@@ -29,6 +29,8 @@ layout(constant_id = 4) const bool CUTOUTS = true;
 layout(constant_id = 5) const bool GUIDING = true;
 // The number of lights; 0xffffffff leaves it to the constants buffer.
 layout(constant_id = 6) const uint LIGHTS = 0xffffffffu;
+// Light tracing (connect.glsl): light paths join camera paths under MIS.
+layout(constant_id = 7) const bool LIGHT_TRACING = true;
 
 layout(push_constant) uniform Params {
     vec4 position;      // camera; w: 1 orthographic
@@ -38,9 +40,9 @@ layout(push_constant) uniform Params {
     uint band_start;    // first pixel of this pass's band
     uint band_count;    // paths in the band
     uint sample_index;
-    uint bounce;
+    uint mode;          // the paths in flight: 0 camera paths, 1 light paths
     uint current;       // the closest-hit queue being read (0 or 1)
-    uint phase;         // schedule's step
+    uint phase;         // a kernel's step (adaptive), or film_convert's light-tracing samples
     uint pool;          // path slots: the stride of every state field
     uint seed;
     uint64_t guide;     // the path-guiding grid's address (guide.glsl)
@@ -55,15 +57,17 @@ layout(set = 0, binding = 4, std430) buffer StateV { vec4 state_v[]; };
 layout(set = 0, binding = 5, std430) buffer StateU { uint state_u[]; };
 // Queue counters [0..15], indirect arguments [16..31], then each queue's paths.
 layout(set = 0, binding = 6, std430) buffer Queues { uint queues[]; };
-// The film, three planes of a vec4 a pixel (FILM_* below): the sum of samples
+// The film, four planes of a vec4 a pixel (FILM_* below): the sum of samples
 // (XYZ under E, or ACEScg; w their count), adaptive sampling's half buffer
-// (twice the odd samples; w 1 once the pixel has converged), and a scratch
-// plane for the convergence check.
+// (twice the odd samples; w 1 once the pixel has converged), a scratch plane
+// for the convergence check, and what light paths splat (atomically; divided
+// by the light-tracing samples taken).
 layout(set = 0, binding = 7, std430) buffer Film { vec4 film[]; };
 uint film_pixels() { return uint(params.du.w) * uint(params.dv.w); }
 #define FILM_SUM 0u
 #define FILM_HALF 1u
 #define FILM_SCRATCH 2u
+#define FILM_SPLAT 3u
 vec4 film_at(uint plane, uint pixel) { return film[plane * film_pixels() + pixel]; }
 // Scene-wide constants (src/render/integrator.lucb: fill_constants).
 layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[]; };
@@ -91,11 +95,31 @@ layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[
                             // w: unguided over guided throughput, which Russian roulette weighs (guiding must not change survival)
 uint light_count() { return LIGHTS != 0xffffffffu ? LIGHTS : uint(constants[K_INFO].x); }
 
+// Light tracing (connect.glsl).
+#define K_LIGHT_PATHS 14    // x light paths a sample (0: none), y 1 / a pixel's area on the image plane at unit distance
+#define K_VIEW 15           // the camera's forward axis (unit)
+bool light_tracing() { return LIGHT_TRACING && constants[K_LIGHT_PATHS].x > 0.0; }
+float light_paths() { return constants[K_LIGHT_PATHS].x; }
+
+// The camera's density of a ray leaving it along `d` (unit), per unit of a
+// pixel's area on the image plane: 1 / (A cos³θ).
+float camera_pdf(vec3 d) {
+    float c = dot(d, constants[K_VIEW].xyz);
+    return c > 0.0 ? constants[K_LIGHT_PATHS].y / (c * c * c) : 0.0;
+}
+
+// Light tracing's MIS (connect.glsl). A camera path: the product of the light
+// tracer's density over its own at the vertices both are known for (times the
+// light paths a sample), its last vertex's density, |cos| of the geometric
+// normal there toward the ray, and the camera's pdf of the first ray. A light
+// path: the product the other way, its last vertex's density, the |cos|, and
+// the light sample's density over the BSDF's at the light (-1 until known).
+#define SV_MIS 13u
 // Path guiding's ring of the first vertices (guide.glsl): pdf, throughput
 // luminance after the vertex, luminance found before it, |cos| of the sampled
 // direction; and cell, direction.
 #define SV_GUIDE(k) (10u + (k))
-#define SU_PIXEL 0u
+#define SU_PIXEL 0u          // a camera path's pixel; a light path's emitter
 #define SU_BOUNCE 1u        // bounces so far: total, diffuse, glossy, transmission (a byte each)
 // What was hit: a triangle or LIGHT_HIT | light. Kept as an integer: bits stored
 // in a float can be denormals, which Metal flushes to zero.
@@ -103,6 +127,8 @@ uint light_count() { return LIGHTS != 0xffffffffu ? LIGHTS : uint(constants[K_IN
 #define SU_NORMAL 3u        // the previous vertex's shading normal (octahedral), for the light tree's MIS pdf
 #define SU_GUIDE_CELL(k) (4u + (k))
 #define SU_GUIDE_DIRECTION(k) (7u + (k))
+// The pixel a light path's camera connection lands on.
+#define SU_SPLAT 10u
 
 vec4 get_v(uint field, uint path) { return state_v[field * params.pool + path]; }
 void set_v(uint field, uint path, vec4 value) { state_v[field * params.pool + path] = value; }

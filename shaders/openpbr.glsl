@@ -128,12 +128,13 @@ float rgb_luminance(vec3 rgb) { return dot(rgb, vec3(0.2722287168, 0.6740817658,
 #define LOBE_TRANSMISSION 2u
 
 struct Surface {
-    vec3 normal;        // shading normal, facing the incoming ray's side
+    vec3 normal;        // shading normal, facing the side the surface is seen from
     vec3 tangent;
     vec3 bitangent;
     vec3 geometric;     // geometric normal on the same side
     uint material;
-    bool inside;        // the ray is leaving the object (it hit a back face)
+    bool back;          // seen from behind its triangle's front face
+    bool inside;        // seen from within a transmissive object (back, transmissive)
     Spec base;          // base color × base weight: diffuse albedo, metal F0
     float diffuse_roughness;
     float metalness;
@@ -152,6 +153,7 @@ struct Surface {
     float coat_eta;
     float coat_compensation;
     float coat_albedo;
+    float coat_k;       // what the coat reflects back down (for its darkening)
     Spec substrate;     // what reaches the layers under the coat
     float p_coat;       // lobe choice: wavelength-free, from the RGB parameters
     float p_metal;
@@ -163,8 +165,26 @@ struct Surface {
 vec3 to_local(Surface s, vec3 v) { return vec3(dot(v, s.tangent), dot(v, s.bitangent), dot(v, s.normal)); }
 vec3 to_world(Surface s, vec3 v) { return s.tangent * v.x + s.bitangent * v.y + s.normal * v.z; }
 
-// Read the material and prepare its lobes for the view direction `wo` (local).
-void prepare_surface(inout Surface s, vec3 wo, vec4 lambda) {
+// The surface at `normal` (shading) and `geometric`, both facing the side it is
+// seen from; `back` when that is behind the triangle's front face.
+Surface surface_at(vec3 normal, vec3 geometric, uint material, bool back) {
+    Surface s;
+    s.normal = normal;
+    basis(normal, s.tangent, s.bitangent);
+    s.geometric = geometric;
+    s.material = material;
+    s.back = back;
+    return s;
+}
+
+// The same point seen from its other side (a refracted direction's viewer).
+Surface turned(Surface s) {
+    return surface_at(-s.normal, -s.geometric, s.material, !s.back);
+}
+
+// The surface's lobes for the view direction `wo` (local): everything a
+// direction's pdf needs, and the albedos f needs; no wavelengths.
+void prepare_lobes(inout Surface s, vec3 wo) {
     uint m = s.material;
     vec4 base_rgb = material_at(m, 1u);
     vec4 specular_rgb = material_at(m, 3u);
@@ -174,17 +194,13 @@ void prepare_surface(inout Surface s, vec3 wo, vec4 lambda) {
     vec4 indices = material_at(m, 11u);
     vec4 geometry = material_at(m, 12u);
     float mu = clamp(wo.z, 0.0, 1.0);
-    s.base = material_color(m, 0u, lambda) * base_rgb.w;
     s.diffuse_roughness = scalars.y;
     s.metalness = HAS_METAL ? clamp(scalars.x, 0.0, 1.0) : 0.0;
     s.specular_weight = max(specular_rgb.w, 0.0);
-    s.metal_tint = material_color(m, 2u, lambda);
-    s.specular_tint = s.metal_tint * s.specular_weight;
     s.transmission = HAS_TRANSMISSION ? clamp(transmission_rgb.w, 0.0, 1.0) : 0.0;
-    s.transmission_tint = material_color(m, 8u, lambda);
     // Only a transmissive material has an inside; any other back face shades
     // like its front (a closed room's walls, seen from within).
-    s.inside = s.inside && s.transmission > 0.0;
+    s.inside = s.back && s.transmission > 0.0;
     // The coat (none from inside an object: its layers face the outside).
     s.coat = (HAS_COAT && !s.inside) ? clamp(coat_rgb.w, 0.0, 1.0) : 0.0;
     float coat_roughness = clamp(indices.y, 0.0, 1.0);
@@ -214,20 +230,18 @@ void prepare_surface(inout Surface s, vec3 wo, vec4 lambda) {
     s.metal_missing = missing;
     s.dielectric_compensation = 1.0 + fresnel_dielectric_average(eta) * missing;
     s.specular_albedo = clamp(s.specular_weight * s.dielectric_compensation * table_dielectric(mu, roughness, eta), 0.0, 1.0);
-    // Under the coat: what it lets through, tinted, and darkened by the light
-    // the coat reflects back down (OpenPBR's Delta = (1 - K) / (1 - E_b K)).
-    s.substrate = Spec(1.0);
+    // Under the coat: what it lets through, darkened by the light it reflects
+    // back down (OpenPBR's Delta = (1 - K) / (1 - E_b K)); the colors follow
+    // in prepare_colors.
     float substrate_rgb = 1.0;
+    s.coat_k = 0.0;
     if (HAS_COAT && s.coat > 0.0) {
         float k_smooth = fresnel_dielectric(mu, s.coat_eta);
         float k_rough = 1.0 - (1.0 - fresnel_dielectric_average(s.coat_eta)) / (s.coat_eta * s.coat_eta);
         float base_roughness = mix(1.0, roughness, s.metalness);
-        float k = mix(k_smooth, k_rough, base_roughness);
-        float darkening = clamp(material_at(m, 11u).w, 0.0, 1.0);
-        Spec delta = (1.0 - k) / (Spec(1.0) - s.base * k);
-        Spec under = material_color(m, 4u, lambda) * (1.0 - s.coat_albedo) * mix(Spec(1.0), delta, darkening);
-        s.substrate = mix(Spec(1.0), under, s.coat);
-        float delta_rgb = (1.0 - k) / max(1e-4, 1.0 - rgb_luminance(base_rgb.xyz * base_rgb.w) * k);
+        s.coat_k = mix(k_smooth, k_rough, base_roughness);
+        float darkening = clamp(indices.w, 0.0, 1.0);
+        float delta_rgb = (1.0 - s.coat_k) / max(1e-4, 1.0 - rgb_luminance(base_rgb.xyz * base_rgb.w) * s.coat_k);
         substrate_rgb = mix(1.0, rgb_luminance(coat_rgb.xyz) * (1.0 - s.coat_albedo) * mix(1.0, delta_rgb, darkening), s.coat);
     }
     // Lobe choice.
@@ -253,6 +267,28 @@ void prepare_surface(inout Surface s, vec3 wo, vec4 lambda) {
     s.p_diffuse = w_diffuse * scale;
 }
 
+// The surface's colors at the path's wavelengths (after prepare_lobes).
+void prepare_colors(inout Surface s, vec4 lambda) {
+    uint m = s.material;
+    s.base = material_color(m, 0u, lambda) * material_at(m, 1u).w;
+    s.metal_tint = material_color(m, 2u, lambda);
+    s.specular_tint = s.metal_tint * s.specular_weight;
+    s.transmission_tint = material_color(m, 8u, lambda);
+    s.substrate = Spec(1.0);
+    if (HAS_COAT && s.coat > 0.0) {
+        float darkening = clamp(material_at(m, 11u).w, 0.0, 1.0);
+        Spec delta = (1.0 - s.coat_k) / (Spec(1.0) - s.base * s.coat_k);
+        Spec under = material_color(m, 4u, lambda) * (1.0 - s.coat_albedo) * mix(Spec(1.0), delta, darkening);
+        s.substrate = mix(Spec(1.0), under, s.coat);
+    }
+}
+
+// Read the material and prepare its lobes for the view direction `wo` (local).
+void prepare_surface(inout Surface s, vec3 wo, vec4 lambda) {
+    prepare_lobes(s, wo);
+    prepare_colors(s, lambda);
+}
+
 // The refraction half-vector for wo and wi on opposite sides at index ratio eta
 // (transmitted over incident), facing +z; false when the pair cannot refract.
 bool refraction_half(vec3 wi, vec3 wo, float eta, out vec3 h) {
@@ -261,11 +297,33 @@ bool refraction_half(vec3 wi, vec3 wo, float eta, out vec3 h) {
     return dot(wo, h) > 0.0 && dot(wi, h) < 0.0;
 }
 
+// The pdf `sample_direction` gives wi for wo (local), over all lobes; needs
+// only prepare_lobes.
+float surface_pdf(Surface s, vec3 wi, vec3 wo) {
+    if (wo.z <= 0.0 || wi.z == 0.0) return 0.0;
+    if (wi.z < 0.0) {
+        if (!HAS_TRANSMISSION || s.p_transmission <= 0.0) return 0.0;
+        vec3 h;
+        if (!refraction_half(wi, wo, s.eta, h)) return 0.0;
+        float o_h = dot(wo, h), i_h = dot(wi, h);
+        float denominator = o_h + s.eta * i_h;
+        float jacobian = s.eta * s.eta * abs(i_h) / (denominator * denominator);
+        return s.p_transmission * ggx_g1(wo, s.alpha) * ggx_d(h, s.alpha) * o_h / wo.z * jacobian;
+    }
+    vec3 h = normalize(wi + wo);
+    float pdf = 0.0;
+    if (HAS_COAT && s.p_coat > 0.0) pdf += s.p_coat * ggx_reflection_pdf(wo, h, s.coat_alpha);
+    if (!s.inside) pdf += s.p_diffuse * wi.z / PI;
+    pdf += (s.p_specular + s.p_metal) * ggx_reflection_pdf(wo, h, s.alpha);
+    return pdf;
+}
+
 // The BSDF value at local directions wi (toward the light) and wo (toward the
 // viewer), cosine not included, and the pdf `sample_surface` gives wi.
 Spec evaluate_surface(Surface s, vec3 wi, vec3 wo, out float pdf) {
     pdf = 0.0;
     if (wo.z <= 0.0 || wi.z == 0.0) return Spec(0.0);
+    pdf = surface_pdf(s, wi, wo);
     float dielectric = 1.0 - s.metalness;
     if (wi.z < 0.0) {
         // Refraction through the dielectric base.
@@ -274,11 +332,9 @@ Spec evaluate_surface(Surface s, vec3 wi, vec3 wo, out float pdf) {
         if (!refraction_half(wi, wo, s.eta, h)) return Spec(0.0);
         float o_h = dot(wo, h), i_h = dot(wi, h);
         float denominator = o_h + s.eta * i_h;
-        float jacobian = s.eta * s.eta * abs(i_h) / (denominator * denominator);
         float d = ggx_d(h, s.alpha);
         // Radiance transport: Walter et al.'s BTDF without its eta² (pbrt-v4's form).
         float f = (1.0 - fresnel_dielectric(o_h, s.eta)) * d * ggx_g2(-wi, wo, s.alpha) * abs(i_h) * o_h / (abs(wi.z) * wo.z * denominator * denominator);
-        pdf = s.p_transmission * ggx_g1(wo, s.alpha) * d * o_h / wo.z * jacobian;
         return s.substrate * s.transmission_tint * (dielectric * s.transmission * f);
     }
     vec3 h = normalize(wi + wo);
@@ -287,13 +343,10 @@ Spec evaluate_surface(Surface s, vec3 wi, vec3 wo, out float pdf) {
     if (HAS_COAT && s.p_coat > 0.0) {
         float coat = ggx_d(h, s.coat_alpha) * ggx_g2(wi, wo, s.coat_alpha) / (4.0 * wi.z * wo.z);
         f += Spec(s.coat * fresnel_dielectric(cos_h, s.coat_eta) * s.coat_compensation * coat);
-        pdf += s.p_coat * ggx_reflection_pdf(wo, h, s.coat_alpha);
     }
     Spec below = Spec(0.0);
-    if (!s.inside) {
+    if (!s.inside)
         below += eon(s.base, s.diffuse_roughness, wi, wo) * (dielectric * (1.0 - s.transmission) * (1.0 - s.specular_albedo));
-        pdf += s.p_diffuse * wi.z / PI;
-    }
     float microfacet = ggx_d(h, s.alpha) * ggx_g2(wi, wo, s.alpha) / (4.0 * wi.z * wo.z);
     if (dielectric > 0.0)
         below += s.specular_tint * (dielectric * fresnel_dielectric(cos_h, s.eta) * s.dielectric_compensation * microfacet);
@@ -302,14 +355,14 @@ Spec evaluate_surface(Surface s, vec3 wi, vec3 wo, out float pdf) {
         Spec compensation = 1.0 + average * s.metal_missing;
         below += min(Spec(1.0), s.specular_weight * fresnel_f82(s.base, s.metal_tint, cos_h)) * compensation * (s.metalness * microfacet);
     }
-    pdf += (s.p_specular + s.p_metal) * ggx_reflection_pdf(wo, h, s.alpha);
     return f + s.substrate * below;
 }
 
 // A direction wi for wo from three uniform numbers (two for the direction, one
-// to choose the lobe); `weight` is f · |cos| / pdf over all lobes, `lobe` what
-// the sample was (LOBE_*) for the bounce limits.
-bool sample_surface(Surface s, vec3 wo, vec3 u, out vec3 wi, out Spec weight, out float pdf, out uint lobe) {
+// to choose the lobe), its pdf over all lobes, and `lobe`, what the sample was
+// (LOBE_*) for the bounce limits. Needs only prepare_lobes.
+bool sample_direction(Surface s, vec3 wo, vec3 u, out vec3 wi, out float pdf, out uint lobe) {
+    pdf = 0.0;
     if (wo.z <= 0.0) return false;
     float pick = u.z;
     if (pick < s.p_diffuse) {
@@ -331,8 +384,15 @@ bool sample_surface(Surface s, vec3 wo, vec3 u, out vec3 wi, out Spec weight, ou
         return false;
     }
     if (wi.z == 0.0) return false;
-    Spec f = evaluate_surface(s, wi, wo, pdf);
-    if (pdf <= 0.0) return false;
+    pdf = surface_pdf(s, wi, wo);
+    return pdf > 0.0;
+}
+
+// sample_direction, and `weight`: f · |cos| / pdf.
+bool sample_surface(Surface s, vec3 wo, vec3 u, out vec3 wi, out Spec weight, out float pdf, out uint lobe) {
+    if (!sample_direction(s, wo, u, wi, pdf, lobe)) return false;
+    float pdf_again;
+    Spec f = evaluate_surface(s, wi, wo, pdf_again);
     weight = f * (abs(wi.z) / pdf);
     return true;
 }

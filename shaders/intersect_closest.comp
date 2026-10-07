@@ -24,7 +24,7 @@ void work() {
     bool camera_ray = bounce_total(get_u(SU_BOUNCE, path)) == 0u;
     for (uint light = 0u; light < lights_count; light++) {
         if (camera_ray && !light_visible(light)) continue;
-        float t = intersect_light(light, origin, direction, hit.t);
+        float t = intersect_light(light, origin, direction, hit.t, params.mode != 0u);
         if (t < hit.t) {
             hit.t = t;
             what = LIGHT_HIT | light;

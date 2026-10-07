@@ -7,7 +7,10 @@
 #       and records passes. A pass traces one sample for one band of pixels (at most
 #       `pool` paths): camera, then per bounce intersect_closest → shade_surface →
 #       shade_miss → intersect_shadow, then finish (paths
-#       into the film) and film_convert (the film's average into the image). Queue
+#       into the film) and film_convert (the film's average into the image). With
+#       light tracing, the first band's pass first runs the sample's light paths:
+#       light_emit, then per bounce intersect_closest → shade_light → shade_miss →
+#       intersect_shadow, which splats camera connections on the film. Queue
 #       sizes never come back to the host: each kernel's last workgroup writes the
 #       next kernels' indirect arguments.
 #
@@ -60,12 +63,17 @@ pub struct RenderSettings:
     ## error about 1.2x in a room lit by bounced light, so it pays only where
     ## indirect light is concentrated (docs/DESIGN.md).
     pub var guiding: bool
+    ## Light tracing: light paths a sample, per pixel (0: none). They connect to
+    ## the camera under MIS with camera paths, which makes caustics and light
+    ## through glass converge (docs/research/FIREFLIES-STUDY.md). Perspective
+    ## cameras only.
+    pub var light_tracing: f64
 
     pub static func of(width: u32, height: u32, samples: u32) -> RenderSettings:
-        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false, 1024, 1024, 1024, 0.0, 0.0, 16, false, false)
+        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false, 1024, 1024, 1024, 0.0, 0.0, 16, false, false, 0.0)
 
-let state_v_fields: usize = 13
-let state_u_fields: usize = 10
+let state_v_fields: usize = 14
+let state_u_fields: usize = 11
 ## The guiding grid: 2^19 cells, each a key, 5 vec4s (4 lobes and their
 ## weights) and 4 lobes' statistics of 5 floats (shaders/guide.glsl).
 let guide_cells: usize = 524288
@@ -83,12 +91,12 @@ let kind_closest: u8 = 1
 let kind_surface: u8 = 2
 let kind_miss: u8 = 3
 let kind_shadow: u8 = 4
-let kind_unused: u8 = 5
+let kind_light: u8 = 5
 let kind_finish: u8 = 6
 let kind_convert: u8 = 7
 let kind_adaptive: u8 = 8
 let kind_rest: u8 = 9
-pub let kernel_names: str[10] = ["camera", "intersect closest", "shade surface", "shade miss", "intersect shadow", "(unused)", "finish", "film convert", "adaptive", "later rounds"]
+pub let kernel_names: str[10] = ["camera", "intersect closest", "shade surface", "shade miss", "intersect shadow", "light paths", "finish", "film convert", "adaptive", "later rounds"]
 
 ## The integrator's kernels in one build (spectral or RGB).
 struct Kernel:
@@ -114,6 +122,8 @@ struct Kernels:
     var film_convert: Kernel
     var adaptive: Kernel
     var guide_fit: Kernel
+    var light_emit: Kernel
+    var shade_light: Kernel
 
     ## The build's kernels; intersection by hardware ray queries when `rays`.
     static func create(device: gpu.Device, spectral: bool, rays: bool, constants: const gpu.Constant[]) -> Kernels!:
@@ -134,8 +144,12 @@ struct Kernels:
             errdefer convert.kernel.destroy()
             var adaptive = try Kernel.create(device, constants, adaptive_comp_words, adaptive_comp_msl, adaptive_comp_group, adaptive_comp_bindings, false)
             errdefer adaptive.kernel.destroy()
-            let fit = try Kernel.create(device, constants, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
-            return Kernels(camera, closest, surface, miss, shadow, finish, convert, adaptive, fit)
+            var fit = try Kernel.create(device, constants, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
+            errdefer fit.kernel.destroy()
+            var emit = try Kernel.create(device, constants, light_emit_comp_words, light_emit_comp_msl, light_emit_comp_group, light_emit_comp_bindings)
+            errdefer emit.kernel.destroy()
+            let light = try Kernel.create(device, constants, shade_light_comp_words, shade_light_comp_msl, shade_light_comp_group, shade_light_comp_bindings)
+            return Kernels(camera, closest, surface, miss, shadow, finish, convert, adaptive, fit, emit, light)
         var camera = try Kernel.create(device, constants, camera_rgb_comp_words, camera_rgb_comp_msl, camera_rgb_comp_group, camera_rgb_comp_bindings)
         errdefer camera.kernel.destroy()
         var closest = try intersect_kernel(device, rays, constants)
@@ -152,8 +166,12 @@ struct Kernels:
         errdefer convert.kernel.destroy()
         var adaptive = try Kernel.create(device, constants, adaptive_rgb_comp_words, adaptive_rgb_comp_msl, adaptive_rgb_comp_group, adaptive_rgb_comp_bindings, false)
         errdefer adaptive.kernel.destroy()
-        let fit = try Kernel.create(device, constants, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
-        return Kernels(camera, closest, surface, miss, shadow, finish, convert, adaptive, fit)
+        var fit = try Kernel.create(device, constants, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
+        errdefer fit.kernel.destroy()
+        var emit = try Kernel.create(device, constants, light_emit_rgb_comp_words, light_emit_rgb_comp_msl, light_emit_rgb_comp_group, light_emit_rgb_comp_bindings)
+        errdefer emit.kernel.destroy()
+        let light = try Kernel.create(device, constants, shade_light_rgb_comp_words, shade_light_rgb_comp_msl, shade_light_rgb_comp_group, shade_light_rgb_comp_bindings)
+        return Kernels(camera, closest, surface, miss, shadow, finish, convert, adaptive, fit, emit, light)
 
     func destroy():
         self.camera.kernel.destroy()
@@ -165,6 +183,8 @@ struct Kernels:
         self.film_convert.kernel.destroy()
         self.adaptive.kernel.destroy()
         self.guide_fit.kernel.destroy()
+        self.light_emit.kernel.destroy()
+        self.shade_light.kernel.destroy()
 
 ## Intersection kernels serve both builds: they read no spectra.
 func intersect_kernel(device: gpu.Device, rays: bool, constants: const gpu.Constant[]) -> Kernel!:
@@ -214,6 +234,12 @@ pub struct Renderer:
     ## the nanoseconds each kind has taken in finished passes.
     var marks: Growing[u8]
     var kernel_ns: f64[10]
+    ## Light tracing: the light paths a sample (0: none), and the samples whose
+    ## light paths have been recorded.
+    var light_count_per_sample: usize
+    var light_samples: u32
+    ## The paths the kernels being recorded run (common.glsl params.mode).
+    var mode: u32
 
     ## A renderer of `scene` through its camera (see RenderSettings.camera). The
     ## scene's buffers are uploaded; `scene` may be closed afterwards.
@@ -267,11 +293,21 @@ pub struct Renderer:
             try pack_material(material, &records)
             cutouts = cutouts or material.geometry_opacity < 1.0
         rows[3] = 1.0 if cutouts else 0.0
+        # Light tracing: light paths a sample (at most a pool's), the image
+        # plane's pixel area at unit distance, the camera's axis.
+        var light_paths: usize = 0
+        if settings.light_tracing > 0.0 and not frame.orthographic and tree.emitter_count > 0:
+            let wanted = (usize)math.max(1.0, math.round(settings.light_tracing * (f64)pixels))
+            light_paths = wanted if wanted < slots else slots
+        let pixel_area = frame.du.length() * frame.dv.length()
+        let view_rows: f64[8] = [(f64)light_paths, 1.0 / pixel_area if pixel_area > 0.0 else 0.0, 0.0, 0.0,
+                                 frame.forward.x, frame.forward.y, frame.forward.z, 0.0]
+        for k in 0..<(usize)8: rows[56 + k] = (f32)view_rows[k]
         var constants = try gpu.Buffer.create(device, u8[]((u8*)&rows[0], 256))
         errdefer constants.destroy()
         # Kernels specialized to the scene: the features its materials use, its
         # light count, guiding.
-        var features = scene_features(library.view(), light_count, settings)
+        var features = scene_features(library.view(), light_count, settings, light_paths > 0)
         var kernels = try Kernels.create(device, settings.spectral, uploaded.accelerated, features)
         errdefer kernels.destroy()
         var materials = try buffer_of(device, u8[]((u8*)records.items.data, records.count * 4))
@@ -287,12 +323,12 @@ pub struct Renderer:
         errdefer state_u.destroy()
         var queues = try gpu.Buffer.allocate(device, (queue_base + queue_count * slots) * 4)
         errdefer queues.destroy()
-        var film = try gpu.Buffer.allocate(device, 3 * pixels * 16)
+        var film = try gpu.Buffer.allocate(device, 4 * pixels * 16)
         errdefer film.destroy()
         var output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
         errdefer output.destroy()
         let shown = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
-        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, guide, guide_address, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, 8 if cutouts else 0, none, none, 0, 0, 0, 0, 0, Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, guide, guide_address, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, 8 if cutouts else 0, none, none, 0, 0, 0, 0, 0, Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], light_paths, 0, 0)
 
     ## Start the next pass if the last has finished. True while there is work,
     ## running or to come; false once every sample is in the image.
@@ -327,7 +363,7 @@ pub struct Renderer:
             var frame: f32[16]
             try self.frame.pack(frame)
             memory.copy(block[0..<64], u8[]((u8*)&frame[0], 64), 64)
-            try self.dispatch(&convert, &self.kernels.film_convert, block, 0, 0, 0, 0, (self.settings.width + 7) // 8, (self.settings.height + 7) // 8)
+            try self.dispatch(&convert, &self.kernels.film_convert, block, 0, 0, 0, self.light_samples, (self.settings.width + 7) // 8, (self.settings.height + 7) // 8)
             try convert.submit()
             self.queue_pass(convert, self.sample)
             return true
@@ -420,6 +456,9 @@ pub struct Renderer:
         try self.frame.pack(frame)
         memory.copy(block[0..<64], u8[]((u8*)&frame[0], 64), 64)
         let groups = (u32)((count + 63) // 64)
+        # The sample's light paths, with its first band.
+        if self.light_count_per_sample > 0 and self.band == 0:
+            try self.record_light_paths(pass, block)
         # Every queue counter and the workgroups' done count start at zero; the
         # camera queues only pixels still sampling.
         try pass.fill(self.queues, 0, 64, 0)
@@ -445,11 +484,27 @@ pub struct Renderer:
             let y = (self.settings.height + 7) // 8
             try self.dispatch(pass, &self.kernels.adaptive, block, start, count, 0, 0, x, y)
             try self.dispatch(pass, &self.kernels.adaptive, block, start, count, 0, 1, x, y)
-        try self.dispatch(pass, &self.kernels.film_convert, block, start, count, 0, 0, (self.settings.width + 7) // 8, (self.settings.height + 7) // 8)
+        try self.dispatch(pass, &self.kernels.film_convert, block, start, count, 0, self.light_samples, (self.settings.width + 7) // 8, (self.settings.height + 7) // 8)
+
+    ## The sample's light paths: emitted, then traced bounce by bounce, each
+    ## surface they reach connected to the camera.
+    func record_light_paths(pass: gpu.Compute*, block: u8[]) -> !:
+        let count = self.light_count_per_sample
+        try pass.fill(self.queues, 0, 64, 0)
+        self.mode = 1
+        try self.dispatch(pass, &self.kernels.light_emit, block, 0, count, 0, 0, (u32)((count + 63) // 64), 1)
+        for bounce in 0..<(usize)self.settings.max_bounces + self.through:
+            let current = (u32)(bounce % 2)
+            try self.indirect(pass, &self.kernels.intersect_closest, block, 0, count, current, (usize)current)
+            try self.indirect(pass, &self.kernels.shade_light, block, 0, count, current, 2)
+            try self.indirect(pass, &self.kernels.shade_miss, block, 0, count, current, 3)
+            try self.indirect(pass, &self.kernels.intersect_shadow, block, 0, count, current, 4)
+        self.mode = 0
+        self.light_samples += 1
 
     ## The push constants after the camera frame: band, sample and step.
     func uniforms(block: u8[], start: usize, count: usize, current: u32, phase: u32):
-        let values: u32[8] = [(u32)start, (u32)count, self.sample, 0, current, phase, (u32)self.pool, self.settings.seed]
+        let values: u32[8] = [(u32)start, (u32)count, self.sample, self.mode, current, phase, (u32)self.pool, self.settings.seed]
         for at in 0..<(usize)8: memory.write[u32]((void*)&block[64 + at * 4], values[at])
         memory.write[u64]((void*)&block[96], self.guide_address)
 
@@ -484,6 +539,7 @@ pub struct Renderer:
         if kernel == &self.kernels.intersect_shadow: return kind_shadow
         if kernel == &self.kernels.finish: return kind_finish
         if kernel == &self.kernels.film_convert: return kind_convert
+        if kernel == &self.kernels.light_emit or kernel == &self.kernels.shade_light: return kind_light
         return kind_adaptive
 
     ## Milliseconds each kernel kind has taken over the finished passes, with
@@ -546,8 +602,9 @@ func make_tables(device: gpu.Device) -> gpu.Buffer!:
     return tables
 
 ## The specialization constants of the integrator kernels (shaders/common.glsl):
-## which material features the scene uses, cut-outs, guiding, the light count.
-func scene_features(library: const OpenPbr[], light_count: usize, settings: RenderSettings) -> gpu.Constant[7]:
+## which material features the scene uses, cut-outs, guiding, the light count,
+## light tracing.
+func scene_features(library: const OpenPbr[], light_count: usize, settings: RenderSettings, light_tracing: bool) -> gpu.Constant[8]:
     var coat = false
     var transmission = false
     var metal = false
@@ -561,7 +618,7 @@ func scene_features(library: const OpenPbr[], light_count: usize, settings: Rend
         cutouts = cutouts or material.geometry_opacity < 1.0
     return [gpu.Constant.boolean(0, coat), gpu.Constant.boolean(1, transmission), gpu.Constant.boolean(2, metal),
             gpu.Constant.boolean(3, emission), gpu.Constant.boolean(4, cutouts), gpu.Constant.boolean(5, settings.guiding),
-            gpu.Constant.uint32(6, (u32)light_count)]
+            gpu.Constant.uint32(6, (u32)light_count), gpu.Constant.boolean(7, light_tracing)]
 
 ## The camera to render through: `index`, or the first camera when it is -1.
 func find_camera(scene: const CompiledScene*, index: i64) -> usize!:

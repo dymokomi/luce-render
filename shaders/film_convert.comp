@@ -1,5 +1,6 @@
 #version 450
-// The film's average per pixel, twice: as ACEScg in `image` (XYZ under E through
+// The film's average per pixel (camera paths' mean, and light paths' splats
+// over the light-tracing samples), twice: as ACEScg in `image` (XYZ under E through
 // the film matrix in the spectral build, as is in the RGB build), and ready to
 // show in `display`: exposed, in linear Rec.709 (sRGB's primaries), through the
 // view (0 standard: clipped; 1 Khronos PBR Neutral tone mapping).
@@ -37,8 +38,11 @@ void main() {
     uint height = uint(params.dv.w);
     uvec2 at = gl_GlobalInvocationID.xy;
     if (at.x >= width || at.y >= height) return;
-    vec4 sum = film[at.y * width + at.x];
+    uint pixel = at.y * width + at.x;
+    vec4 sum = film[pixel];
     vec3 value = sum.xyz / max(sum.w, 1.0);
+    // Light paths' splats, over the light-tracing samples taken (params.phase).
+    if (params.phase > 0u) value += film_at(FILM_SPLAT, pixel).xyz / float(params.phase);
 #if SPECTRAL
     value = vec3(dot(constants[K_FILM].xyz, value), dot(constants[K_FILM + 1].xyz, value), dot(constants[K_FILM + 2].xyz, value));
 #endif

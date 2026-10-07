@@ -120,6 +120,7 @@ bool sample_triangle(uint triangle, vec3 p, vec2 u, vec4 lambda, out LightSample
     float cos_light = abs(dot(s.direction, cross_ab)) / (2.0 * area);
     if (cos_light <= 0.0) return false;
     s.pdf = d2 / (cos_light * area);
+    s.cos_light = cos_light;
     s.delta = false;
     radiance = material_color(shading[triangle].w, 6u, lambda);
     return true;

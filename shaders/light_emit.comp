@@ -1,0 +1,103 @@
+#version 450
+// Start the sample's light paths (connect.glsl): an emitter chosen by power, a
+// point on it uniformly by area, a cosine-weighted direction (either side of an
+// emissive triangle), four wavelengths; queued for the first closest hit.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+#include "common.glsl"
+#include "sampler.glsl"
+#include "spectrum.glsl"
+#include "lights.glsl"
+#include "microfacet.glsl"
+#include "openpbr.glsl"
+#include "lighttree.glsl"
+#include "connect.glsl"
+
+// Light paths draw their numbers as pixels past any image's.
+#define LIGHT_PATH_ID(path) (0x80000000u | (path))
+
+void work() {
+    uint path = gl_GlobalInvocationID.x;
+    if (path >= params.band_count) return;
+    vec4 u_point = sample4(LIGHT_PATH_ID(path), params.sample_index, GROUP_CAMERA);
+    vec4 u_pick = sample4(LIGHT_PATH_ID(path), params.sample_index, GROUP_WAVELENGTH);
+    uint emitter;
+    float chance;
+    if (!emitter_by_power(u_pick.y, emitter, chance)) return;
+#if SPECTRAL
+    vec4 lambda = sample_wavelengths(u_pick.x);
+#else
+    vec4 lambda = vec4(0.0);
+#endif
+    uint code = emitter_code(emitter);
+    vec3 q;
+    vec3 n;
+    Spec radiance;
+    float area;
+    bool two_sided = false;
+    if ((code & EMITTER_TRIANGLE) != 0u) {
+        uint triangle = code & ~EMITTER_TRIANGLE;
+        vec3 a = tree_point(indices[triangle * 3u]);
+        vec3 b = tree_point(indices[triangle * 3u + 1u]);
+        vec3 c = tree_point(indices[triangle * 3u + 2u]);
+        float r = sqrt(u_point.x);
+        q = a * (1.0 - r) + b * (r * (1.0 - u_point.y)) + c * (r * u_point.y);
+        vec3 cross_ab = cross(b - a, c - a);
+        area = 0.5 * length(cross_ab);
+        n = cross_ab / max(2.0 * area, 1e-30);
+        if (u_pick.z < 0.5) n = -n;
+        two_sided = true;
+        radiance = material_color(shading[triangle].w, 6u, lambda);
+    } else {
+        uint type = light_type(code);
+        vec4 row0 = light_at(code, 0u);
+        if (type == LIGHT_SPHERE) {
+            float r = light_at(code, 1u).w;
+            float z = 1.0 - 2.0 * u_point.x;
+            float s = sqrt(max(0.0, 1.0 - z * z));
+            float phi = 2.0 * PI * u_point.y;
+            n = vec3(s * cos(phi), s * sin(phi), z);
+            q = row0.xyz + r * n;
+            area = 4.0 * PI * r * r;
+        } else {
+            vec2 a = type == LIGHT_RECT ? 2.0 * u_point.xy - 1.0 : concentric(u_point.xy);
+            q = row0.xyz + a.x * light_at(code, 1u).xyz + a.y * light_at(code, 2u).xyz;
+            n = light_at(code, 3u).xyz;
+            area = light_at(code, 3u).w;
+        }
+        radiance = light_radiance(code, lambda);
+    }
+    if (area <= 0.0) return;
+    // A cosine-weighted direction about n.
+    vec2 disk = concentric(u_point.zw);
+    float cos_n = sqrt(max(0.0, 1.0 - dot(disk, disk)));
+    if (cos_n <= 0.0) return;
+    vec3 t, b;
+    basis(n, t, b);
+    vec3 direction = normalize(t * disk.x + b * disk.y + n * cos_n);
+    float point_pdf = chance / area;
+    float direction_pdf = cos_n / (two_sided ? 2.0 * PI : PI);
+    // Radiance × cos over both densities: what one path carries.
+    Spec throughput = radiance * (cos_n / (point_pdf * direction_pdf));
+    float largest = spec_max(throughput);
+    if (!(largest > 0.0)) return;
+    set_u(SU_PIXEL, path, emitter);
+    set_u(SU_BOUNCE, path, 0u);
+    set_v(SV_ORIGIN, path, vec4(offset_origin(q, n), 0.0));
+    set_v(SV_DIRECTION, path, vec4(direction, direction_pdf));
+    set_v(SV_THROUGHPUT, path, throughput);
+    set_v(SV_LAMBDA, path, lambda);
+    // Russian roulette weighs throughput relative to the start's.
+    set_v(SV_VERTEX, path, vec4(q, 1.0 / largest));
+    set_v(SV_MIS, path, vec4(1.0, point_pdf, cos_n, -1.0));
+    queue_push(Q_CLOSEST, path);
+}
+
+void main() {
+    work();
+    if (last_group((params.band_count + 63u) / 64u)) {
+        arguments(Q_CLOSEST);
+    }
+}

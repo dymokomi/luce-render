@@ -32,6 +32,8 @@ void work() {
     set_v(SV_THROUGHPUT, path, vec4(1.0));
     set_v(SV_RADIANCE, path, vec4(0.0));
     set_v(SV_VERTEX, path, vec4(origin, 1.0));
+    // Light tracing's MIS: the light paths a sample, and the camera's pdf.
+    if (light_tracing()) set_v(SV_MIS, path, vec4(light_paths(), 0.0, 0.0, camera_pdf(direction)));
     for (uint k = 0u; k < 3u; k++) set_u(SU_GUIDE_CELL(k), path, NONE);
 #if SPECTRAL
     set_v(SV_LAMBDA, path, sample_wavelengths(sample4(pixel, params.sample_index, GROUP_WAVELENGTH).x));

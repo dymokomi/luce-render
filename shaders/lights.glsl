@@ -55,6 +55,7 @@ struct LightSample {
     vec3 direction;   // unit, from the shaded point toward the light
     float distance;   // INFINITY for distant lights
     float pdf;        // solid angle (1 for a delta)
+    float cos_light;  // at the light, toward the shaded point (1 for distant lights)
     bool delta;
 };
 
@@ -99,6 +100,7 @@ bool sample_light(uint light, vec3 p, vec2 u, out LightSample s) {
     vec4 row3 = light_at(light, 3u);
     uint type = uint(row0.w);
     s.delta = false;
+    s.cos_light = 1.0;
     if (type == LIGHT_RECT || type == LIGHT_DISK) {
         vec2 a = type == LIGHT_RECT ? 2.0 * u - 1.0 : concentric(u);
         vec3 q = row0.xyz + a.x * row1.xyz + a.y * row2.xyz;
@@ -109,6 +111,7 @@ bool sample_light(uint light, vec3 p, vec2 u, out LightSample s) {
         float cos_light = -dot(s.direction, row3.xyz);
         if (cos_light <= 0.0 || row3.w <= 0.0) return false;
         s.pdf = d2 / (cos_light * row3.w);
+        s.cos_light = cos_light;
         return true;
     }
     if (type == LIGHT_SPHERE) {
@@ -121,6 +124,7 @@ bool sample_light(uint light, vec3 p, vec2 u, out LightSample s) {
         s.distance = sphere_hit(row0.xyz, r, p, s.direction);
         if (s.distance >= INFINITY) return false;
         s.pdf = 1.0 / (2.0 * PI * (1.0 - cos_max));
+        s.cos_light = max(0.0, -dot(s.direction, normalize(p + s.direction * s.distance - row0.xyz)));
         return true;
     }
     // Distant: toward the light is against its emission direction.
@@ -138,9 +142,20 @@ bool sample_light(uint light, vec3 p, vec2 u, out LightSample s) {
     return true;
 }
 
+// The cosine at light `light` (not distant) toward the point a ray from o
+// along d (unit) left, where it hits the light at distance t.
+float light_cos(uint light, vec3 o, vec3 d, float t) {
+    vec4 row0 = light_at(light, 0u);
+    if (uint(row0.w) == LIGHT_SPHERE) return max(0.0, -dot(d, normalize(o + d * t - row0.xyz)));
+    return max(0.0, -dot(d, light_at(light, 3u).xyz));
+}
+
 // Where a ray (unit direction) meets the light's emitting side first, or INFINITY.
 // Lights are seen only from the side they shine to; distant lights are never hit.
-float intersect_light(uint light, vec3 o, vec3 d, float t_max) {
+// `light_flow`: the ray follows light (a light path), so it is stopped where
+// a camera ray along it reversed would be: crossing a flat light the way it
+// shines. Visibility then reads the same both ways.
+float intersect_light(uint light, vec3 o, vec3 d, float t_max, bool light_flow) {
     vec4 row0 = light_at(light, 0u);
     uint type = uint(row0.w);
     if (type == LIGHT_SPHERE) {
@@ -152,7 +167,7 @@ float intersect_light(uint light, vec3 o, vec3 d, float t_max) {
     vec3 v = light_at(light, 2u).xyz;
     vec3 n = light_at(light, 3u).xyz;
     float facing = dot(d, n);
-    if (facing >= 0.0) return INFINITY;
+    if (light_flow ? facing <= 0.0 : facing >= 0.0) return INFINITY;
     float t = dot(row0.xyz - o, n) / facing;
     if (t <= 0.0 || t >= t_max) return INFINITY;
     vec3 q = o + t * d - row0.xyz;

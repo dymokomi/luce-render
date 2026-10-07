@@ -11,7 +11,8 @@ layout(local_size_x = 64) in;
 
 void work() {
     uint at = gl_GlobalInvocationID.x;
-    if (at >= queue_count(Q_MISS)) return;
+    // Light paths that leave the scene just end.
+    if (params.mode != 0u || at >= queue_count(Q_MISS)) return;
     uint path = queue_path(Q_MISS, at);
     uint bounce = bounce_total(get_u(SU_BOUNCE, path));
     vec4 ray = get_v(SV_DIRECTION, path);

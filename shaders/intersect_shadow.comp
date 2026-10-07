@@ -5,10 +5,11 @@
 // cut-outs it meets, keeping (1 - opacity) of the light at each: the mean of
 // the stochastic pass-through shade_surface takes, so cut-outs cast the
 // shadows they should. Anything else opaque, glass included, blocks: light
-// through glass arrives on BSDF paths (and path guiding).
+// through glass arrives on BSDF paths, and on light paths (light tracing).
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_float : require
 layout(local_size_x = 64) in;
 #include "common.glsl"
 #include "trace.glsl"
@@ -17,6 +18,21 @@ layout(set = 0, binding = 11, std430) readonly buffer Shading { uvec4 shading[];
 layout(set = 0, binding = 12, std430) readonly buffer Materials { vec4 materials[]; };
 #define MATERIAL_STRIDE 16u
 
+// What got through: added to the path's radiance, or for a light path's
+// camera connection (already in the film's terms) splatted on its pixel.
+void deliver(uint path, float kept) {
+    vec4 value = get_v(SV_SHADOW_RADIANCE, path) * kept;
+    if (params.mode == 0u) {
+        set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + value);
+        return;
+    }
+    if (any(isnan(value.xyz)) || any(isinf(value.xyz))) return;
+    uint at = FILM_SPLAT * film_pixels() + get_u(SU_SPLAT, path);
+    atomicAdd(film[at].x, value.x);
+    atomicAdd(film[at].y, value.y);
+    atomicAdd(film[at].z, value.z);
+}
+
 void work() {
     uint at = gl_GlobalInvocationID.x;
     if (at >= queue_count(Q_SHADOW)) return;
@@ -24,7 +40,7 @@ void work() {
     vec4 origin = get_v(SV_SHADOW_ORIGIN, path);
     vec3 direction = get_v(SV_SHADOW_DIRECTION, path).xyz;
     if (!trace_any(origin.xyz, direction, origin.w)) {
-        set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + get_v(SV_SHADOW_RADIANCE, path));
+        deliver(path, 1.0);
         return;
     }
     if (!CUTOUTS || constants[K_INFO].w < 0.5) return;
@@ -34,7 +50,7 @@ void work() {
     for (uint hop = 0u; hop < 16u; hop++) {
         Hit hit = trace_closest(from, direction, remaining);
         if (hit.triangle == NONE) {
-            set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + get_v(SV_SHADOW_RADIANCE, path) * kept);
+            deliver(path, kept);
             return;
         }
         float opacity = clamp(materials[shading[hit.triangle].w * MATERIAL_STRIDE + 12u].x, 0.0, 1.0);
@@ -46,7 +62,7 @@ void work() {
         from = p + direction * margin;
         remaining -= hit.t + margin;
         if (remaining <= 0.0) {
-            set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + get_v(SV_SHADOW_RADIANCE, path) * kept);
+            deliver(path, kept);
             return;
         }
     }

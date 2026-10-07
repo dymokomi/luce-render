@@ -4,6 +4,8 @@
 // the ray through (cut-out opacity), adds its emission, takes one light sample
 // (a shadow ray in the path's own slot) and one BSDF sample, then continues or
 // ends by Russian roulette and the bounce limits. Indirect light is clamped.
+// With light tracing, both techniques weigh against light paths too, and the
+// path carries the light tracer's density of it (connect.glsl).
 //
 // Materials are OpenPBR (shaders/openpbr.glsl).
 #extension GL_GOOGLE_include_directive : require
@@ -18,6 +20,7 @@ layout(local_size_x = 64) in;
 #include "openpbr.glsl"
 #include "lighttree.glsl"
 #include "guide.glsl"
+#include "connect.glsl"
 
 vec3 point_of(uint index) {
     return vec3(positions[index * 3u], positions[index * 3u + 1u], positions[index * 3u + 2u]);
@@ -54,14 +57,18 @@ void work() {
     // passes through cut-outs leave in place.
     vec4 vertex_row = get_v(SV_VERTEX, path);
     vec3 vertex = vertex_row.xyz;
+    vec4 mis = get_v(SV_MIS, path);
     if ((what & LIGHT_HIT) != 0u) {
         uint light = what & ~LIGHT_HIT;
         float weight = 1.0;
         if (total == 0u) {
             if (!light_visible(light)) return;
         } else if (ray.w > 0.0) {
-            float chance = (1.0 - constants[K_TREE].z) * tree_pdf(light_emitter(light), vertex, previous_normal(path));
-            weight = power_heuristic(ray.w, light_hit_pdf(light, vertex, ray.xyz, distance(vertex, origin + hit.x * ray.xyz)) * chance);
+            uint emitter = light_emitter(light);
+            float reach = distance(vertex, origin + hit.x * ray.xyz);
+            float chance = (1.0 - constants[K_TREE].z) * tree_pdf(emitter, vertex, previous_normal(path));
+            float traced = light_tracing() ? camera_hit_ratio(mis, emitter, light_cos(light, vertex, ray.xyz, reach), reach, ray.w) : 0.0;
+            weight = mis_weight(light_hit_pdf(light, vertex, ray.xyz, reach) * chance / ray.w, traced);
         }
         add_radiance(path, clamped(throughput * light_radiance(light, lambda) * weight, total));
         return;
@@ -76,6 +83,11 @@ void work() {
     if (inside) geometric = -geometric;
     uvec4 attributes = shading[triangle];
     vec3 p = origin + hit.x * ray.xyz;
+    // The camera's density of this vertex (area), and what turns the light
+    // sampler's pdf here toward the last vertex into that vertex's density.
+    float reach = distance(vertex, p);
+    float density = (total == 0u ? mis.w : ray.w) * abs(dot(ray.xyz, geometric)) / (reach * reach);
+    float back_reach = mis.z / (reach * reach);
     vec4 u_opacity = sample4(pixel, params.sample_index, GROUP_OPACITY(total));
 
     // Cut-out opacity: pass straight through with probability 1 - opacity, at
@@ -94,7 +106,8 @@ void work() {
         uint emitter = triangle_emitter(triangle);
         if (total > 0u && ray.w > 0.0 && emitter != NONE) {
             float chance = (1.0 - constants[K_TREE].z) * tree_pdf(emitter, vertex, previous_normal(path));
-            weight = power_heuristic(ray.w, triangle_hit_pdf(triangle, ray.xyz, distance(vertex, p)) * chance);
+            float traced = light_tracing() ? camera_hit_ratio(mis, emitter, abs(dot(ray.xyz, geometric)), reach, ray.w) : 0.0;
+            weight = mis_weight(triangle_hit_pdf(triangle, ray.xyz, reach) * chance / ray.w, traced);
         }
         add_radiance(path, clamped(throughput * material_color(attributes.w, 6u, lambda) * weight, total));
     }
@@ -105,12 +118,7 @@ void work() {
 
     vec3 normal = normalize((1.0 - hit.z - hit.w) * octahedral_decode(attributes.x) + hit.z * octahedral_decode(attributes.y) + hit.w * octahedral_decode(attributes.z));
     if (dot(normal, geometric) < 0.0) normal = -normal;
-    Surface surface;
-    surface.normal = normal;
-    basis(normal, surface.tangent, surface.bitangent);
-    surface.geometric = geometric;
-    surface.material = attributes.w;
-    surface.inside = inside;
+    Surface surface = surface_at(normal, geometric, attributes.w, inside);
     vec3 wo = to_local(surface, -ray.xyz);
     prepare_surface(surface, wo, lambda);
 
@@ -138,6 +146,7 @@ void work() {
     Spec emitted = Spec(0.0);
     float chance = 0.0;
     bool sampled = false;
+    uint emitter = NONE;
     if (u_light.x < p_distant) {
         float share;
         uint light = pick_distant(u_light.x / p_distant, share);
@@ -147,7 +156,6 @@ void work() {
             sampled = true;
         }
     } else {
-        uint emitter;
         float tree_chance;
         if (tree_sample((u_light.x - p_distant) / max(1e-7, 1.0 - p_distant), from, normal, emitter, tree_chance)) {
             chance = (1.0 - p_distant) * tree_chance;
@@ -166,10 +174,22 @@ void work() {
         if ((side > 0.0) == (wi.z > 0.0) && (side > 0.0 || surface.p_transmission > 0.0)) {
             float bsdf_pdf;
             Spec f = evaluate_surface(surface, wi, wo, bsdf_pdf);
-            if (guided > 0.0) bsdf_pdf = guided * guide_pdf(cell, s.direction) + (1.0 - guided) * bsdf_pdf;
+            // MIS against light paths weighs BSDF pdfs alone: what a light
+            // path can compute for this vertex (connect.glsl).
+            if (guided > 0.0 && !light_tracing()) bsdf_pdf = guided * guide_pdf(cell, s.direction) + (1.0 - guided) * bsdf_pdf;
             if (bsdf_pdf > 0.0) {
                 float light_pdf = s.pdf * chance;
-                float weight = s.delta ? 1.0 : power_heuristic(light_pdf, bsdf_pdf);
+                // The light tracer's density of this path over the camera
+                // path's BSDF ray reaching the same light point.
+                float traced = 0.0;
+                if (light_tracing() && !s.delta && emitter != NONE && density > 0.0) {
+                    float d2 = s.distance * s.distance;
+                    float at_last = total == 0u ? 1.0 : sampler_pdf(surface, s.direction, -ray.xyz) * back_reach / mis.y;
+                    float at_vertex = emission_direction_pdf(emitter, s.cos_light) * abs(side) / d2 / density;
+                    float at_light = emitter_area_pdf(emitter) / (bsdf_pdf * s.cos_light / d2);
+                    traced = mis.x * at_last * at_vertex * at_light;
+                }
+                float weight = s.delta ? 1.0 : mis_weight(bsdf_pdf / light_pdf, traced * bsdf_pdf / light_pdf);
                 Spec contribution = clamped(throughput * f * abs(wi.z) * emitted * (weight / light_pdf), total);
                 // Stop short of the emitter by the margin origins leave surfaces
                 // (offset_origin), so a shadow ray to an emissive triangle does
@@ -195,17 +215,20 @@ void work() {
     // The unguided throughput's ratio to the guided one: f cos / p_bsdf against
     // f cos / p_mixture.
     float unguided = 1.0;
+    float bsdf_only;
     if (u_opacity.y < guided) {
         wi = to_local(surface, guide_sample(cell, vec3(u_opacity.zw, u.w)));
         float bsdf_pdf;
         Spec f = evaluate_surface(surface, wi, wo, bsdf_pdf);
         pdf = guided * guide_pdf(cell, to_world(surface, wi)) + (1.0 - guided) * bsdf_pdf;
+        bsdf_only = bsdf_pdf;
         if (pdf <= 0.0 || spec_max(f) <= 0.0) return;
         unguided = pdf / max(bsdf_pdf, 1e-6 * pdf);
         weight = f * (abs(wi.z) / pdf);
         lobe = wi.z < 0.0 ? LOBE_TRANSMISSION : (surface.p_diffuse > 0.5 ? LOBE_DIFFUSE : LOBE_GLOSSY);
     } else {
         if (!sample_surface(surface, wo, u.xyw, wi, weight, pdf, lobe)) return;
+        bsdf_only = pdf;
         if (guided > 0.0) {
             float mixed = guided * guide_pdf(cell, to_world(surface, wi)) + (1.0 - guided) * pdf;
             unguided = mixed / pdf;
@@ -242,6 +265,14 @@ void work() {
     vec3 next = side > 0.0 ? from : offset_origin(p, -geometric);
     set_v(SV_ORIGIN, path, vec4(next, 0.0));
     set_v(SV_VERTEX, path, vec4(next, survival_scale));
+    // The ray's pdf for MIS where it ends; with light tracing, the BSDF's
+    // alone, and this vertex's factor of the light tracer's density, settled
+    // now that the light sampler's direction here is known.
+    if (light_tracing()) {
+        float at_last = total == 0u ? 1.0 : sampler_pdf(surface, direction, -ray.xyz) * back_reach / mis.y;
+        set_v(SV_MIS, path, vec4(mis.x * at_last, density, abs(side), 0.0));
+        pdf = bsdf_only;
+    }
     set_v(SV_DIRECTION, path, vec4(direction, pdf));
     set_v(SV_THROUGHPUT, path, throughput);
     queue_push(Q_CLOSEST + 1u - params.current, path);

@@ -2,7 +2,7 @@
 ## - a white furnace: a white diffuse sphere under a uniform white background
 ##   is exactly the background everywhere, in both builds;
 ## - a square area light over a grey plane: the radiance straight below its
-##   center is albedo / π × the rectangle's irradiance;
+##   center is albedo / π × the rectangle's irradiance, with light paths too;
 ## - spectral against RGB: a colored light (and a blackbody) on a white plane
 ##   agree between the builds within the spectral upsampling's error.
 import memory
@@ -11,6 +11,7 @@ from luce_std import clock
 from luce_gpu import gpu
 from luce_render import render
 from luce_geocore.geocore import Vector3, Mesh, MeshPrimitives, GeometrySet, MaterialAssignment
+import interop
 
 pub func checks(device: gpu.Device) -> !:
     try furnace(device, true, 0.0)
@@ -25,10 +26,14 @@ pub func checks(device: gpu.Device) -> !:
     try emission(device, false)
     try emission(device, true)
     try assigned_materials(device)
-    try area_light(device, true)
-    try area_light(device, false)
-    try emissive_quad(device, true)
-    try emissive_quad(device, false)
+    try area_light(device, true, 0.0)
+    try area_light(device, false, 0.0)
+    try area_light(device, true, 1.0)
+    try area_light(device, false, 0.5)
+    try emissive_quad(device, true, 0.0)
+    try emissive_quad(device, false, 0.0)
+    try emissive_quad(device, true, 1.0)
+    try lit_room(device)
     try cutout_shadow(device)
     try adaptive(device)
     try guided_room(device)
@@ -224,7 +229,7 @@ func corner_irradiance(x: f64, y: f64, h: f64) -> f64:
 
 ## The same square as an emissive mesh (two triangles, light sampled through
 ## the light tree, two-sided) lights the floor below it as the rect light does.
-func emissive_quad(device: gpu.Device, spectral: bool) -> !:
+func emissive_quad(device: gpu.Device, spectral: bool, light_tracing: f64) -> !:
     let floor = try MeshPrimitives.grid(20.0, 8)
     defer floor.release()
     let square = try MeshPrimitives.grid(1.0, 1)
@@ -240,9 +245,11 @@ func emissive_quad(device: gpu.Device, spectral: bool) -> !:
     let pitch = -math.atan2(0.5, 3.0)
     let set = try library.value().with_camera("/camera", Vector3(0.0, 0.5, 3.0), Vector3(pitch, 0.0, 0.0), 0, 200.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
     defer set.release()
-    var settings = render.RenderSettings.of(32, 32, 256)
+    # Light paths land on the measured pixels a few a sample: they need more.
+    var settings = render.RenderSettings.of(32, 32, 256 if light_tracing == 0.0 else 4096)
     settings.spectral = spectral
     settings.max_bounces = 1
+    settings.light_tracing = light_tracing
     settings.material.base_color = Vector3(0.5, 0.5, 0.5)
     settings.material.specular_weight = 0.0
     let pixels = try new f32[32 * 32 * 4] --- in memory.heap
@@ -251,7 +258,7 @@ func emissive_quad(device: gpu.Device, spectral: bool) -> !:
     let measured = window_mean(pixels, 32, 14, 14, 4)
     let expected = 0.5 / math.pi * 4.0 * 4.0 * corner_irradiance(0.5, 0.5, 1.0)
     if math.abs(measured.y / expected - 1.0) > 0.02:
-        print(f"emissive quad (spectral {spectral}): {measured.x} {measured.y} {measured.z}, expected {expected}")
+        print(f"emissive quad (spectral {spectral}, light paths {light_tracing}): {measured.x} {measured.y} {measured.z}, expected {expected}")
         assert(false)
 
 ## A 3 × 3 sheet between the rect light and the floor, reflecting nothing
@@ -330,7 +337,8 @@ func adaptive(device: gpu.Device) -> !:
 ## spot's bounce, which cosine sampling rarely finds and light sampling cannot.
 ## Path guiding learns where it is; at equal samples (four seeds, each shared
 ## by both ways) the image is closer to a long unguided reference.
-func guided_room(device: gpu.Device) -> !:
+## The room of guided_room (and lit_room).
+func lamp_room() -> interop.Reference[GeometrySet]!:
     let floor = try MeshPrimitives.grid(6.0, 4)
     defer floor.release()
     let wall = try MeshPrimitives.grid(6.0, 4)
@@ -356,7 +364,10 @@ func guided_room(device: gpu.Device) -> !:
         room = try room.value().merged(panel)
     let viewed = try room.value().with_camera("/camera", Vector3(2.5, 1.5, 2.5), Vector3(-0.15, 0.785, 0.0), 0, 24.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
     defer viewed.release()
-    let set = try viewed.value().with_light("/lamp", Vector3(0.0, 0.25, 0.0), Vector3(0.5 * math.pi, 0.0, 0.0), 0, Vector3(1.0, 1.0, 1.0), 200.0, 0.0, 0.0, false, 0.2, 0.2, 0.5, 0.0, false)
+    return try viewed.value().with_light("/lamp", Vector3(0.0, 0.25, 0.0), Vector3(0.5 * math.pi, 0.0, 0.0), 0, Vector3(1.0, 1.0, 1.0), 200.0, 0.0, 0.0, false, 0.2, 0.2, 0.5, 0.0, false)
+
+func guided_room(device: gpu.Device) -> !:
+    let set = try lamp_room()
     defer set.release()
     var scene = try render.compile_scene(set.value())
     defer scene.close()
@@ -388,7 +399,44 @@ func guided_room(device: gpu.Device) -> !:
     print(f"guiding: room MSE at 256 samples {errors[1]} guided against {errors[0]} unguided ({errors[0] / math.max(errors[1], 1e-30)}x better)")
     assert(errors[1] < errors[0])
 
-func area_light(device: gpu.Device, spectral: bool) -> !:
+## Light tracing in the lamp room: everything seen is lit by the small bright
+## spot the shaded lamp throws on the ceiling. Light paths reach it easily, so
+## with them the image at equal samples is closer to a long reference, and its
+## mean agrees with it (MIS weights that sum to one).
+func lit_room(device: gpu.Device) -> !:
+    let set = try lamp_room()
+    defer set.release()
+    var scene = try render.compile_scene(set.value())
+    defer scene.close()
+    let size: usize = 128 * 96 * 4
+    let images = try new f32[size * 3] --- in memory.heap
+    defer free(images) in memory.heap
+    for way in 0..<(usize)3:
+        var settings = render.RenderSettings.of(128, 96, 4096 if way == 0 else 256)
+        settings.spectral = false
+        settings.max_bounces = 3
+        settings.material.base_color = Vector3(0.5, 0.5, 0.5)
+        settings.material.specular_weight = 0.0
+        settings.light_tracing = 1.0 if way == 2 else 0.0
+        settings.seed = (u32)(way + 1)
+        var renderer = try render.Renderer.create(device, &scene, settings)
+        defer renderer.destroy()
+        try renderer.finish()
+        try renderer.read(images[way * size..<(way + 1) * size])
+    var errors: f64[2] = [0.0, 0.0]
+    var means: f64[3] = [0.0, 0.0, 0.0]
+    for p in 0..<(usize)(128 * 96):
+        let reference = (f64)images[p * 4 + 1]
+        means[0] += reference
+        for k in 0..<(usize)2:
+            let value = (f64)images[(k + 1) * size + p * 4 + 1]
+            means[k + 1] += value
+            errors[k] += (value - reference) * (value - reference)
+    print(f"light tracing: room MSE at 256 samples {errors[1]} against {errors[0]} without ({errors[0] / math.max(errors[1], 1e-30)}x better); mean {means[2] / means[0]} of the reference's")
+    assert(errors[1] < errors[0])
+    assert(math.abs(means[2] / means[0] - 1.0) < 0.01)
+
+func area_light(device: gpu.Device, spectral: bool, light_tracing: f64) -> !:
     let floor = try MeshPrimitives.grid(20.0, 8)
     defer floor.release()
     let base = try GeometrySet.of_mesh(floor)
@@ -400,9 +448,11 @@ func area_light(device: gpu.Device, spectral: bool) -> !:
     defer viewed.release()
     let set = try viewed.value().with_light("/key", Vector3(0.0, 1.0, 0.0), Vector3(-0.5 * math.pi, 0.0, 0.0), 0, Vector3(1.0, 1.0, 1.0), 4.0, 0.0, 0.0, false, 1.0, 1.0, 0.5, 0.0, false)
     defer set.release()
-    var settings = render.RenderSettings.of(32, 32, 256)
+    # Light paths land on the measured pixels a few a sample: they need more.
+    var settings = render.RenderSettings.of(32, 32, 256 if light_tracing == 0.0 else 4096)
     settings.spectral = spectral
     settings.max_bounces = 1
+    settings.light_tracing = light_tracing
     settings.material.base_color = Vector3(0.5, 0.5, 0.5)
     settings.material.specular_weight = 0.0
     let pixels = try new f32[32 * 32 * 4] --- in memory.heap
@@ -411,7 +461,7 @@ func area_light(device: gpu.Device, spectral: bool) -> !:
     let measured = window_mean(pixels, 32, 14, 14, 4)
     let expected = 0.5 / math.pi * 4.0 * 4.0 * corner_irradiance(0.5, 0.5, 1.0)
     if math.abs(measured.y / expected - 1.0) > 0.02 or math.abs(measured.x / expected - 1.0) > 0.03:
-        print(f"area light (spectral {spectral}): {measured.x} {measured.y} {measured.z}, expected {expected}")
+        print(f"area light (spectral {spectral}, light paths {light_tracing}): {measured.x} {measured.y} {measured.z}, expected {expected}")
         assert(false)
 
 ## A colored light, or a white one at a color temperature: products of two

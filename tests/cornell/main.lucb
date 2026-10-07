@@ -126,14 +126,20 @@ pub func main(arguments: str[]) -> i32!:
     defer scene.close()
     let pixels = try new f32[512 * 512 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
-    # LUCE_CORNELL_SAMPLES and LUCE_CORNELL_CLAMP change the image's samples
-    # and indirect clamp (none by default: the unbiased image).
+    # LUCE_CORNELL_SAMPLES, LUCE_CORNELL_CLAMP, LUCE_CORNELL_LIGHT and
+    # LUCE_CORNELL_SEED change the image's samples, indirect clamp (none by
+    # default: the unbiased image), light paths (percent of a path a pixel)
+    # and seed.
     var settings = render.RenderSettings.of(512, 512, (u32)number_of("LUCE_CORNELL_SAMPLES", 128.0))
     settings.clamp_indirect = number_of("LUCE_CORNELL_CLAMP", 0.0)
+    settings.light_tracing = number_of("LUCE_CORNELL_LIGHT", 0.0) / 100.0
+    settings.seed = (u32)number_of("LUCE_CORNELL_SEED", 0.0)
     let ms = try render_image(device, &scene, settings, pixels)
     try files.ensure_directory("build")
     try save_ppm("build/cornell.ppm", "P6 512 512 255\n", pixels, 512, 512, 0.0)
-    print(f"cornell: {scene.triangle_count()} triangles, 512 x 512, {settings.samples} samples, clamp {settings.clamp_indirect}: {ms} ms a sample (build/cornell.ppm)")
+    # The image as it is (rgba32f, rows from the top), for measuring.
+    try files.write("build/cornell.raw", u8[]((u8*)&pixels[0], pixels.length * 4))
+    print(f"cornell: {scene.triangle_count()} triangles, 512 x 512, {settings.samples} samples, clamp {settings.clamp_indirect}, light paths {settings.light_tracing}: {ms} ms a sample (build/cornell.ppm)")
     if os.env("LUCE_BENCH") == none: return 0
     # The full benchmark.
     let large = try new f32[1024 * 1024 * 4] --- in memory.heap
