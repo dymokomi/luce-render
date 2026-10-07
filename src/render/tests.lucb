@@ -141,3 +141,33 @@ test "a sphere's shading normals point away from its center (MeshPrimitives cent
             if normal.dot(position) < 0.9:
                 print(f"triangle {triangle} corner {k}: position {position.x} {position.y} {position.z} normal {normal.x} {normal.y} {normal.z}")
                 assert(false)
+
+test "the light tree reaches every emitter by its trail, and holds their energy at the root":
+    let grid = MeshPrimitives.grid(4.0, 9) catch failure: trap(failure.message)
+    defer grid.release()
+    let set = GeometrySet.of_mesh(grid) catch failure: trap(failure.message)
+    defer set.release()
+    var scene = compile_scene(set.value()) catch failure: trap(failure.message)
+    defer scene.close()
+    var glowing = OpenPbr.standard()
+    glowing.emission_luminance = 2.0
+    let materials: OpenPbr[1] = [glowing]
+    var no_lights: f32[1] = [0.0]
+    var tree = build_light_tree(&scene, no_lights[..<0], 0, materials) catch failure: trap(failure.message)
+    defer tree.close()
+    let count = tree.emitter_count
+    assert(count == scene.triangle_count() and count == 162)
+    var total: f64 = 0.0
+    for index in 0..<count:
+        let trail = tree.records.items[index * 4 + 1]
+        let depth = tree.records.items[index * 4 + 2]
+        assert(depth <= 8)
+        var node: usize = 0
+        for level in 0..<depth:
+            node = (usize)tree.links.items[node * 2] + (usize)((trail >> level) & 1)
+        assert(tree.links.items[node * 2 + 1] == leaf_node and (usize)tree.links.items[node * 2] == index)
+        # The triangle map points back at the emitter.
+        let code = tree.records.items[index * 4]
+        assert(code & emitter_triangle != 0 and tree.records.items[count * 4 + (usize)(code & ~emitter_triangle)] == (u32)index)
+        total += (f64)tree.nodes.items[node * 12 + 3]
+    assert(math.abs((f64)tree.nodes.items[3] / total - 1.0) < 1e-4)

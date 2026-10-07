@@ -14,6 +14,7 @@ layout(local_size_x = 64) in;
 #include "lights.glsl"
 #include "microfacet.glsl"
 #include "openpbr.glsl"
+#include "lighttree.glsl"
 
 vec3 point_of(uint index) {
     return vec3(positions[index * 3u], positions[index * 3u + 1u], positions[index * 3u + 2u]);
@@ -52,7 +53,8 @@ void main() {
         if (total == 0u) {
             if (!light_visible(light)) return;
         } else if (ray.w > 0.0) {
-            weight = power_heuristic(ray.w, light_hit_pdf(light, origin, ray.xyz, hit.x));
+            float chance = (1.0 - constants[K_TREE].z) * tree_pdf(light_emitter(light), origin, previous_normal(path));
+            weight = power_heuristic(ray.w, light_hit_pdf(light, origin, ray.xyz, hit.x) * chance);
         }
         add_radiance(path, clamped(throughput * light_radiance(light, lambda) * weight, total));
         return;
@@ -78,9 +80,17 @@ void main() {
         return;
     }
 
-    // Emission: surfaces are not light-sampled yet, so it takes no MIS weight.
-    if (material_at(attributes.w, 7u).w > 0.0)
-        add_radiance(path, clamped(throughput * material_color(attributes.w, 6u, lambda), total));
+    // Emission, MIS-weighted against the light sample the previous vertex took
+    // (emissive triangles are emitters of the light tree).
+    if (material_at(attributes.w, 7u).w > 0.0) {
+        float weight = 1.0;
+        uint emitter = triangle_emitter(triangle);
+        if (total > 0u && ray.w > 0.0 && emitter != NONE) {
+            float chance = (1.0 - constants[K_TREE].z) * tree_pdf(emitter, origin, previous_normal(path));
+            weight = power_heuristic(ray.w, triangle_hit_pdf(triangle, ray.xyz, hit.x) * chance);
+        }
+        add_radiance(path, clamped(throughput * material_color(attributes.w, 6u, lambda) * weight, total));
+    }
 
     // A surface reached past the bounce limit ends the path. The ray that got
     // here was still traced, so its light hits (and their MIS weights) count.
@@ -97,29 +107,58 @@ void main() {
     vec3 wo = to_local(surface, -ray.xyz);
     prepare_surface(surface, wo, lambda);
 
-    // One light sample, on either side when the surface transmits.
-    uint lights_count = uint(constants[K_INFO].x);
-    if (lights_count > 0u) {
-        vec4 u = sample4(pixel, params.sample_index, GROUP_LIGHT(total));
-        float select_pdf;
-        uint light = pick_light(u.x, select_pdf);
-        LightSample s;
-        if (select_pdf > 0.0 && sample_light(light, p, u.yz, s)) {
-            float side = dot(s.direction, geometric);
-            vec3 wi = to_local(surface, s.direction);
-            if ((side > 0.0) == (wi.z > 0.0) && (side > 0.0 || surface.p_transmission > 0.0)) {
-                float bsdf_pdf;
-                Spec f = evaluate_surface(surface, wi, wo, bsdf_pdf);
-                if (bsdf_pdf > 0.0) {
-                    float light_pdf = s.pdf * select_pdf;
-                    float weight = s.delta ? 1.0 : power_heuristic(light_pdf, bsdf_pdf);
-                    Spec contribution = clamped(throughput * f * abs(wi.z) * light_radiance(light, lambda) * (weight / light_pdf), total);
-                    float reach = s.distance >= INFINITY ? INFINITY : s.distance * (1.0 - 1e-4);
-                    set_v(SV_SHADOW_ORIGIN, path, vec4(offset_origin(p, side > 0.0 ? geometric : -geometric), reach));
-                    set_v(SV_SHADOW_DIRECTION, path, vec4(s.direction, 0.0));
-                    set_v(SV_SHADOW_RADIANCE, path, contribution);
-                    queue_push(Q_SHADOW, path);
-                }
+    // One light sample, on either side when the surface transmits: a distant
+    // light (by power), or an emitter of the light tree (by importance at this
+    // point and normal).
+    vec3 from = offset_origin(p, geometric);
+    vec4 u_light = sample4(pixel, params.sample_index, GROUP_LIGHT(total));
+    float p_distant = constants[K_TREE].z;
+    LightSample s;
+    Spec emitted = Spec(0.0);
+    float chance = 0.0;
+    bool sampled = false;
+    if (u_light.x < p_distant) {
+        float share;
+        uint light = pick_distant(u_light.x / p_distant, share);
+        if (light != NONE && share > 0.0 && sample_light(light, p, u_light.yz, s)) {
+            chance = p_distant * share;
+            emitted = light_radiance(light, lambda);
+            sampled = true;
+        }
+    } else {
+        uint emitter;
+        float tree_chance;
+        if (tree_sample((u_light.x - p_distant) / max(1e-7, 1.0 - p_distant), from, normal, emitter, tree_chance)) {
+            chance = (1.0 - p_distant) * tree_chance;
+            uint code = emitter_code(emitter);
+            if ((code & EMITTER_TRIANGLE) != 0u) {
+                sampled = sample_triangle(code & ~EMITTER_TRIANGLE, p, u_light.yz, lambda, s, emitted);
+            } else if (sample_light(code, p, u_light.yz, s)) {
+                emitted = light_radiance(code, lambda);
+                sampled = true;
+            }
+        }
+    }
+    if (sampled && chance > 0.0) {
+        float side = dot(s.direction, geometric);
+        vec3 wi = to_local(surface, s.direction);
+        if ((side > 0.0) == (wi.z > 0.0) && (side > 0.0 || surface.p_transmission > 0.0)) {
+            float bsdf_pdf;
+            Spec f = evaluate_surface(surface, wi, wo, bsdf_pdf);
+            if (bsdf_pdf > 0.0) {
+                float light_pdf = s.pdf * chance;
+                float weight = s.delta ? 1.0 : power_heuristic(light_pdf, bsdf_pdf);
+                Spec contribution = clamped(throughput * f * abs(wi.z) * emitted * (weight / light_pdf), total);
+                // Stop short of the emitter by the margin origins leave surfaces
+                // (offset_origin), so a shadow ray to an emissive triangle does
+                // not find the triangle itself.
+                vec3 target = p + s.direction * s.distance;
+                float margin = 4e-4 * max(1.0, max(abs(target.x), max(abs(target.y), abs(target.z))));
+                float reach = s.distance >= INFINITY ? INFINITY : max(0.0, s.distance - margin);
+                set_v(SV_SHADOW_ORIGIN, path, vec4(offset_origin(p, side > 0.0 ? geometric : -geometric), reach));
+                set_v(SV_SHADOW_DIRECTION, path, vec4(s.direction, 0.0));
+                set_v(SV_SHADOW_RADIANCE, path, contribution);
+                queue_push(Q_SHADOW, path);
             }
         }
     }
@@ -144,7 +183,10 @@ void main() {
         throughput /= survive;
     }
     set_u(SU_BOUNCE, path, bounces);
-    set_v(SV_ORIGIN, path, vec4(offset_origin(p, side > 0.0 ? geometric : -geometric), 0.0));
+    set_u(SU_NORMAL, path, octahedral_encode(normal));
+    // From `from` on the reflecting side: the point the light tree weighed, so
+    // an emitter hit's MIS pdf matches the light sample's.
+    set_v(SV_ORIGIN, path, vec4(side > 0.0 ? from : offset_origin(p, -geometric), 0.0));
     set_v(SV_DIRECTION, path, vec4(direction, pdf));
     set_v(SV_THROUGHPUT, path, throughput);
     queue_push(Q_CLOSEST + 1u - params.current, path);

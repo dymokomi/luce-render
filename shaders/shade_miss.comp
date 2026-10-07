@@ -25,7 +25,7 @@ void main() {
         if (bounce == 0u) {
             if (!light_visible(light)) continue;
         } else if (ray.w > 0.0) {
-            weight = power_heuristic(ray.w, light_hit_pdf(light, vec3(0.0), ray.xyz, INFINITY));
+            weight = power_heuristic(ray.w, light_hit_pdf(light, vec3(0.0), ray.xyz, INFINITY) * light_select_pdf(light));
         }
         radiance += light_radiance(light, lambda) * weight;
     }

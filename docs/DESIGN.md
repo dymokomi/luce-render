@@ -119,9 +119,10 @@ for the viewport.
 
 - **UsdLux shapes:** rect, disk, sphere and distant, with dome later. Rect and disk
   lights are also primitives in the BVH, so BSDF rays can hit them.
-- **Light tree from v1:** Cycles' min/max importance over pbrt's compact 32-byte
-  node, with at most 8 emitters per leaf. It covers the lights and emissive
-  triangles.
+- **Light tree:** pbrt-v4's light-bounds importance over a median-split binary
+  tree, one emitter a leaf. It covers the lights that have a place and the emissive
+  triangles. Each emitter's trail gives its pdf for MIS (light_tree.lucb,
+  lighttree.glsl). Cycles' min/max importance and wider leaves can come later.
 - **MIS:** power-heuristic between light sampling and BSDF sampling. Russian
   roulette, indirect clamping and filter-glossy follow Cycles.
 
@@ -168,22 +169,31 @@ EON, fuzz and thin film are closed form and need no tables.
 
 ## Status
 
-v1 is running: a wavefront integrator in both builds, with Lambertian surfaces in
-the default material, UsdLux rect, disk, sphere and distant lights, power-heuristic
-MIS, Russian roulette, an Owen-scrambled Sobol sampler, an XYZ or ACEScg film, and
-progressive passes. The GPU tests check it against closed forms:
+v1 renders OpenPBR v1 (EON diffuse, GGX specular over it, F82 metal, coat,
+rough dielectric transmission, emission, cut-out opacity) with per-face material
+binding, UsdLux lights and emissive meshes. Light samples come from a light tree
+over every emitter (power-chosen distant lights aside), MIS-weighted against BSDF
+samples through trail-recomputed tree pdfs. It has an indirect clamp, per-kind
+bounce limits, hardware ray queries with the software BVH as fallback, and
+spectral and RGB builds.
 
-- **White furnace:** within 1%.
-- **Rect-light irradiance:** within 2%.
-- **Spectral against RGB:** within 3%, for a colored light and for a blackbody.
+GPU tests check it against closed forms or self-consistency:
 
-**Speed:** 1920 × 1080, 12k triangles, 12 bounces: about 6.7 ms a sample spectral
-and 6.5 ms RGB on an M4 Max. That covers 2M paths in 2 bands of 2^20.
+- **White furnaces:** diffuse under specular, rough EON, rough metal, coat, smooth
+  glass.
+- **Cut-out opacity.**
+- **Emission.**
+- **Assigned materials.**
+- **Rect light and emissive quad irradiance:** both against the closed form.
+- **Spectral against RGB.**
+- **Ray queries against the BVH.**
+
+**Speed:** about 9 ms a 1080p spectral sample at 12 bounces on an M4 Max.
 
 Next:
 
-- OpenPBR v1 lobes with their albedo tables, and materials per triangle.
-- Smooth normals.
-- The light tree.
-- Adaptive sampling.
-- Workgroup-aggregated queue appends.
+- Adaptive sampling and a denoiser.
+- Transparent shadows through glass and cut-outs.
+- Instancing as a BLAS per prototype.
+- Workgroup-aggregated queue appends and per-kernel timings.
+- Then path guiding.

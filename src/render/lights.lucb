@@ -7,8 +7,10 @@
 #       radiance is color × intensity × 2^exposure, divided by its area when it
 #       normalizes, as UsdLux defines it. A color temperature multiplies by the blackbody
 #       of that temperature at luminance 1. A distant light's intensity is the irradiance
-#       it delivers, spread over its angular size (a delta when the angle is 0). Lights
-#       are chosen for light samples in proportion to an estimate of their power.
+#       it delivers, spread over its angular size (a delta when the angle is 0).
+#       Light samples choose distant lights by power (their shares among the distant
+#       lights are recorded here); every other light is an emitter of the light tree
+#       (light_tree.lucb), its index recorded here in the order the tree numbers them.
 #
 #==============================================================================================
 
@@ -18,9 +20,9 @@ pub let light_stride: usize = 7
 func luminance(rgb: Vector3) -> f64:
     return 0.2722287168 * rgb.x + 0.6740817658 * rgb.y + 0.0536895174 * rgb.z
 
-## The records of the scene's lights, and their count; `radius` bounds the scene
-## (for a distant light's share of the power).
-pub func pack_lights(objects: const SceneObjects*, radius: f64, out: Growing[f32]*) -> usize!:
+## The records of the scene's lights: their count and the distant lights'
+## power, by how much of the scene (radius `radius`) they light.
+pub func pack_lights(objects: const SceneObjects*, radius: f64, out: Growing[f32]*) -> (usize, f64)!:
     out.clear()
     var powers = Growing[f64]()
     defer powers.close()
@@ -71,8 +73,7 @@ pub func pack_lights(objects: const SceneObjects*, radius: f64, out: Growing[f32
             let tinted = to_acescg.apply(tint.multiply_scalar(1.0 / tint.y))
             rgb = Vector3(rgb.x * tinted.x, rgb.y * tinted.y, rgb.z * tinted.z)
             flags += 2.0
-        let reach = area if kind < 3.0 else math.pi * radius * radius
-        try powers.push(math.max(0.0, luminance(rgb)) * reach * (1.0 if kind == 3.0 else math.pi))
+        try powers.push(math.max(0.0, luminance(rgb)) * math.pi * radius * radius if kind == 3.0 else -1.0)
         let rows: f64[28] = [position.x, position.y, position.z, kind,
                              u.x, u.y, u.z, size,
                              v.x, v.y, v.z, cos_half,
@@ -81,14 +82,26 @@ pub func pack_lights(objects: const SceneObjects*, radius: f64, out: Growing[f32
                              rgb.x, rgb.y, rgb.z, flags,
                              light.temperature, 0.0, 0.0, 0.0]
         for value in rows: try out.push((f32)value)
+    # Distant lights: shares of their power and the running share; the others
+    # take the next emitter index.
     let count = powers.count
     var total: f64 = 0.0
-    for power in powers.view(): total += power
+    var distant: usize = 0
+    for power in powers.view():
+        if power >= 0.0:
+            total += power
+            distant += 1
     var running: f64 = 0.0
+    var emitter: usize = 0
     for index in 0..<count:
-        let chance = powers.items[index] / total if total > 0.0 else 1.0 / (f64)count
-        running += chance
         let row = (index * light_stride + 6) * 4
-        out.items[row + 1] = (f32)chance
-        out.items[row + 2] = (f32)running if index + 1 < count else 2.0
-    return count
+        let power = powers.items[index]
+        if power < 0.0:
+            out.items[row + 3] = (f32)emitter
+            emitter += 1
+            continue
+        let share = power / total if total > 0.0 else 1.0 / (f64)distant
+        running += share
+        out.items[row + 1] = (f32)share
+        out.items[row + 2] = (f32)running
+    return (count, total)

@@ -6,6 +6,7 @@ device.lucb
 spectrum.lucb
 lights.lucb
 materials.lucb
+light_tree.lucb
 integrator.lucb
 session.lucb
 kernels.lucb

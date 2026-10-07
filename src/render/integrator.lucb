@@ -18,7 +18,8 @@
 #       3 lights, 4 state (vec4 fields), 5 state (uint fields), 6 queues, 7 film,
 #       8 the image (ACEScg), 9 constants, 10 the display image (exposed, Rec.709),
 #       11 triangle shading attributes, 12 materials, 13 albedo tables, 14 the TLAS
-#       (hardware ray queries; otherwise intersection walks the BVH in 0..2).
+#       (hardware ray queries; otherwise intersection walks the BVH in 0..2), 15 the
+#       light tree's links, emitters and triangle map (light_tree.lucb).
 #
 #==============================================================================================
 
@@ -52,7 +53,7 @@ pub struct RenderSettings:
         return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false, 1024, 1024, 1024, 0.0)
 
 let state_v_fields: usize = 9
-let state_u_fields: usize = 3
+let state_u_fields: usize = 4
 let queue_count: usize = 5
 let queue_base: usize = 32
 let constants_rows: usize = 16
@@ -140,6 +141,7 @@ pub struct Renderer:
     var constants: gpu.Buffer
     var materials: gpu.Buffer
     var tables: gpu.Buffer
+    var emitters: gpu.Buffer
     var state_v: gpu.Buffer
     var state_u: gpu.Buffer
     var queues: gpu.Buffer
@@ -173,18 +175,40 @@ pub struct Renderer:
         errdefer kernels.destroy()
         var packed = Growing[f32]()
         defer packed.close()
-        let light_count = try pack_lights(&scene.objects, scene_radius(scene), &packed)
+        let (light_count, distant_power) = try pack_lights(&scene.objects, scene_radius(scene), &packed)
+        # Materials: the default first (material 0), then the scene's library.
+        var library = Growing[OpenPbr]()
+        defer library.close()
+        try library.push(settings.material)
+        for index in 0..<scene.materials.count(): try library.push(openpbr_of(&scene.materials, index))
+        # The light tree's nodes follow the light records; its links, emitter
+        # records and triangle map make the emitter buffer.
+        var tree = try build_light_tree(scene, packed.view(), light_count, library.view())
+        defer tree.close()
+        let node_offset = packed.count // 4
+        for value in tree.nodes.view(): try packed.push(value)
         var lights = try buffer_of(device, u8[]((u8*)packed.items.data, packed.count * 4))
         errdefer lights.destroy()
+        var links = Growing[u32]()
+        defer links.close()
+        try links.assign(tree.links.view())
+        for value in tree.records.view(): try links.push(value)
+        var emitters = try buffer_of(device, u8[]((u8*)links.items.data, links.count * 4))
+        errdefer emitters.destroy()
+        let total = distant_power + tree.energy
+        let p_distant = (distant_power / total if total > 0.0 else 0.0) if tree.emitter_count > 0 else (1.0 if distant_power > 0.0 else 0.0)
         var rows: f32[64]
         try fill_constants(rows, settings, light_count)
+        let tree_row: f64[4] = [(f64)tree.node_count(), (f64)node_offset, p_distant, (f64)tree.emitter_count]
+        let offsets_row: f64[4] = [(f64)tree.links.count, (f64)(tree.links.count + tree.emitter_count * 4), 0.0, 0.0]
+        for k in 0..<(usize)4:
+            rows[32 + k] = (f32)tree_row[k]
+            rows[40 + k] = (f32)offsets_row[k]
         var constants = try gpu.Buffer.create(device, u8[]((u8*)&rows[0], 256))
         errdefer constants.destroy()
         var records = Growing[f32]()
         defer records.close()
-        # The default first (material 0), then the scene's library.
-        try pack_material(settings.material, &records)
-        for index in 0..<scene.materials.count(): try pack_material(openpbr_of(&scene.materials, index), &records)
+        for material in library.view(): try pack_material(material, &records)
         var materials = try buffer_of(device, u8[]((u8*)records.items.data, records.count * 4))
         errdefer materials.destroy()
         var tables = try make_tables(device)
@@ -200,7 +224,7 @@ pub struct Renderer:
         var output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
         errdefer output.destroy()
         let shown = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
-        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, none, 0, 0, 0)
+        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, none, 0, 0, 0)
 
     ## Start the next pass if the last has finished. True while there is work,
     ## running or to come; false once every sample is in the image.
@@ -311,15 +335,15 @@ pub struct Renderer:
         let values: u32[8] = [(u32)start, (u32)count, self.sample, 0, current, phase, (u32)self.pool, self.settings.seed]
         for at in 0..<(usize)8: memory.write[u32]((void*)&block[64 + at * 4], values[at])
 
-    func bindings(kernel: const Kernel*) -> gpu.Binding[15]:
-        var all: gpu.Binding[15] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
+    func bindings(kernel: const Kernel*) -> gpu.Binding[16]:
+        var all: gpu.Binding[16] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
                                     gpu.Binding(buffer = self.lights), gpu.Binding(buffer = self.state_v), gpu.Binding(buffer = self.state_u),
                                     gpu.Binding(buffer = self.queues), gpu.Binding(buffer = self.film), gpu.Binding(texture = self.output),
                                     gpu.Binding(buffer = self.constants), gpu.Binding(texture = self.shown),
                                     gpu.Binding(buffer = self.scene.shading), gpu.Binding(buffer = self.materials),
-                                    gpu.Binding(buffer = self.tables), gpu.Binding()]
+                                    gpu.Binding(buffer = self.tables), gpu.Binding(), gpu.Binding(buffer = self.emitters)]
         if self.scene.accelerated: all[14] = gpu.Binding(accel = self.scene.tlas)
-        for at in 0..<(usize)15:
+        for at in 0..<(usize)16:
             if at >= kernel.kinds.length or kernel.kinds[at] == 0: all[at] = gpu.Binding()
         return all
 
@@ -346,6 +370,7 @@ pub struct Renderer:
         self.constants.destroy()
         self.materials.destroy()
         self.tables.destroy()
+        self.emitters.destroy()
         self.state_v.destroy()
         self.state_u.destroy()
         self.queues.destroy()

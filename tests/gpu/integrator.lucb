@@ -27,6 +27,8 @@ pub func checks(device: gpu.Device) -> !:
     try assigned_materials(device)
     try area_light(device, true)
     try area_light(device, false)
+    try emissive_quad(device, true)
+    try emissive_quad(device, false)
     try spectral_agrees(device, 0.0)
     try spectral_agrees(device, 3000.0)
     try hardware_agrees(device)
@@ -203,7 +205,8 @@ func assigned_materials(device: gpu.Device) -> !:
     try rendered(device, set.value(), settings, pixels)
     let glowing = window_mean(pixels, 48, 12, 14, 4)
     let dark = window_mean(pixels, 48, 32, 14, 4)
-    if math.abs(glowing.x - 2.0) > 0.03 or glowing.y > 0.01 or dark.x > 0.001:
+    # The right sphere does not glow; it only catches a little of the left's light.
+    if math.abs(glowing.x - 2.0) > 0.03 or glowing.y > 0.01 or dark.x > 0.05:
         print(f"assigned materials: left {glowing.x} {glowing.y} {glowing.z}, right {dark.x} {dark.y} {dark.z}")
         assert(false)
 
@@ -213,6 +216,38 @@ func corner_irradiance(x: f64, y: f64, h: f64) -> f64:
     let a = math.sqrt(x * x + h * h)
     let b = math.sqrt(y * y + h * h)
     return 0.5 * (x / a * math.atan(y / a) + y / b * math.atan(x / b))
+
+## The same square as an emissive mesh (two triangles, light sampled through
+## the light tree, two-sided) lights the floor below it as the rect light does.
+func emissive_quad(device: gpu.Device, spectral: bool) -> !:
+    let floor = try MeshPrimitives.grid(20.0, 8)
+    defer floor.release()
+    let square = try MeshPrimitives.grid(1.0, 1)
+    defer square.release()
+    let glowing = try MaterialAssignment.faces(square, "", "material", "materials/glow")
+    defer glowing.release()
+    let lamp = try (try GeometrySet.of_mesh(glowing)).value().transformed(Vector3(0.0, 1.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer lamp.release()
+    let both = try (try GeometrySet.of_mesh(floor)).value().merged(lamp)
+    defer both.release()
+    let library = try both.value().with_material("materials/glow", "openpbr", "emission_luminance\nbase_weight\nspecular_weight", [4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    defer library.release()
+    let pitch = -math.atan2(0.5, 3.0)
+    let set = try library.value().with_camera("/camera", Vector3(0.0, 0.5, 3.0), Vector3(pitch, 0.0, 0.0), 0, 200.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer set.release()
+    var settings = render.RenderSettings.of(32, 32, 256)
+    settings.spectral = spectral
+    settings.max_bounces = 1
+    settings.material.base_color = Vector3(0.5, 0.5, 0.5)
+    settings.material.specular_weight = 0.0
+    let pixels = try new f32[32 * 32 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    try rendered(device, set.value(), settings, pixels)
+    let measured = window_mean(pixels, 32, 14, 14, 4)
+    let expected = 0.5 / math.pi * 4.0 * 4.0 * corner_irradiance(0.5, 0.5, 1.0)
+    if math.abs(measured.y / expected - 1.0) > 0.02:
+        print(f"emissive quad (spectral {spectral}): {measured.x} {measured.y} {measured.z}, expected {expected}")
+        assert(false)
 
 func area_light(device: gpu.Device, spectral: bool) -> !:
     let floor = try MeshPrimitives.grid(20.0, 8)

@@ -70,6 +70,7 @@ layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[
 // What was hit: a triangle or LIGHT_HIT | light. Kept as an integer: bits stored
 // in a float can be denormals, which Metal flushes to zero.
 #define SU_HIT 2u
+#define SU_NORMAL 3u        // the previous vertex's shading normal (octahedral), for the light tree's MIS pdf
 
 vec4 get_v(uint field, uint path) { return state_v[field * params.pool + path]; }
 void set_v(uint field, uint path, vec4 value) { state_v[field * params.pool + path] = value; }

@@ -7,7 +7,8 @@
 //   3  emission direction (local -Z), area
 //   4  emission spectrum fit (c0, c1, c2, scale)
 //   5  emission ACEScg, flags (1 visible to camera, 2 blackbody)
-//   6  kelvin, selection pdf, cumulative selection, -
+//   6  kelvin, share among distant lights, cumulative share, emitter (lights
+//      that have a place are emitters of the light tree, lighttree.glsl)
 // Radiance already holds intensity, exposure and normalization; a distant light's
 // is its irradiance over its solid angle (all of it when the angle is 0: a delta).
 
@@ -20,7 +21,9 @@
 vec4 light_at(uint light, uint row) { return lights[light * LIGHT_STRIDE + row]; }
 uint light_type(uint light) { return uint(light_at(light, 0u).w); }
 bool light_visible(uint light) { return (uint(light_at(light, 5u).w) & 1u) != 0u; }
-float light_select_pdf(uint light) { return light_at(light, 6u).y; }
+// The chance a light sample picks distant light `light` (others: the tree's).
+float light_select_pdf(uint light) { return constants[8].z * light_at(light, 6u).y; }
+uint light_emitter(uint light) { return uint(light_at(light, 6u).w); }
 
 Spec light_radiance(uint light, vec4 lambda) {
     vec4 rgb = light_at(light, 5u);
@@ -34,14 +37,17 @@ Spec light_radiance(uint light, vec4 lambda) {
     return radiance;
 }
 
-// A light chosen in proportion to its power; `pdf` the chance of choosing it.
-uint pick_light(float u, out float pdf) {
+// A distant light chosen in proportion to its power; `pdf` its share among
+// the distant lights.
+uint pick_distant(float u, out float pdf) {
     uint count = uint(constants[K_INFO].x);
-    uint chosen = count - 1u;
+    uint chosen = NONE;
     for (uint light = 0u; light < count; light++) {
-        if (u < light_at(light, 6u).z) { chosen = light; break; }
+        if (light_type(light) != 3u) continue;
+        chosen = light;
+        if (u < light_at(light, 6u).z) break;
     }
-    pdf = light_select_pdf(chosen);
+    pdf = chosen == NONE ? 0.0 : light_at(chosen, 6u).y;
     return chosen;
 }
 
@@ -157,7 +163,7 @@ float intersect_light(uint light, vec3 o, vec3 d, float t_max) {
 }
 
 // The solid-angle pdf of sampling the light hit at distance `t` along `d` from
-// `o`, times its selection pdf: the light side of MIS for a BSDF ray.
+// `o` (the selection's chance not included).
 float light_hit_pdf(uint light, vec3 o, vec3 d, float t) {
     vec4 row0 = light_at(light, 0u);
     uint type = uint(row0.w);
@@ -174,5 +180,5 @@ float light_hit_pdf(uint light, vec3 o, vec3 d, float t) {
         float cos_light = max(1e-12, -dot(d, row3.xyz));
         pdf = t * t / (cos_light * row3.w);
     }
-    return pdf * light_select_pdf(light);
+    return pdf;
 }

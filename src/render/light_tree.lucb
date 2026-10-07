@@ -1,0 +1,233 @@
+#==============================================================================================
+#
+#   render/light_tree - A tree of every emitter, for choosing light samples
+#
+#   DESCRIPTION:
+#       Emitters are the UsdLux lights that have a place (rect, disk, sphere) and every
+#       emissive triangle. Each has bounds, a power and an emission cone (axis, the
+#       spread of normals θo, the spread of emission about them θe), after pbrt-v4's
+#       LightBounds and Cycles' light tree. The tree is binary, split at the median
+#       emitter along the bounds' longest axis, so its depth stays below 32; a node
+#       holds the union of its emitters' bounds, cones and power. The kernels
+#       (shaders/lighttree.glsl) descend it choosing children by pbrt's importance, and
+#       recompute an emitter's probability for MIS from its trail (the left/right
+#       choices from the root, a bit each). Distant lights stay outside the tree.
+#
+#       Layout. Node floats (12 each) follow the light records in the lights buffer:
+#       lo.xyz, energy; hi.xyz, cos θo; axis.xyz, cos θe. The emitter buffer holds u32s:
+#       2 per node (first child, or the emitter of a leaf; leaf flag), then 4 per emitter
+#       (what it is: a light index, or a triangle slot with emitter_triangle set; its
+#       trail; its depth; -), then each triangle's emitter (none: no_emitter).
+#
+#==============================================================================================
+
+pub let emitter_triangle: u32 = 0x80000000
+pub let leaf_node: u32 = 0x80000000
+pub let no_emitter: u32 = 0xffffffff
+
+struct Emitter:
+    var lo: Vector3
+    var hi: Vector3
+    var axis: Vector3
+    var theta_o: f64
+    var theta_e: f64
+    var energy: f64
+    var code: u32
+
+    func center() -> Vector3:
+        return self.lo.add(self.hi).multiply_scalar(0.5)
+
+## The cone holding both cones of normals (pbrt-v4's DirectionCone Union).
+func cone_union(a_axis: Vector3, a_theta: f64, b_axis: Vector3, b_theta: f64) -> (Vector3, f64):
+    let theta_d = math.acos(math.clamp(a_axis.dot(b_axis), -1.0, 1.0))
+    if math.min(theta_d + b_theta, math.pi) <= a_theta: return (a_axis, a_theta)
+    if math.min(theta_d + a_theta, math.pi) <= b_theta: return (b_axis, b_theta)
+    let theta_o = 0.5 * (a_theta + theta_d + b_theta)
+    if theta_o >= math.pi: return (a_axis, math.pi)
+    let rotate = theta_o - a_theta
+    let w = a_axis.cross(b_axis)
+    if w.length() < 1e-12: return (a_axis, math.pi)
+    # Rodrigues: a's axis turned toward b's by `rotate`.
+    let k = w.multiply_scalar(1.0 / w.length())
+    let turned = a_axis.multiply_scalar(math.cos(rotate)).add(k.cross(a_axis).multiply_scalar(math.sin(rotate))).add(k.multiply_scalar(k.dot(a_axis) * (1.0 - math.cos(rotate))))
+    let direction = turned.normalized() catch failure:
+        _ = failure
+        recover a_axis
+    return (direction, theta_o)
+
+pub struct LightTree:
+    pub var nodes: Growing[f32]
+    pub var links: Growing[u32]
+    ## Emitter records then the triangle map, as the emitter buffer holds them.
+    pub var records: Growing[u32]
+    pub var emitter_count: usize
+    pub var energy: f64
+
+    pub func init():
+        self.nodes = Growing[f32]()
+        self.links = Growing[u32]()
+        self.records = Growing[u32]()
+        self.emitter_count = 0
+        self.energy = 0.0
+
+    pub func node_count() -> usize:
+        return self.links.count // 2
+
+    pub func close():
+        self.nodes.close()
+        self.links.close()
+        self.records.close()
+
+struct TreeJob:
+    var node: usize
+    var first: usize
+    var count: usize
+    var trail: u32
+    var depth: u32
+
+## The tree over the scene's emitters: its lights that have a place (the light
+## records `lights`, `light_count` of them) and its triangles whose material
+## emits (`materials`, by the triangles' material index).
+pub func build_light_tree(scene: const CompiledScene*, lights: const f32[], light_count: usize, materials: const OpenPbr[]) -> LightTree!:
+    var tree = LightTree()
+    errdefer tree.close()
+    var emitters = Growing[Emitter]()
+    defer emitters.close()
+    for index in 0..<light_count:
+        let row = lights[index * light_stride * 4..<(index + 1) * light_stride * 4]
+        let kind = row[3]
+        if kind == 3.0: continue
+        let position = Vector3((f64)row[0], (f64)row[1], (f64)row[2])
+        let u = Vector3((f64)row[4], (f64)row[5], (f64)row[6])
+        let v = Vector3((f64)row[8], (f64)row[9], (f64)row[10])
+        let normal = Vector3((f64)row[12], (f64)row[13], (f64)row[14])
+        let area = (f64)row[15]
+        let rgb = Vector3((f64)row[20], (f64)row[21], (f64)row[22])
+        var extent = Vector3(math.abs(u.x) + math.abs(v.x), math.abs(u.y) + math.abs(v.y), math.abs(u.z) + math.abs(v.z))
+        var theta_o: f64 = 0.0
+        if kind == 2.0:
+            let radius = (f64)row[7]
+            extent = Vector3(radius, radius, radius)
+            theta_o = math.pi
+        let energy = math.max(0.0, luminance(rgb)) * area * math.pi
+        try emitters.push(Emitter(position.subtract(extent), position.add(extent), normal, theta_o, 0.5 * math.pi, energy, (u32)index))
+    let p = scene.positions.view()
+    for triangle in 0..<scene.triangle_count():
+        let material = scene.shading.items[triangle * 4 + 3]
+        if (usize)material >= materials.length: continue
+        let m = materials[(usize)material]
+        if m.emission_luminance <= 0.0: continue
+        let a = point_of(p, scene.indices.items[triangle * 3])
+        let b = point_of(p, scene.indices.items[triangle * 3 + 1])
+        let third = point_of(p, scene.indices.items[triangle * 3 + 2])
+        let cross = b.subtract(a).cross(third.subtract(a))
+        let area = 0.5 * cross.length()
+        if area <= 0.0: continue
+        let lo = Vector3(math.min(a.x, math.min(b.x, third.x)), math.min(a.y, math.min(b.y, third.y)), math.min(a.z, math.min(b.z, third.z)))
+        let hi = Vector3(math.max(a.x, math.max(b.x, third.x)), math.max(a.y, math.max(b.y, third.y)), math.max(a.z, math.max(b.z, third.z)))
+        # Emission is two-sided: every direction about the normal.
+        let energy = math.max(0.0, luminance(m.emission_color.multiply_scalar(m.emission_luminance))) * area * 2.0 * math.pi
+        try emitters.push(Emitter(lo, hi, cross.multiply_scalar(0.5 / area), math.pi, 0.5 * math.pi, energy, emitter_triangle | (u32)triangle))
+    let count = emitters.count
+    tree.emitter_count = count
+    # Emitter records, then the triangle map.
+    try tree.records.fill(count * 4 + scene.triangle_count(), 0)
+    for at in 0..<scene.triangle_count(): tree.records.items[count * 4 + at] = no_emitter
+    for index in 0..<count:
+        let code = emitters.items[index].code
+        tree.records.items[index * 4] = code
+        if code & emitter_triangle != 0: tree.records.items[count * 4 + (usize)(code & ~emitter_triangle)] = (u32)index
+    if count == 0: return tree
+    let order = try new u32[count] --- in memory.heap
+    defer free(order) in memory.heap
+    for at in 0..<count: order[at] = (u32)at
+    try tree.nodes.reserve(2 * count * 12)
+    try tree.links.reserve(4 * count)
+    try push_node(&tree)
+    var stack = Growing[TreeJob]()
+    defer stack.close()
+    try stack.push(TreeJob(0, 0, count, 0, 0))
+    while stack.count > 0:
+        stack.count -= 1
+        let job = stack.items[stack.count]
+        let range = order[job.first..<job.first + job.count]
+        # The union of the range: bounds, cone and power.
+        var first = emitters.items[(usize)range[0]]
+        var lo = first.lo
+        var hi = first.hi
+        var axis = first.axis
+        var theta_o = first.theta_o
+        var theta_e = first.theta_e
+        var energy: f64 = 0.0
+        for index in range:
+            let e = emitters.items[(usize)index]
+            lo = Vector3(math.min(lo.x, e.lo.x), math.min(lo.y, e.lo.y), math.min(lo.z, e.lo.z))
+            hi = Vector3(math.max(hi.x, e.hi.x), math.max(hi.y, e.hi.y), math.max(hi.z, e.hi.z))
+            let merged = cone_union(axis, theta_o, e.axis, e.theta_o)
+            axis = merged.0
+            theta_o = merged.1
+            theta_e = math.max(theta_e, e.theta_e)
+            energy += e.energy
+        let at = job.node * 12
+        let values: f64[12] = [lo.x, lo.y, lo.z, energy, hi.x, hi.y, hi.z, math.cos(theta_o), axis.x, axis.y, axis.z, math.cos(theta_e)]
+        for k in 0..<(usize)12: tree.nodes.items[at + k] = (f32)values[k]
+        if job.node == 0: tree.energy = energy
+        if job.count == 1:
+            let emitter = (usize)range[0]
+            tree.links.items[job.node * 2] = (u32)emitter
+            tree.links.items[job.node * 2 + 1] = leaf_node
+            tree.records.items[emitter * 4 + 1] = job.trail
+            tree.records.items[emitter * 4 + 2] = job.depth
+            continue
+        # Split at the median along the longest axis of the centers' bounds.
+        var axis_index: usize = 0
+        let size = hi.subtract(lo)
+        if size.y > size.x and size.y >= size.z: axis_index = 1
+        elif size.z > size.x and size.z > size.y: axis_index = 2
+        let half = job.count // 2
+        select(emitters.view(), range, half, axis_index)
+        let child = tree.node_count()
+        try push_node(&tree)
+        try push_node(&tree)
+        tree.links.items[job.node * 2] = (u32)child
+        tree.links.items[job.node * 2 + 1] = 0
+        try stack.push(TreeJob(child + 1, job.first + half, job.count - half, job.trail | ((u32)1 << job.depth), job.depth + 1))
+        try stack.push(TreeJob(child, job.first, half, job.trail, job.depth + 1))
+    return tree
+
+func push_node(tree: LightTree*) -> !:
+    try tree.nodes.extend(tree.nodes.count + 12, 0.0)
+    try tree.links.extend(tree.links.count + 2, 0)
+
+func point_of(p: const f32[], index: u32) -> Vector3:
+    let i = (usize)index * 3
+    return Vector3((f64)p[i], (f64)p[i + 1], (f64)p[i + 2])
+
+func key_of(emitters: const Emitter[], index: u32, axis: usize) -> f64:
+    let middle = emitters[(usize)index].center()
+    return middle.x if axis == 0 else (middle.y if axis == 1 else middle.z)
+
+## Reorder `order` so the emitter at `k` is the one sorting there by center
+## along `axis`, those before it no larger and those after no smaller
+## (quickselect, Lomuto's partition).
+func select(emitters: const Emitter[], order: u32[], k: usize, axis: usize):
+    var low: usize = 0
+    var high = order.length
+    while high - low > 1:
+        let middle = (low + high) // 2
+        let pivot = key_of(emitters, order[middle], axis)
+        swap(order, middle, high - 1)
+        var store = low
+        for i in low..<high - 1:
+            if key_of(emitters, order[i], axis) < pivot:
+                swap(order, i, store)
+                store += 1
+        swap(order, store, high - 1)
+        if store == k: return
+        if k < store: high = store
+        else: low = store + 1
+
+func swap(order: u32[], a: usize, b: usize):
+    let held = order[a]
+    order[a] = order[b]
+    order[b] = held
