@@ -8,8 +8,7 @@
 //   10     metalness, diffuse roughness, specular roughness, specular anisotropy
 //   11     specular IOR, coat roughness, coat IOR, coat darkening
 //   12     opacity, thin walled, coat anisotropy, dispersion (Cauchy's B in nm², 0 none)
-//   13     texture slots (-1 none): base color, specular roughness, metalness, normal map
-//          (src/render/textures.lucb), sampled at the hit's texture coordinates
+//   13     the node graph's program entry (-1 none; shader_program.glsl), -, -, -
 // OpenPBR v1, in a local frame with the normal along +z on the side the ray
 // came from (the layering after OpenPBR's specification and its reference):
 //   - coat: a GGX dielectric layer at coat_ior over everything below; the
@@ -52,6 +51,14 @@ vec2 triangle_uv(uint triangle, vec2 b) {
 // Where the surface being shaded is in its textures; set per hit.
 vec2 surface_uv = vec2(0.0);
 
+// The parameters the material's node graph drives at this hit
+// (src/render/shader_graph.lucb's registers), and which: set per hit by
+// run_program, read here in place of the record's.
+uint program_mask = 0u;
+float program_values[23];
+bool driven(uint bit) { return (program_mask & (1u << bit)) != 0u; }
+vec3 driven3(uint at) { return vec3(program_values[at], program_values[at + 1u], program_values[at + 2u]); }
+
 #ifdef MATERIAL_TEXTURES
 #extension GL_EXT_nonuniform_qualifier : require
 layout(set = 0, binding = 13) uniform sampler texture_sampler;
@@ -62,33 +69,6 @@ vec4 texture_at(float slot, vec2 uv) {
 #else
 vec4 texture_at(float slot, vec2 uv) { return vec4(1.0); }
 #endif
-
-// The shading normal `n` bent by material `m`'s normal map (tangent space,
-// stored as 0.5 + 0.5 n) at the hit on `triangle`, in the frame its texture
-// coordinates give.
-vec3 mapped_normal(uint m, uint triangle, vec3 n) {
-    float slot = material_at(m, 13u).w;
-    if (slot < 0.0) return n;
-    uint i0 = indices[triangle * 3u], i1 = indices[triangle * 3u + 1u], i2 = indices[triangle * 3u + 2u];
-    vec3 p0 = vec3(positions[i0 * 3u], positions[i0 * 3u + 1u], positions[i0 * 3u + 2u]);
-    vec3 e1 = vec3(positions[i1 * 3u], positions[i1 * 3u + 1u], positions[i1 * 3u + 2u]) - p0;
-    vec3 e2 = vec3(positions[i2 * 3u], positions[i2 * 3u + 1u], positions[i2 * 3u + 2u]) - p0;
-    vec2 uv0 = triangle_uv(triangle, vec2(0.0));
-    vec2 d1 = triangle_uv(triangle, vec2(1.0, 0.0)) - uv0;
-    vec2 d2 = triangle_uv(triangle, vec2(0.0, 1.0)) - uv0;
-    float det = d1.x * d2.y - d2.x * d1.y;
-    if (abs(det) < 1e-12) return n;
-    vec3 t = (e1 * d2.y - e2 * d1.y) / det;
-    vec3 b = (e2 * d1.x - e1 * d2.x) / det;
-    t = t - n * dot(n, t);
-    if (dot(t, t) < 1e-20) return n;
-    t = normalize(t);
-    vec3 bt = cross(n, t);
-    if (dot(bt, b) < 0.0) bt = -bt;
-    vec3 c = texture_at(slot, surface_uv).xyz * 2.0 - 1.0;
-    vec3 bent = t * c.x + bt * c.y + n * c.z;
-    return dot(bent, bent) > 1e-12 ? normalize(bent) : n;
-}
 
 // Linear Rec.709 (what textures sample as) to ACEScg.
 const mat3 rec709_to_acescg = mat3(0.613097, 0.070194, 0.020616,
@@ -290,11 +270,21 @@ void read_material(inout Surface s) {
     vec4 scalars = material_at(m, 10u);
     vec4 indices = material_at(m, 11u);
     vec4 geometry = material_at(m, 12u);
-    // Textures replace their parameters where the material has them.
-    vec4 maps = material_at(m, 13u);
-    if (maps.x >= 0.0) base_rgb = vec4(rec709_to_acescg * texture_at(maps.x, surface_uv).rgb, base_rgb.w);
-    if (maps.y >= 0.0) scalars.z = texture_at(maps.y, surface_uv).r;
-    if (maps.z >= 0.0) scalars.x = texture_at(maps.z, surface_uv).r;
+    // What the node graph drives replaces the record's.
+    if (program_mask != 0u) {
+        if (driven(0u)) base_rgb.xyz = driven3(0u);
+        if (driven(1u)) base_rgb.w = program_values[3];
+        if (driven(2u)) scalars.x = program_values[4];
+        if (driven(3u)) scalars.y = program_values[5];
+        if (driven(4u)) specular_rgb.w = program_values[6];
+        if (driven(5u)) scalars.z = program_values[7];
+        if (driven(6u)) coat_rgb.w = program_values[8];
+        if (driven(7u)) indices.y = program_values[9];
+        if (driven(8u)) transmission_rgb.w = program_values[10];
+        if (driven(10u)) specular_rgb.xyz = driven3(14u);
+        if (driven(11u)) transmission_rgb.xyz = driven3(17u);
+        if (driven(12u)) coat_rgb.xyz = driven3(20u);
+    }
     s.diffuse_roughness = scalars.y;
     s.metalness = HAS_METAL ? clamp(scalars.x, 0.0, 1.0) : 0.0;
     s.specular_weight = max(specular_rgb.w, 0.0);
@@ -400,15 +390,14 @@ void update_substrate(inout Surface s) {
 // substrate follows with the lobes, update_substrate).
 void read_colors(inout Surface s, vec4 lambda) {
     uint m = s.material;
-    float base_map = material_at(m, 13u).x;
-    s.base = material_color(m, 0u, lambda) * material_at(m, 1u).w;
-    // A base color texture's texel as a reflectance spectrum (at most 1).
-    if (base_map >= 0.0)
-        s.base = clamp(spec_of_texel(rec709_to_acescg * texture_at(base_map, surface_uv).rgb, lambda), Spec(0.0), Spec(1.0)) * material_at(m, 1u).w;
-    s.metal_tint = material_color(m, 2u, lambda);
+    // Colors the node graph drives are reflectance spectra through the
+    // environment basis (at most 1); the record's are fitted ones.
+    float weight = driven(1u) ? program_values[3] : material_at(m, 1u).w;
+    s.base = (driven(0u) ? clamp(spec_of_texel(driven3(0u), lambda), Spec(0.0), Spec(1.0)) : material_color(m, 0u, lambda)) * weight;
+    s.metal_tint = driven(10u) ? clamp(spec_of_texel(driven3(14u), lambda), Spec(0.0), Spec(1.0)) : material_color(m, 2u, lambda);
     s.specular_tint = s.metal_tint * s.specular_weight;
-    s.transmission_tint = material_color(m, 8u, lambda);
-    s.coat_tint = (HAS_COAT && s.coat > 0.0) ? material_color(m, 4u, lambda) : Spec(1.0);
+    s.transmission_tint = driven(11u) ? clamp(spec_of_texel(driven3(17u), lambda), Spec(0.0), Spec(1.0)) : material_color(m, 8u, lambda);
+    s.coat_tint = (HAS_COAT && s.coat > 0.0) ? (driven(12u) ? clamp(spec_of_texel(driven3(20u), lambda), Spec(0.0), Spec(1.0)) : material_color(m, 4u, lambda)) : Spec(1.0);
 }
 
 // Read the material and prepare its lobes and colors for the view direction

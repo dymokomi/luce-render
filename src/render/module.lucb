@@ -17,7 +17,8 @@
 #       device.lucb    GpuScene, the scene's buffers, and the primary-ray probe
 #       spectrum.lucb  color matching, spectral fits of colors, blackbodies, film matrix
 #       environment.lucb  a dome light's image, read and prepared for sampling by importance
-#       textures.lucb  materials' image textures (PNG, JPEG, OpenEXR) in a texture table
+#       shader_graph.lucb  materials' node graphs compiled into programs for the kernels
+#       textures.lucb  materials' textures (PNG, JPEG, OpenEXR) and programs
 #       lights.lucb    UsdLux lights packed for the kernels
 #       materials.lucb OpenPBR Surface parameters packed for the kernels
 #       light_tree.lucb the light tree over lights and emissive triangles

@@ -244,6 +244,8 @@ pub struct Renderer:
     ## The materials' textures, and the triangles' texture coordinates.
     var textures: MaterialTextures
     var uvs: gpu.Buffer
+    ## The materials' node-graph programs (shader_graph.lucb).
+    var programs: gpu.Buffer
 
     ## A renderer of `scene` through its camera (see RenderSettings.camera). The
     ## scene's buffers are uploaded; `scene` may be closed afterwards.
@@ -323,14 +325,17 @@ pub struct Renderer:
         while corner_uvs.count < 6: try corner_uvs.push(0.0)
         var uvs = try buffer_of(device, u8[]((u8*)corner_uvs.items.data, corner_uvs.count * 4))
         errdefer uvs.destroy()
+        var programs = try buffer_of(device, u8[]((u8*)textures.programs.items.data, textures.programs.count * 4))
+        errdefer programs.destroy()
         memory.write[u64]((void*)&rows[92], try tables.address())
         memory.write[u64]((void*)&rows[94], try uvs.address())
+        memory.write[u64]((void*)&rows[96], try programs.address())
         var records = Growing[f32]()
         defer records.close()
         var cutouts = false
         for index in 0..<library.count:
             let material = library.items[index]
-            try pack_material(material, textures.slots.items[index * 4..<index * 4 + 4], &records)
+            try pack_material(material, textures.entries.items[index], &records)
             cutouts = cutouts or material.geometry_opacity < 1.0
         rows[3] = 1.0 if cutouts else 0.0
         # The camera: light paths a sample (at most a band's; they take the
@@ -362,7 +367,9 @@ pub struct Renderer:
         errdefer constants.destroy()
         # Kernels specialized to the scene: the features its materials use, its
         # light count, guiding.
-        var features = scene_features(library.view(), light_count, settings, light_paths > 0)
+        var has_programs = false
+        for entry in textures.entries.view(): has_programs = has_programs or entry >= 0.0
+        var features = scene_features(library.view(), light_count, settings, light_paths > 0, has_programs)
         var kernels = try Kernels.create(device, settings.spectral, uploaded.accelerated, features)
         errdefer kernels.destroy()
         var materials = try buffer_of(device, u8[]((u8*)records.items.data, records.count * 4))
@@ -381,7 +388,7 @@ pub struct Renderer:
         var output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
         errdefer output.destroy()
         let shown = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
-        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, guide, guide_address, state_v, state_u, queues, film, output, shown, false, frame, band, light_count, 8 if cutouts else 0, none, none, 0, 0, 0, 0, 0, Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], light_paths, 0, 0, slots, textures, uvs)
+        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, guide, guide_address, state_v, state_u, queues, film, output, shown, false, frame, band, light_count, 8 if cutouts else 0, none, none, 0, 0, 0, 0, 0, Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], light_paths, 0, 0, slots, textures, uvs, programs)
 
     ## Start the next pass if the last has finished. True while there is work,
     ## running or to come; false once every sample is in the image.
@@ -615,6 +622,7 @@ pub struct Renderer:
         self.tables.destroy()
         self.textures.destroy()
         self.uvs.destroy()
+        self.programs.destroy()
         self.emitters.destroy()
         self.guide.destroy()
         self.state_v.destroy()
@@ -648,7 +656,7 @@ func make_tables(device: gpu.Device) -> gpu.Buffer!:
 ## The specialization constants of the integrator kernels (shaders/common.glsl):
 ## which material features the scene uses, cut-outs, guiding, the light count,
 ## light tracing.
-func scene_features(library: const OpenPbr[], light_count: usize, settings: RenderSettings, light_tracing: bool) -> gpu.Constant[8]:
+func scene_features(library: const OpenPbr[], light_count: usize, settings: RenderSettings, light_tracing: bool, programs: bool) -> gpu.Constant[9]:
     var coat = false
     var transmission = false
     var metal = false
@@ -662,7 +670,7 @@ func scene_features(library: const OpenPbr[], light_count: usize, settings: Rend
         cutouts = cutouts or material.geometry_opacity < 1.0
     return [gpu.Constant.boolean(0, coat), gpu.Constant.boolean(1, transmission), gpu.Constant.boolean(2, metal),
             gpu.Constant.boolean(3, emission), gpu.Constant.boolean(4, cutouts), gpu.Constant.boolean(5, settings.guiding),
-            gpu.Constant.uint32(6, (u32)light_count), gpu.Constant.boolean(7, light_tracing)]
+            gpu.Constant.uint32(6, (u32)light_count), gpu.Constant.boolean(7, light_tracing), gpu.Constant.boolean(8, programs)]
 
 ## The camera to render through: `index`, or the first camera when it is -1.
 func find_camera(scene: const CompiledScene*, index: i64) -> usize!:

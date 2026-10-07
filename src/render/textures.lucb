@@ -1,29 +1,25 @@
 #==============================================================================================
 #
-#   render/textures - Materials' image textures, in a texture table
+#   render/textures - Materials' textures and node-graph programs
 #
 #   DESCRIPTION:
-#       A material may name image files for some parameters (text-valued
-#       parameters, luce-geocore): base_color_texture, specular_roughness_texture,
-#       base_metalness_texture and geometry_normal_texture (a tangent-space normal
-#       map). Each file is read once per use: colors as sRGB-encoded 8-bit (PNG,
-#       JPEG) sampled as linear light, data (roughness, metalness, normals) as
-#       stored; OpenEXR files as half floats either way. The kernels sample them
-#       through a texture table (shaders/openpbr.glsl) at the hit's texture
-#       coordinates, slot -1 meaning none. Images are linear Rec.709 once
-#       sampled; colors become ACEScg in the kernels.
+#       A material may carry a node graph (shader_graph.lucb). Its Image nodes name
+#       files, each read once per use: colors as sRGB-encoded 8-bit (PNG, JPEG)
+#       sampled as linear light, data (roughness, normals) as stored; OpenEXR files as
+#       half floats either way. The kernels sample them through a texture table
+#       (shaders/openpbr.glsl) at the point's texture coordinates; images are linear
+#       Rec.709 once sampled, made ACEScg by the program. Every material's program
+#       sits in one u32 buffer, each at its entry (-1: none).
 #
 #==============================================================================================
 
-## The texture parameters, in the material record's order (row 13).
-pub let texture_parameters: str[4] = ["base_color_texture", "specular_roughness_texture", "base_metalness_texture", "geometry_normal_texture"]
-
 pub struct MaterialTextures:
-    ## Each material's slots (four a material, in texture_parameters' order;
-    ## -1 none), the default material's first.
-    pub var slots: Growing[f32]
+    ## Each material's program entry (-1 none), the default material's first.
+    pub var entries: Growing[f32]
+    pub var programs: Growing[u32]
     pub var textures: Growing[gpu.Texture]
     pub var table: gpu.TextureTable
+    var device: gpu.Device
     ## The file and use of each texture, to read each once.
     var keys: Growing[u8]
 
@@ -33,44 +29,43 @@ pub struct MaterialTextures:
             var held = texture
             held.destroy()
         self.textures.close()
-        self.slots.close()
+        self.entries.close()
+        self.programs.close()
         self.keys.close()
 
-## The textures `materials` name, read onto `device`: slots for the default
-## material (none) and then each of the library's materials, and a table that
-## always has at least one texture (kernels that sample need one bound).
+## The programs of `materials`' node graphs and the textures they read, on
+## `device`; the table always has at least one texture (kernels that sample
+## need one bound).
 pub func load_textures(device: gpu.Device, materials: const Materials*) -> MaterialTextures!:
-    var keys = Growing[u8]()
-    errdefer keys.close()
-    var textures = Growing[gpu.Texture]()
+    var assets = MaterialTextures(Growing[f32](), Growing[u32](), Growing[gpu.Texture](), gpu.TextureTable(), device, Growing[u8]())
     errdefer:
-        for texture in textures.view():
+        for texture in assets.textures.view():
             var held = texture
             held.destroy()
-        textures.close()
-    var slots = Growing[f32]()
-    errdefer slots.close()
-    for k in 0..<(usize)4: try slots.push(-1.0)
+        assets.textures.close()
+        assets.entries.close()
+        assets.programs.close()
+        assets.keys.close()
+    try assets.entries.push(-1.0)
+    try assets.programs.push(0)
     for index in 0..<materials.count():
-        for k in 0..<(usize)4:
-            let file = materials.find_text(index, texture_parameters[k])
-            if file.length == 0:
-                try slots.push(-1.0)
-                continue
-            # Colors are sRGB; the rest data.
-            let color = k == 0
-            let slot = try texture_slot(device, &keys, &textures, file, color)
-            try slots.push((f32)slot)
-    if textures.count == 0:
+        let graph = materials.find_text(index, "shader_graph")
+        var entry: i64 = -1
+        if graph.length > 0: entry = try compile_graph(graph, ImageSlots(image_slot, (void*)&assets), &assets.programs)
+        try assets.entries.push((f32)entry)
+    if assets.textures.count == 0:
         var white = try gpu.Texture.create(device, 1, 1, gpu.Format.rgba8_linear)
         errdefer white.destroy()
         let texel: u8[4] = [255, 255, 255, 255]
         try white.upload(u8[]((u8*)&texel[0], 4))
-        try textures.push(white)
-    var table = try gpu.TextureTable.create(device, (u32)textures.count)
-    errdefer table.destroy()
-    for at in 0..<textures.count: try table.set((u32)at, textures.items[at])
-    return MaterialTextures(slots, textures, table, keys)
+        try assets.textures.push(white)
+    assets.table = try gpu.TextureTable.create(device, (u32)assets.textures.count)
+    for at in 0..<assets.textures.count: try assets.table.set((u32)at, assets.textures.items[at])
+    return assets
+
+func image_slot(context: void*, file: str, color: bool) -> f64!:
+    let assets = (MaterialTextures*)context
+    return (f64)(try texture_slot(assets.device, &assets.keys, &assets.textures, file, color))
 
 ## The slot of `file` read for its use (`color`: sRGB), read now if it is new.
 func texture_slot(device: gpu.Device, keys: Growing[u8]*, textures: Growing[gpu.Texture]*, file: str, color: bool) -> usize!:

@@ -150,19 +150,30 @@ for the viewport.
 | v2 | transmission depth, dispersion, fuzz, thin film |
 | v3 | subsurface random walk |
 
-**Textures** (textures.lucb): a material's text-valued parameters name images
-(`base_color_texture`, `specular_roughness_texture`, `base_metalness_texture`,
-`geometry_normal_texture`).
-- **Files:** PNG and JPEG load as 8-bit (sRGB for colors), OpenEXR as half floats.
-- **Lookup:** shade_surface samples them from a texture table at the hit's texture
-  coordinates, which are the meshes' `uv` per triangle corner, reached by
-  buffer address.
-- **Color:** a base color texel becomes ACEScg, then a reflectance spectrum
-  through the environment basis, clamped to [0, 1].
-- **Normal maps:** they bend the shading normal in the frame the triangle's UVs
-  give, on camera and light paths alike.
-- **Checked:** a textured grey floor lights as a grey material does, within
-  0.02%.
+**Node graphs** (shader_graph.lucb, shaders/shader_program.glsl, after
+[research/SHADER-NODES-STUDY.md](research/SHADER-NODES-STUDY.md) and Cycles'
+SVM):
+- **The graph:** a material's `shader_graph` text parameter holds nodes,
+  constants and links, one statement a line (or after a `;`). Its
+  `openpbr_surface` node's linked inputs drive OpenPBR parameters; unlinked
+  ones leave the material record as it is.
+- **Compiling:** the host compiles each graph to a flat u32 program. An operand
+  is a constant's bits or a NaN-tagged stack slot; the stack is 64 floats.
+- **Running:** shade_surface runs the program once a hit, for camera and light
+  paths alike, before the surface is read.
+  - Driven parameters replace the record's in read_material and read_colors;
+    driven colors go through the environment basis.
+  - Programs read nothing direction-dependent, so MIS stays consistent.
+  - A scene without graphs drops the interpreter (HAS_PROGRAMS).
+- **Nodes:**
+  - inputs: uv, position, value, color;
+  - textures and procedurals: image (PNG, JPEG, OpenEXR via the texture
+    table), checker, Perlin fractal noise;
+  - math and color: math, mix, map range, clamp, separate, combine, a
+    two-stop ramp;
+  - normals: normal map (tangent frame from the triangle's UVs).
+- **Checked:** an image-driven floor lights as a grey material (0.02%), and a
+  graph of every node kind wired to grey matches exactly.
 
 Energy compensation uses precomputed albedo tables (study §3.5):
 

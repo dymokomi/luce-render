@@ -24,6 +24,7 @@ layout(local_size_x = 64) in;
 #include "lighttree.glsl"
 #include "guide.glsl"
 #include "connect.glsl"
+#include "shader_program.glsl"
 
 vec3 point_of(uint index) {
     return vec3(positions[index * 3u], positions[index * 3u + 1u], positions[index * 3u + 2u]);
@@ -131,7 +132,12 @@ void shade_camera(uint path) {
 
     vec3 normal = normalize((1.0 - hit.z - hit.w) * octahedral_decode(attributes.x) + hit.z * octahedral_decode(attributes.y) + hit.w * octahedral_decode(attributes.z));
     if (dot(normal, geometric) < 0.0) normal = -normal;
-    normal = mapped_normal(attributes.w, triangle, normal);
+    // The material's node graph, once for this hit; it may bend the normal.
+    run_program(attributes.w, triangle, p, normal);
+    if (driven(9u)) {
+        normal = normalize(driven3(11u));
+        if (dot(normal, geometric) < 0.0) normal = -normal;
+    }
     Surface surface = surface_at(normal, geometric, attributes.w, inside);
     vec3 wo = to_local(surface, -ray.xyz);
     prepare_surface(surface, wo, lambda);

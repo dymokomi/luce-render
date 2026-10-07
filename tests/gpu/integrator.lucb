@@ -20,6 +20,7 @@ from luce_exr import exr
 from luce_raster.model import Raster, SampleType
 from luce_raster.binary import Buffer
 from luce_geocore.core.growing import Growing
+from luce_geocore.kernel import append_text
 
 pub func checks(device: gpu.Device) -> !:
     try furnace(device, true, 0.0)
@@ -50,6 +51,8 @@ pub func checks(device: gpu.Device) -> !:
     try dome_sun(device, false)
     try textured_floor(device, true)
     try textured_floor(device, false)
+    try graph_nodes(device, true)
+    try graph_nodes(device, false)
     try cutout_shadow(device)
     try adaptive(device)
     try guided_room(device)
@@ -574,9 +577,10 @@ func dome_sun(device: gpu.Device, spectral: bool) -> !:
     print(f"dome sun (spectral {spectral}): {measured.x} {measured.y} {measured.z}, expected {expected}")
     assert(math.abs(measured.y / expected - 1.0) < 0.02)
 
-## The rect light over a floor whose grey comes from a texture: an sRGB PNG
-## of 188s (0.502 linear) mapped by the floor's texture coordinates lights as
-## a material of that grey does.
+## The rect light over a floor whose grey comes from a texture through a node
+## graph (an image node driving base_color): an sRGB PNG of 188s (0.502
+## linear) mapped by the floor's texture coordinates lights as a material of
+## that grey does.
 func textured_floor(device: gpu.Device, spectral: bool) -> !:
     var file = Growing[u8]()
     defer file.close()
@@ -606,11 +610,40 @@ func textured_floor(device: gpu.Device, spectral: bool) -> !:
     let albedo = math.pow((188.0 / 255.0 + 0.055) / 1.055, 2.4)
     var means: f64[2] = [0.0, 0.0]
     for way in 0..<(usize)2:
-        let library = try (try base.value().with_material("materials/floor", "openpbr", "base_color_texture\nspecular_weight", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], name) if way == 0
+        var graph = Growing[u8]()
+        defer graph.close()
+        try append_text(&graph, "\nnode grey image ")
+        try append_text(&graph, name)
+        try append_text(&graph, "; node surface openpbr_surface; link surface base_color grey color")
+        let library = try (try base.value().with_material("materials/floor", "openpbr", "specular_weight\nshader_graph", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], (str)graph.view()) if way == 0
                            else try base.value().with_material("materials/floor", "openpbr", "base_color\nspecular_weight", [albedo, albedo, albedo, 0.0, 0.0, 0.0, 0.0, 0.0]))
         defer library.release()
         means[way] = try floor_window(device, library, spectral)
     print(f"textured floor (spectral {spectral}): {means[0]} against a grey material's {means[1]}")
+    assert(math.abs(means[0] / means[1] - 1.0) < 0.005)
+
+## Every kind of node in one graph, wired so the floor comes out a 0.5 grey
+## with its flat normal: noise into a ramp of one grey, a checker of one grey
+## choosing between that and (multiply, map range, clamp) combined, split and
+## combined again, and a normal map of the flat color. It must light as a 0.5
+## grey material does.
+func graph_nodes(device: gpu.Device, spectral: bool) -> !:
+    let grid = try MeshPrimitives.grid(20.0, 8)
+    defer grid.release()
+    let mapped = try AttributeKernels.uv_project(grid, 0.05)
+    defer mapped.release()
+    let bound = try MaterialAssignment.faces(mapped, "", "material", "materials/floor")
+    defer bound.release()
+    let base = try GeometrySet.of_mesh(bound)
+    defer base.release()
+    let graph = "\nnode n noise; input n scale 3; node r ramp; link r fac n fac; input r color1 0.5; input r color2 0.5; node c checker; input c color1 0.5; input c color2 0.5; node a math multiply; input a a 0.25; input a b 2; node b map_range; input b value 0.25; input b from_max 0.5; node d clamp; input d value 0.7; input d max 0.5; node k combine; link k r a value; link k g b value; link k b d value; node m mix; link m fac c fac; link m a r color; link m b k color; node s separate; link s color m color; node x combine; link x r s r; link x g s g; link x b s b; node nm normal_map; node surface openpbr_surface; link surface base_color x color; link surface geometry_normal nm normal"
+    var means: f64[2] = [0.0, 0.0]
+    for way in 0..<(usize)2:
+        let library = try (try base.value().with_material("materials/floor", "openpbr", "specular_weight\nshader_graph", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], graph) if way == 0
+                           else try base.value().with_material("materials/floor", "openpbr", "base_color\nspecular_weight", [0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]))
+        defer library.release()
+        means[way] = try floor_window(device, library, spectral)
+    print(f"graph nodes (spectral {spectral}): {means[0]} against a grey material's {means[1]}")
     assert(math.abs(means[0] / means[1] - 1.0) < 0.005)
 
 ## The mean of the window below the rect light, lit by it, of `library` (a floor).

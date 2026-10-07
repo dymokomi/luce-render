@@ -71,7 +71,12 @@ void shade_light(uint path) {
 
     vec3 normal = normalize((1.0 - hit.z - hit.w) * octahedral_decode(attributes.x) + hit.z * octahedral_decode(attributes.y) + hit.w * octahedral_decode(attributes.z));
     if (dot(normal, geometric) < 0.0) normal = -normal;
-    normal = mapped_normal(attributes.w, triangle, normal);
+    // The material's node graph, as camera paths run it.
+    run_program(attributes.w, triangle, p, normal);
+    if (driven(9u)) {
+        normal = normalize(driven3(11u));
+        if (dot(normal, geometric) < 0.0) normal = -normal;
+    }
     // The surface on the side light arrives from, read once: seen from the
     // camera or the next vertex on that side, it is only oriented.
     Surface lit = surface_at(normal, geometric, attributes.w, back);

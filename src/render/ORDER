@@ -5,6 +5,7 @@ camera.lucb
 device.lucb
 spectrum.lucb
 environment.lucb
+shader_graph.lucb
 textures.lucb
 lights.lucb
 materials.lucb

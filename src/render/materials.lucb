@@ -100,9 +100,9 @@ func cauchy_b(material: OpenPbr) -> f64:
     let line_c = 656.3
     return (material.specular_ior - 1.0) * scale / (abbe * (1.0 / (line_f * line_f) - 1.0 / (line_c * line_c)))
 
-## Append `material`'s record: material_stride vec4s; `maps` its texture
-## slots (textures.lucb; -1 none).
-pub func pack_material(material: OpenPbr, maps: const f32[], out: Growing[f32]*) -> !:
+## Append `material`'s record: material_stride vec4s; `program` its node
+## graph's entry (textures.lucb; -1 none).
+pub func pack_material(material: OpenPbr, program: f32, out: Growing[f32]*) -> !:
     let colors: Vector3[5] = [material.base_color, material.specular_color, material.coat_color,
                               material.emission_color.multiply_scalar(material.emission_luminance), material.transmission_color]
     let weights: f64[5] = [material.base_weight, material.specular_weight, material.coat_weight, material.emission_luminance, material.transmission_weight]
@@ -113,7 +113,7 @@ pub func pack_material(material: OpenPbr, maps: const f32[], out: Growing[f32]*)
     let rest: f64[24] = [material.base_metalness, material.base_diffuse_roughness, material.specular_roughness, material.specular_roughness_anisotropy,
                          material.specular_ior, material.coat_roughness, material.coat_ior, material.coat_darkening,
                          material.geometry_opacity, 1.0 if material.geometry_thin_walled else 0.0, material.coat_roughness_anisotropy, cauchy_b(material),
-                         (f64)maps[0], (f64)maps[1], (f64)maps[2], (f64)maps[3],
+                         (f64)program, 0.0, 0.0, 0.0,
                          0.0, 0.0, 0.0, 0.0,
                          0.0, 0.0, 0.0, 0.0]
     for value in rest: try out.push((f32)value)

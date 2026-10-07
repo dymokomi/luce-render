@@ -1,0 +1,440 @@
+#==============================================================================================
+#
+#   render/shader_graph - Material node graphs compiled for the kernels
+#
+#   DESCRIPTION:
+#       A material may carry a node graph (the text parameter `shader_graph`): nodes that
+#       compute values at the shaded point and drive some of its OpenPBR parameters. The
+#       graph's text has one statement a line (or after a `;`: a material's texts are
+#       one a line):
+#
+#           node <id> <kind> [<setting>]      the setting is the rest of the line
+#           input <id> <input> <x> [<y> <z>]  a constant for an unlinked input
+#           link <id> <input> <source id> <output>
+#
+#       The terminal is the `openpbr_surface` node: its linked inputs override the
+#       material's parameters, its unlinked ones leave the material record as it is.
+#       Nodes (docs/research/SHADER-NODES-STUDY.md):
+#
+#           uv, position                    the point's texture coordinates, its world position
+#           value, color                    constants
+#           image <file> [data]             a texture (sRGB unless `data`) at `vector` (uv)
+#           checker, noise                  procedurals at `vector` (uv; position for noise)
+#           math <operation>                add, subtract, multiply, divide, power, minimum,
+#                                           maximum, absolute, sine, cosine, floor, fraction
+#           mix, map_range, clamp           mix(fac, a, b) of colors; ranges of values
+#           separate, combine               a color's r, g, b
+#           ramp                            two colors at two positions, by `fac`
+#           normal_map                      a tangent-space normal map's color as a normal
+#
+#       The program (shaders/shader_program.glsl) is a flat u32 array, one opcode then
+#       its operands and output slots. An operand is a constant's bits, or a stack slot
+#       tagged in a NaN (0x7FC10000 | slot); colors and vectors take three. Programs are
+#       direction-free, so camera and light paths see one surface (connect.glsl).
+#
+#==============================================================================================
+
+pub let program_stack: u32 = 64
+let slot_tag: u32 = 0x7FC10000
+
+let op_end: u32 = 0
+let op_uv: u32 = 1
+let op_position: u32 = 2
+let op_value: u32 = 3
+let op_color: u32 = 4
+let op_image: u32 = 5
+let op_checker: u32 = 6
+let op_noise: u32 = 7
+let op_math: u32 = 8
+let op_mix: u32 = 9
+let op_map_range: u32 = 10
+let op_clamp: u32 = 11
+let op_separate: u32 = 12
+let op_combine: u32 = 13
+let op_ramp: u32 = 14
+let op_normal_map: u32 = 15
+let op_output: u32 = 16
+
+## A socket: its name, how many floats it is (1 or 3) and its default.
+struct Socket:
+    var name: str
+    var width: u32
+    var x: f64
+    var y: f64
+    var z: f64
+
+func one(name: str, value: f64) -> Socket:
+    return Socket(name, 1, value, 0.0, 0.0)
+
+func three(name: str, x: f64, y: f64, z: f64) -> Socket:
+    return Socket(name, 3, x, y, z)
+
+## A kind's sockets: inputs then outputs, and its opcode.
+struct Kind:
+    var opcode: u32
+    var inputs: Growing[Socket]
+    var outputs: Growing[Socket]
+
+    func close():
+        self.inputs.close()
+        self.outputs.close()
+
+## The sockets of `kind` (false: no such kind). Vectors default to the uv
+## (texture coordinates) unless given; a `position` default means the point.
+func kind_of(name: str) -> (Kind, bool)!:
+    var kind = Kind(0, Growing[Socket](), Growing[Socket]())
+    errdefer kind.close()
+    let i = &kind.inputs
+    let o = &kind.outputs
+    if name == "uv":
+        kind.opcode = op_uv
+        try o.push(three("uv", 0.0, 0.0, 0.0))
+    elif name == "position":
+        kind.opcode = op_position
+        try o.push(three("position", 0.0, 0.0, 0.0))
+    elif name == "value":
+        kind.opcode = op_value
+        try i.push(one("value", 0.0))
+        try o.push(one("value", 0.0))
+    elif name == "color":
+        kind.opcode = op_color
+        try i.push(three("color", 0.8, 0.8, 0.8))
+        try o.push(three("color", 0.0, 0.0, 0.0))
+    elif name == "image":
+        kind.opcode = op_image
+        try i.push(three("vector", 0.0, 0.0, 0.0))
+        try o.push(three("color", 0.0, 0.0, 0.0))
+        try o.push(one("alpha", 0.0))
+    elif name == "checker":
+        kind.opcode = op_checker
+        try i.push(three("vector", 0.0, 0.0, 0.0))
+        try i.push(three("color1", 0.8, 0.8, 0.8))
+        try i.push(three("color2", 0.2, 0.2, 0.2))
+        try i.push(one("scale", 5.0))
+        try o.push(three("color", 0.0, 0.0, 0.0))
+        try o.push(one("fac", 0.0))
+    elif name == "noise":
+        kind.opcode = op_noise
+        try i.push(three("vector", 0.0, 0.0, 0.0))
+        try i.push(one("scale", 5.0))
+        try i.push(one("detail", 2.0))
+        try i.push(one("roughness", 0.5))
+        try o.push(one("fac", 0.0))
+        try o.push(three("color", 0.0, 0.0, 0.0))
+    elif name == "math":
+        kind.opcode = op_math
+        try i.push(one("a", 0.5))
+        try i.push(one("b", 0.5))
+        try o.push(one("value", 0.0))
+    elif name == "mix":
+        kind.opcode = op_mix
+        try i.push(one("fac", 0.5))
+        try i.push(three("a", 0.5, 0.5, 0.5))
+        try i.push(three("b", 0.5, 0.5, 0.5))
+        try o.push(three("color", 0.0, 0.0, 0.0))
+    elif name == "map_range":
+        kind.opcode = op_map_range
+        try i.push(one("value", 0.5))
+        try i.push(one("from_min", 0.0))
+        try i.push(one("from_max", 1.0))
+        try i.push(one("to_min", 0.0))
+        try i.push(one("to_max", 1.0))
+        try o.push(one("value", 0.0))
+    elif name == "clamp":
+        kind.opcode = op_clamp
+        try i.push(one("value", 0.5))
+        try i.push(one("min", 0.0))
+        try i.push(one("max", 1.0))
+        try o.push(one("value", 0.0))
+    elif name == "separate":
+        kind.opcode = op_separate
+        try i.push(three("color", 0.8, 0.8, 0.8))
+        try o.push(one("r", 0.0))
+        try o.push(one("g", 0.0))
+        try o.push(one("b", 0.0))
+    elif name == "combine":
+        kind.opcode = op_combine
+        try i.push(one("r", 0.0))
+        try i.push(one("g", 0.0))
+        try i.push(one("b", 0.0))
+        try o.push(three("color", 0.0, 0.0, 0.0))
+    elif name == "ramp":
+        kind.opcode = op_ramp
+        try i.push(one("fac", 0.5))
+        try i.push(three("color1", 0.0, 0.0, 0.0))
+        try i.push(three("color2", 1.0, 1.0, 1.0))
+        try i.push(one("position1", 0.0))
+        try i.push(one("position2", 1.0))
+        try o.push(three("color", 0.0, 0.0, 0.0))
+    elif name == "normal_map":
+        kind.opcode = op_normal_map
+        try i.push(three("color", 0.5, 0.5, 1.0))
+        try i.push(one("strength", 1.0))
+        try o.push(three("normal", 0.0, 0.0, 0.0))
+    else:
+        kind.close()
+        return (Kind(0, Growing[Socket](), Growing[Socket]()), false)
+    return (kind, true)
+
+## The OpenPBR parameters a graph may drive: their override register in the
+## kernels (shader_program.glsl), width and bit.
+func surface_register(name: str) -> (u32, u32, u32, bool):
+    if name == "base_color": return (0, 3, 0, true)
+    if name == "base_weight": return (3, 1, 1, true)
+    if name == "base_metalness": return (4, 1, 2, true)
+    if name == "base_diffuse_roughness": return (5, 1, 3, true)
+    if name == "specular_weight": return (6, 1, 4, true)
+    if name == "specular_roughness": return (7, 1, 5, true)
+    if name == "coat_weight": return (8, 1, 6, true)
+    if name == "coat_roughness": return (9, 1, 7, true)
+    if name == "transmission_weight": return (10, 1, 8, true)
+    if name == "geometry_normal": return (11, 3, 9, true)
+    if name == "specular_color": return (14, 3, 10, true)
+    if name == "transmission_color": return (17, 3, 11, true)
+    if name == "coat_color": return (20, 3, 12, true)
+    return (0, 0, 0, false)
+
+struct GraphNode:
+    var id: str
+    var kind: str
+    var setting: str
+    ## Its outputs' first stack slots once emitted (NONE: not yet).
+    var emitted: bool
+    var slots: Growing[u32]
+
+struct GraphInput:
+    var node: usize
+    var name: str
+    var values: f64[3]
+    ## A link: the source node and its output's name (none: a constant).
+    var source: i64
+    var output: str
+
+## Resolves image files to texture slots (textures.lucb).
+pub struct ImageSlots:
+    pub var resolve: func(void*, str, bool) -> f64!
+    pub var context: void*
+
+struct Compiler:
+    var nodes: Growing[GraphNode]
+    var inputs: Growing[GraphInput]
+    var words: Growing[u32]
+    var stack: u32
+    var images: ImageSlots
+    ## The implicit uv and position nodes' slots, once made.
+    var uv_slot: i64
+    var position_slot: i64
+
+    func close():
+        for node in self.nodes.view():
+            var held = node
+            held.slots.close()
+        self.nodes.close()
+        self.inputs.close()
+
+    func find(id: str) -> i64:
+        for at in 0..<self.nodes.count:
+            if self.nodes.items[at].id == id: return (i64)at
+        return -1
+
+    func input_of(node: usize, name: str) -> i64:
+        for at in 0..<self.inputs.count:
+            let entry = &self.inputs.items[at]
+            if entry.node == node and entry.name == name: return (i64)at
+        return -1
+
+    func allocate(width: u32) -> u32!:
+        let slot = self.stack
+        if self.stack + width > program_stack: error(invalid, "a material's node graph needs more than 64 values at once")
+        self.stack += width
+        return slot
+
+    func operand_slot(slot: u32) -> !:
+        try self.words.push(slot_tag | slot)
+
+    ## The slot of the implicit texture coordinates or position.
+    func implicit(position: bool) -> u32!:
+        let held = self.position_slot if position else self.uv_slot
+        if held >= 0: return (u32)held
+        let slot = try self.allocate(3)
+        try self.words.push(op_position if position else op_uv)
+        for k in 0..<(u32)3: try self.words.push(slot + k)
+        if position: self.position_slot = (i64)slot
+        else: self.uv_slot = (i64)slot
+        return slot
+
+    ## Operand words for input `socket` of node `node` onto `out`: its link's
+    ## slots, its constant, or the socket's default. Conversions and implicit
+    ## inputs it needs are emitted ahead of the node.
+    func operands(node: usize, kind_name: str, socket: Socket, out: Growing[u32]*) -> !:
+        let at = self.input_of(node, socket.name)
+        if at >= 0 and self.inputs.items[(usize)at].source >= 0:
+            let entry = self.inputs.items[(usize)at]
+            let slot = try self.output_slot((usize)entry.source, entry.output, socket.width)
+            for k in 0..<socket.width: try out.push(slot_tag | (slot + k))
+            return
+        if at < 0 and socket.name == "vector":
+            let slot = try self.implicit(kind_name == "noise")
+            for k in 0..<socket.width: try out.push(slot_tag | (slot + k))
+            return
+        var values: f64[3] = [socket.x, socket.y, socket.z]
+        if at >= 0: values = self.inputs.items[(usize)at].values
+        for k in 0..<socket.width: try out.push(constant_bits(values[(usize)k]))
+
+    ## The first slot of output `name` of node `source`, emitting the node
+    ## first; a one-wide output feeding three takes its value thrice.
+    func output_slot(source: usize, name: str, width: u32) -> u32!:
+        try self.emit(source, 0)
+        let (kind, known) = try kind_of(self.nodes.items[source].kind)
+        defer:
+            var held = kind
+            held.close()
+        _ = known
+        for at in 0..<kind.outputs.count:
+            if kind.outputs.items[at].name != name: continue
+            let slot = self.nodes.items[source].slots.items[at]
+            let given = kind.outputs.items[at].width
+            if given == width: return slot
+            # Widths differ: a value spread to a color, or a color's average.
+            let spread = try self.allocate(width)
+            try self.words.push(op_color if width == 3 else op_value)
+            if width == 3:
+                for k in 0..<(u32)3: try self.operand_slot(slot)
+                for k in 0..<(u32)3: try self.words.push(spread + k)
+            else:
+                try self.operand_slot(slot)
+                try self.words.push(spread)
+            return spread
+        error(invalid, "a node graph links an output its node does not have")
+
+    ## Emit node `index` (once), after the nodes it reads.
+    func emit(index: usize, depth: usize) -> !:
+        if depth > 256: error(invalid, "a material's node graph loops")
+        if self.nodes.items[index].emitted: return
+        let kind_name = self.nodes.items[index].kind
+        let (kind, known) = try kind_of(kind_name)
+        defer:
+            var held = kind
+            held.close()
+        if not known: error(invalid, "a material's node graph has a node of an unknown kind")
+        # The nodes it reads, first.
+        for at in 0..<self.inputs.count:
+            let entry = self.inputs.items[at]
+            if entry.node == index and entry.source >= 0: try self.emit((usize)entry.source, depth + 1)
+        var head = Growing[u32]()
+        defer head.close()
+        try head.push(kind.opcode)
+        if kind.opcode == op_image:
+            let setting = self.nodes.items[index].setting
+            var file = setting
+            var color = true
+            if setting.length > 5 and (str)setting.bytes[setting.length - 5..] == " data":
+                file = (str)setting.bytes[..<setting.length - 5]
+                color = false
+            let slot = try self.images.resolve(self.images.context, file, color)
+            try head.push((u32)slot)
+            try head.push(1 if color else 0)
+        if kind.opcode == op_math: try head.push(math_operation(self.nodes.items[index].setting))
+        for socket in kind.inputs.view(): try self.operands(index, kind_name, socket, &head)
+        for word in head.view(): try self.words.push(word)
+        for socket in kind.outputs.view():
+            let slot = try self.allocate(socket.width)
+            try self.nodes.items[index].slots.push(slot)
+            for k in 0..<socket.width: try self.words.push(slot + k)
+        self.nodes.items[index].emitted = true
+
+## A constant operand: its f32 bits (non-finite values become 0).
+func constant_bits(value: f64) -> u32:
+    var v = (f32)value
+    if not (v == v) or v > 3.0e38 or v < -3.0e38: v = 0.0
+    return memory.read[u32]((const void*)&v)
+
+func math_operation(name: str) -> u32:
+    let names: str[12] = ["add", "subtract", "multiply", "divide", "power", "minimum", "maximum", "absolute", "sine", "cosine", "floor", "fraction"]
+    for at in 0..<(usize)12:
+        if names[at] == name: return (u32)at
+    return 0
+
+## The words of one line's `index`-th space-separated token (empty past the end).
+func token(line: str, index: usize) -> str:
+    var at: usize = 0
+    var count: usize = 0
+    let bytes = line.bytes
+    while at < bytes.length:
+        while at < bytes.length and bytes[at] == ' ': at += 1
+        let start = at
+        while at < bytes.length and bytes[at] != ' ': at += 1
+        if start == at: break
+        if count == index: return (str)bytes[start..<at]
+        count += 1
+    return ""
+
+## From the start of the `index`-th token to the line's end.
+func line_from(line: str, index: usize) -> str:
+    var at: usize = 0
+    var count: usize = 0
+    let bytes = line.bytes
+    while at < bytes.length:
+        while at < bytes.length and bytes[at] == ' ': at += 1
+        if at >= bytes.length: break
+        if count == index: return (str)bytes[at..]
+        while at < bytes.length and bytes[at] != ' ': at += 1
+        count += 1
+    return ""
+
+func number_of(text: str) -> f64!:
+    if text.length == 0: return 0.0
+    return try strings.parse_f64(text)
+
+## Graph `text` compiled onto the end of `words`: its entry (the first word's
+## index), or -1 when the graph drives no parameter.
+pub func compile_graph(text: str, images: ImageSlots, words: Growing[u32]*) -> i64!:
+    var compiler = Compiler(Growing[GraphNode](), Growing[GraphInput](), Growing[u32](), 0, images, -1, -1)
+    defer compiler.close()
+    # Statements, by line.
+    var start: usize = 0
+    let bytes = text.bytes
+    for at in 0..<bytes.length + 1:
+        if at < bytes.length and bytes[at] != 10 and bytes[at] != ';': continue
+        let line = (str)bytes[start..<at]
+        start = at + 1
+        let verb = token(line, 0)
+        if verb == "node":
+            try compiler.nodes.push(GraphNode(token(line, 1), token(line, 2), line_from(line, 3), false, Growing[u32]()))
+        elif verb == "input" or verb == "link":
+            let node = compiler.find(token(line, 1))
+            if node < 0: error(invalid, "a node graph sets an input of a node it lacks")
+            var entry = GraphInput((usize)node, token(line, 2), [0.0, 0.0, 0.0], -1, "")
+            if verb == "input":
+                for k in 0..<(usize)3: entry.values[k] = try number_of(token(line, 3 + k))
+                if token(line, 4).length == 0:
+                    entry.values[1] = entry.values[0]
+                    entry.values[2] = entry.values[0]
+            else:
+                entry.source = compiler.find(token(line, 3))
+                if entry.source < 0: error(invalid, "a node graph links from a node it lacks")
+                entry.output = token(line, 4)
+            try compiler.inputs.push(entry)
+    # The surface's linked inputs, each an output op.
+    var surface: i64 = -1
+    for at in 0..<compiler.nodes.count:
+        if compiler.nodes.items[at].kind == "openpbr_surface": surface = (i64)at
+    if surface < 0: return -1
+    var any = false
+    for at in 0..<compiler.inputs.count:
+        let entry = compiler.inputs.items[at]
+        if entry.node != (usize)surface or entry.source < 0: continue
+        let (register, width, bit, known) = surface_register(entry.name)
+        if not known: continue
+        let slot = try compiler.output_slot((usize)entry.source, entry.output, width)
+        try compiler.words.push(op_output)
+        try compiler.words.push(register)
+        try compiler.words.push(width)
+        try compiler.words.push(bit)
+        for k in 0..<width: try compiler.operand_slot(slot + k)
+        any = true
+    if not any: return -1
+    try compiler.words.push(op_end)
+    let entry = (i64)words.count
+    for word in compiler.words.view(): try words.push(word)
+    return entry
