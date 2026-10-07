@@ -103,6 +103,15 @@ func squared_error(a: const f32[], b: const f32[]) -> f64:
             sum += d * d
     return sum / (f64)(a.length // 4)
 
+## A whole number from environment variable `name`, else `fallback`.
+func number_of(name: c.str, fallback: f64) -> f64:
+    let text = os.env(name) else return fallback
+    var value: f64 = 0.0
+    for byte in text.bytes:
+        if byte < 48 or byte > 57: return fallback
+        value = value * 10.0 + (f64)(byte - 48)
+    return value
+
 pub func main(arguments: str[]) -> i32!:
     _ = arguments
     var device = gpu.Device.open() catch failure:
@@ -117,11 +126,14 @@ pub func main(arguments: str[]) -> i32!:
     defer scene.close()
     let pixels = try new f32[512 * 512 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
-    var settings = render.RenderSettings.of(512, 512, 128)
+    # LUCE_CORNELL_SAMPLES and LUCE_CORNELL_CLAMP change the image's samples
+    # and indirect clamp (none by default: the unbiased image).
+    var settings = render.RenderSettings.of(512, 512, (u32)number_of("LUCE_CORNELL_SAMPLES", 128.0))
+    settings.clamp_indirect = number_of("LUCE_CORNELL_CLAMP", 0.0)
     let ms = try render_image(device, &scene, settings, pixels)
     try files.ensure_directory("build")
     try save_ppm("build/cornell.ppm", "P6 512 512 255\n", pixels, 512, 512, 0.0)
-    print(f"cornell: {scene.triangle_count()} triangles, 512 x 512, 128 samples: {ms} ms a sample (build/cornell.ppm)")
+    print(f"cornell: {scene.triangle_count()} triangles, 512 x 512, {settings.samples} samples, clamp {settings.clamp_indirect}: {ms} ms a sample (build/cornell.ppm)")
     if os.env("LUCE_BENCH") == none: return 0
     # The full benchmark.
     let large = try new f32[1024 * 1024 * 4] --- in memory.heap
