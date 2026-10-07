@@ -24,6 +24,8 @@ pub struct RenderSession:
     var exposure_stops: f64
     var view: i64
     var problem_text: Growing[u8]
+    ## The material the next `start` renders every surface with.
+    var material: OpenPbr
 
     pub func init():
         self.device = gpu.Device()
@@ -35,6 +37,7 @@ pub struct RenderSession:
         self.exposure_stops = 0.0
         self.view = 1
         self.problem_text = Growing[u8]()
+        self.material = OpenPbr.standard()
 
     pub static func make() -> interop.Reference[RenderSession]!:
         return try interop.Reference[RenderSession].adopt(try new RenderSession() in memory.heap, render_session_type, memory.heap)
@@ -60,10 +63,28 @@ pub struct RenderSession:
         settings.max_bounces = (u32)bounces
         settings.spectral = spectral
         settings.camera = index
+        settings.material = self.material
         self.settings = settings
         self.waiting = scene
         self.started = clock.now()
         self.took = 0.0
+
+    ## The OpenPBR parameters every surface takes in the next `start` (until
+    ## materials are assigned per object). Colors are linear ACEScg.
+    pub func set_material(base_color: Vector3, metalness: f64, diffuse_roughness: f64, specular_weight: f64, specular_color: Vector3,
+                          specular_roughness: f64, specular_ior: f64, anisotropy: f64, emission_luminance: f64, emission_color: Vector3):
+        var material = OpenPbr.standard()
+        material.base_color = base_color
+        material.base_metalness = metalness
+        material.base_diffuse_roughness = diffuse_roughness
+        material.specular_weight = specular_weight
+        material.specular_color = specular_color
+        material.specular_roughness = specular_roughness
+        material.specular_ior = specular_ior
+        material.specular_roughness_anisotropy = anisotropy
+        material.emission_luminance = emission_luminance
+        material.emission_color = emission_color
+        self.material = material
 
     ## Advance the render a pass and draw it fitted into (x, y, width, height) of
     ## `target`; whether passes are still coming.
