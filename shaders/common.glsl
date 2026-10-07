@@ -18,6 +18,18 @@
 // so both builds store and pass the same type.
 #define Spec vec4
 
+// The scene's features as specialization constants (src/render/integrator.lucb:
+// scene_features): the compiler drops what a scene does not use. The defaults
+// keep everything, so a kernel built without values is correct for any scene.
+layout(constant_id = 0) const bool HAS_COAT = true;
+layout(constant_id = 1) const bool HAS_TRANSMISSION = true;
+layout(constant_id = 2) const bool HAS_METAL = true;
+layout(constant_id = 3) const bool HAS_EMISSION = true;
+layout(constant_id = 4) const bool CUTOUTS = true;
+layout(constant_id = 5) const bool GUIDING = true;
+// The number of lights; 0xffffffff leaves it to the constants buffer.
+layout(constant_id = 6) const uint LIGHTS = 0xffffffffu;
+
 layout(push_constant) uniform Params {
     vec4 position;      // camera; w: 1 orthographic
     vec4 corner;
@@ -77,6 +89,8 @@ layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[
 #define SV_HIT 8u           // t, -, barycentrics u, v
 #define SV_VERTEX 9u        // the last scattering point (origins move on through cut-outs; MIS pdfs are from here);
                             // w: unguided over guided throughput, which Russian roulette weighs (guiding must not change survival)
+uint light_count() { return LIGHTS != 0xffffffffu ? LIGHTS : uint(constants[K_INFO].x); }
+
 // Path guiding's ring of the first vertices (guide.glsl): pdf, throughput
 // luminance after the vertex, luminance found before it, |cos| of the sampled
 // direction; and cell, direction.

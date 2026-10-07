@@ -98,8 +98,10 @@ struct Kernel:
     ## at 1080p on an M4 Max). Off where infinities and NaNs must behave: the
     ## BVH's slab tests (intersection) and the film's NaN guard (finish, convert,
     ## adaptive).
-    static func create(device: gpu.Device, words: const u32[], msl: c.str, group: const u32[], kinds: const u8[], fast: bool = true) -> Kernel!:
-        return Kernel(try gpu.Kernel.create(device, words, msl, group, kinds, fast_math = fast), kinds)
+    ## `constants`: the scene's features (scene_features), which every
+    ## integrator kernel declares.
+    static func create(device: gpu.Device, constants: const gpu.Constant[], words: const u32[], msl: c.str, group: const u32[], kinds: const u8[], fast: bool = true) -> Kernel!:
+        return Kernel(try gpu.Kernel.create(device, words, msl, group, kinds, fast_math = fast, constants = constants), kinds)
 
 struct Kernels:
     var camera: Kernel
@@ -114,47 +116,47 @@ struct Kernels:
     var guide_fit: Kernel
 
     ## The build's kernels; intersection by hardware ray queries when `rays`.
-    static func create(device: gpu.Device, spectral: bool, rays: bool) -> Kernels!:
+    static func create(device: gpu.Device, spectral: bool, rays: bool, constants: const gpu.Constant[]) -> Kernels!:
         if spectral:
-            var camera = try Kernel.create(device, camera_comp_words, camera_comp_msl, camera_comp_group, camera_comp_bindings)
+            var camera = try Kernel.create(device, constants, camera_comp_words, camera_comp_msl, camera_comp_group, camera_comp_bindings)
             errdefer camera.kernel.destroy()
-            var schedule = try Kernel.create(device, schedule_comp_words, schedule_comp_msl, schedule_comp_group, schedule_comp_bindings)
+            var schedule = try Kernel.create(device, constants, schedule_comp_words, schedule_comp_msl, schedule_comp_group, schedule_comp_bindings)
             errdefer schedule.kernel.destroy()
-            var closest = try intersect_kernel(device, rays)
+            var closest = try intersect_kernel(device, rays, constants)
             errdefer closest.kernel.destroy()
-            var surface = try Kernel.create(device, shade_surface_comp_words, shade_surface_comp_msl, shade_surface_comp_group, shade_surface_comp_bindings)
+            var surface = try Kernel.create(device, constants, shade_surface_comp_words, shade_surface_comp_msl, shade_surface_comp_group, shade_surface_comp_bindings)
             errdefer surface.kernel.destroy()
-            var miss = try Kernel.create(device, shade_miss_comp_words, shade_miss_comp_msl, shade_miss_comp_group, shade_miss_comp_bindings)
+            var miss = try Kernel.create(device, constants, shade_miss_comp_words, shade_miss_comp_msl, shade_miss_comp_group, shade_miss_comp_bindings)
             errdefer miss.kernel.destroy()
-            var shadow = try shadow_kernel(device, rays)
+            var shadow = try shadow_kernel(device, rays, constants)
             errdefer shadow.kernel.destroy()
-            var finish = try Kernel.create(device, finish_comp_words, finish_comp_msl, finish_comp_group, finish_comp_bindings, false)
+            var finish = try Kernel.create(device, constants, finish_comp_words, finish_comp_msl, finish_comp_group, finish_comp_bindings, false)
             errdefer finish.kernel.destroy()
-            var convert = try Kernel.create(device, film_convert_comp_words, film_convert_comp_msl, film_convert_comp_group, film_convert_comp_bindings, false)
+            var convert = try Kernel.create(device, constants, film_convert_comp_words, film_convert_comp_msl, film_convert_comp_group, film_convert_comp_bindings, false)
             errdefer convert.kernel.destroy()
-            var adaptive = try Kernel.create(device, adaptive_comp_words, adaptive_comp_msl, adaptive_comp_group, adaptive_comp_bindings, false)
+            var adaptive = try Kernel.create(device, constants, adaptive_comp_words, adaptive_comp_msl, adaptive_comp_group, adaptive_comp_bindings, false)
             errdefer adaptive.kernel.destroy()
-            let fit = try Kernel.create(device, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
+            let fit = try Kernel.create(device, constants, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
             return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert, adaptive, fit)
-        var camera = try Kernel.create(device, camera_rgb_comp_words, camera_rgb_comp_msl, camera_rgb_comp_group, camera_rgb_comp_bindings)
+        var camera = try Kernel.create(device, constants, camera_rgb_comp_words, camera_rgb_comp_msl, camera_rgb_comp_group, camera_rgb_comp_bindings)
         errdefer camera.kernel.destroy()
-        var schedule = try Kernel.create(device, schedule_rgb_comp_words, schedule_rgb_comp_msl, schedule_rgb_comp_group, schedule_rgb_comp_bindings)
+        var schedule = try Kernel.create(device, constants, schedule_rgb_comp_words, schedule_rgb_comp_msl, schedule_rgb_comp_group, schedule_rgb_comp_bindings)
         errdefer schedule.kernel.destroy()
-        var closest = try intersect_kernel(device, rays)
+        var closest = try intersect_kernel(device, rays, constants)
         errdefer closest.kernel.destroy()
-        var surface = try Kernel.create(device, shade_surface_rgb_comp_words, shade_surface_rgb_comp_msl, shade_surface_rgb_comp_group, shade_surface_rgb_comp_bindings)
+        var surface = try Kernel.create(device, constants, shade_surface_rgb_comp_words, shade_surface_rgb_comp_msl, shade_surface_rgb_comp_group, shade_surface_rgb_comp_bindings)
         errdefer surface.kernel.destroy()
-        var miss = try Kernel.create(device, shade_miss_rgb_comp_words, shade_miss_rgb_comp_msl, shade_miss_rgb_comp_group, shade_miss_rgb_comp_bindings)
+        var miss = try Kernel.create(device, constants, shade_miss_rgb_comp_words, shade_miss_rgb_comp_msl, shade_miss_rgb_comp_group, shade_miss_rgb_comp_bindings)
         errdefer miss.kernel.destroy()
-        var shadow = try shadow_kernel(device, rays)
+        var shadow = try shadow_kernel(device, rays, constants)
         errdefer shadow.kernel.destroy()
-        var finish = try Kernel.create(device, finish_rgb_comp_words, finish_rgb_comp_msl, finish_rgb_comp_group, finish_rgb_comp_bindings, false)
+        var finish = try Kernel.create(device, constants, finish_rgb_comp_words, finish_rgb_comp_msl, finish_rgb_comp_group, finish_rgb_comp_bindings, false)
         errdefer finish.kernel.destroy()
-        var convert = try Kernel.create(device, film_convert_rgb_comp_words, film_convert_rgb_comp_msl, film_convert_rgb_comp_group, film_convert_rgb_comp_bindings, false)
+        var convert = try Kernel.create(device, constants, film_convert_rgb_comp_words, film_convert_rgb_comp_msl, film_convert_rgb_comp_group, film_convert_rgb_comp_bindings, false)
         errdefer convert.kernel.destroy()
-        var adaptive = try Kernel.create(device, adaptive_rgb_comp_words, adaptive_rgb_comp_msl, adaptive_rgb_comp_group, adaptive_rgb_comp_bindings, false)
+        var adaptive = try Kernel.create(device, constants, adaptive_rgb_comp_words, adaptive_rgb_comp_msl, adaptive_rgb_comp_group, adaptive_rgb_comp_bindings, false)
         errdefer adaptive.kernel.destroy()
-        let fit = try Kernel.create(device, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
+        let fit = try Kernel.create(device, constants, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
         return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert, adaptive, fit)
 
     func destroy():
@@ -170,13 +172,13 @@ struct Kernels:
         self.guide_fit.kernel.destroy()
 
 ## Intersection kernels serve both builds: they read no spectra.
-func intersect_kernel(device: gpu.Device, rays: bool) -> Kernel!:
-    if rays: return try Kernel.create(device, intersect_closest_rq_comp_words, intersect_closest_rq_comp_msl, intersect_closest_rq_comp_group, intersect_closest_rq_comp_bindings, false)
-    return try Kernel.create(device, intersect_closest_comp_words, intersect_closest_comp_msl, intersect_closest_comp_group, intersect_closest_comp_bindings, false)
+func intersect_kernel(device: gpu.Device, rays: bool, constants: const gpu.Constant[]) -> Kernel!:
+    if rays: return try Kernel.create(device, constants, intersect_closest_rq_comp_words, intersect_closest_rq_comp_msl, intersect_closest_rq_comp_group, intersect_closest_rq_comp_bindings, false)
+    return try Kernel.create(device, constants, intersect_closest_comp_words, intersect_closest_comp_msl, intersect_closest_comp_group, intersect_closest_comp_bindings, false)
 
-func shadow_kernel(device: gpu.Device, rays: bool) -> Kernel!:
-    if rays: return try Kernel.create(device, intersect_shadow_rq_comp_words, intersect_shadow_rq_comp_msl, intersect_shadow_rq_comp_group, intersect_shadow_rq_comp_bindings, false)
-    return try Kernel.create(device, intersect_shadow_comp_words, intersect_shadow_comp_msl, intersect_shadow_comp_group, intersect_shadow_comp_bindings, false)
+func shadow_kernel(device: gpu.Device, rays: bool, constants: const gpu.Constant[]) -> Kernel!:
+    if rays: return try Kernel.create(device, constants, intersect_shadow_rq_comp_words, intersect_shadow_rq_comp_msl, intersect_shadow_rq_comp_group, intersect_shadow_rq_comp_bindings, false)
+    return try Kernel.create(device, constants, intersect_shadow_comp_words, intersect_shadow_comp_msl, intersect_shadow_comp_group, intersect_shadow_comp_bindings, false)
 
 pub struct Renderer:
     var device: gpu.Device
@@ -230,8 +232,6 @@ pub struct Renderer:
         let slots = pool if pool < pixels else pixels
         var uploaded = try GpuScene.upload(device, scene, not settings.software_bvh)
         errdefer uploaded.destroy()
-        var kernels = try Kernels.create(device, settings.spectral, uploaded.accelerated)
-        errdefer kernels.destroy()
         var packed = Growing[f32]()
         defer packed.close()
         let (light_count, distant_power) = try pack_lights(&scene.objects, scene_radius(scene), &packed)
@@ -274,6 +274,11 @@ pub struct Renderer:
         rows[3] = 1.0 if cutouts else 0.0
         var constants = try gpu.Buffer.create(device, u8[]((u8*)&rows[0], 256))
         errdefer constants.destroy()
+        # Kernels specialized to the scene: the features its materials use, its
+        # light count, guiding.
+        var features = scene_features(library.view(), light_count, settings)
+        var kernels = try Kernels.create(device, settings.spectral, uploaded.accelerated, features)
+        errdefer kernels.destroy()
         var materials = try buffer_of(device, u8[]((u8*)records.items.data, records.count * 4))
         errdefer materials.destroy()
         var tables = try make_tables(device)
@@ -546,6 +551,24 @@ func make_tables(device: gpu.Device) -> gpu.Buffer!:
     try pass.submit()
     try pass.wait()
     return tables
+
+## The specialization constants of the integrator kernels (shaders/common.glsl):
+## which material features the scene uses, cut-outs, guiding, the light count.
+func scene_features(library: const OpenPbr[], light_count: usize, settings: RenderSettings) -> gpu.Constant[7]:
+    var coat = false
+    var transmission = false
+    var metal = false
+    var emission = false
+    var cutouts = false
+    for material in library:
+        coat = coat or material.coat_weight > 0.0
+        transmission = transmission or material.transmission_weight > 0.0
+        metal = metal or material.base_metalness > 0.0
+        emission = emission or material.emission_luminance > 0.0
+        cutouts = cutouts or material.geometry_opacity < 1.0
+    return [gpu.Constant.boolean(0, coat), gpu.Constant.boolean(1, transmission), gpu.Constant.boolean(2, metal),
+            gpu.Constant.boolean(3, emission), gpu.Constant.boolean(4, cutouts), gpu.Constant.boolean(5, settings.guiding),
+            gpu.Constant.uint32(6, (u32)light_count)]
 
 ## The camera to render through: `index`, or the first camera when it is -1.
 func find_camera(scene: const CompiledScene*, index: i64) -> usize!:

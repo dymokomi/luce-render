@@ -18,7 +18,7 @@ void main() {
     Spec throughput = get_v(SV_THROUGHPUT, path);
     vec4 lambda = get_v(SV_LAMBDA, path);
     Spec radiance = spec_of(constants[K_BACKGROUND_FIT], constants[K_BACKGROUND_RGB].xyz, lambda);
-    uint lights_count = uint(constants[K_INFO].x);
+    uint lights_count = light_count();
     for (uint light = 0u; light < lights_count; light++) {
         if (light_type(light) != LIGHT_DISTANT) continue;
         float cos_half = light_at(light, 2u).w;

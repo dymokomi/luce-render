@@ -27,7 +27,7 @@ void main() {
         set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + get_v(SV_SHADOW_RADIANCE, path));
         return;
     }
-    if (constants[K_INFO].w < 0.5) return;
+    if (!CUTOUTS || constants[K_INFO].w < 0.5) return;
     vec3 from = origin.xyz;
     float remaining = origin.w;
     float kept = 1.0;

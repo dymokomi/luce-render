@@ -40,7 +40,7 @@ Spec light_radiance(uint light, vec4 lambda) {
 // A distant light chosen in proportion to its power; `pdf` its share among
 // the distant lights.
 uint pick_distant(float u, out float pdf) {
-    uint count = uint(constants[K_INFO].x);
+    uint count = light_count();
     uint chosen = NONE;
     for (uint light = 0u; light < count; light++) {
         if (light_type(light) != 3u) continue;

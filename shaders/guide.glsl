@@ -30,7 +30,7 @@ GuideKeys guide_keys() { return GuideKeys(params.guide); }
 GuideLobes guide_lobes() { return GuideLobes(params.guide + uint64_t(GUIDE_CELLS) * 4ul); }
 GuideStats guide_stats() { return GuideStats(params.guide + uint64_t(GUIDE_CELLS) * (4ul + 16ul * uint64_t(GUIDE_LOBES + 1u))); }
 
-bool guiding() { return constants[K_GUIDE].x > 0.5; }
+bool guiding() { return GUIDING && constants[K_GUIDE].x > 0.5; }
 
 // The cell of point p with normal n, made on first use; NONE when the grid is
 // full along the probe run. Cells are about 8 pixels of the camera's footprint

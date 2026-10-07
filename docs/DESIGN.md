@@ -212,8 +212,21 @@ Since then:
   - soft EM, product with the BSDF, MI reweighting of training passes, and
     illumination-aware cells.
 
+Performance, after BACKENDS-STUDY.md:
+
+- **Keep the portable layer.** Dispatch overhead is small, about 3.5 µs a
+  dependent dispatch; one bounce already costs 80% of a 12-bounce sample.
+- **Fast math** on the shading kernels: 9.0 to 8.3 ms.
+- **Scene specialization:** material features, cut-outs, guiding and the light
+  count become specialization constants. Shading drops 3.3 to 2.1 ms, the
+  sample 8.4 to about 7.2 ms spectral and 7.8 to 6.6 ms RGB, at 1080p on an
+  M4 Max.
+
 Next:
 
+- Fold `schedule` into its producers.
+- Refill paths mid-pass with a larger pool.
+- Sort shading by material.
 - A denoiser.
 - Transparent shadows through glass and cut-outs.
 - Instancing as a BLAS per prototype.

@@ -81,7 +81,7 @@ void main() {
     // Cut-out opacity: pass straight through with probability 1 - opacity, at
     // the same bounce. The hit distance decorrelates stacked layers.
     float opacity = clamp(material_at(attributes.w, 12u).x, 0.0, 1.0);
-    if (opacity < 1.0 && fract(u_opacity.x + float(hash_u32(floatBitsToUint(hit.x))) * (1.0 / 4294967296.0)) >= opacity) {
+    if (CUTOUTS && opacity < 1.0 && fract(u_opacity.x + float(hash_u32(floatBitsToUint(hit.x))) * (1.0 / 4294967296.0)) >= opacity) {
         set_v(SV_ORIGIN, path, vec4(offset_origin(p, -geometric), 0.0));
         queue_push(Q_CLOSEST + 1u - params.current, path);
         return;
@@ -89,7 +89,7 @@ void main() {
 
     // Emission, MIS-weighted against the light sample the previous vertex took
     // (emissive triangles are emitters of the light tree).
-    if (material_at(attributes.w, 7u).w > 0.0) {
+    if (HAS_EMISSION && material_at(attributes.w, 7u).w > 0.0) {
         float weight = 1.0;
         uint emitter = triangle_emitter(triangle);
         if (total > 0u && ray.w > 0.0 && emitter != NONE) {

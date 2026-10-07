@@ -19,7 +19,7 @@ void main() {
     vec3 direction = get_v(SV_DIRECTION, path).xyz;
     Hit hit = trace_closest(origin, direction, INFINITY);
     uint what = hit.triangle;
-    uint lights_count = uint(constants[K_INFO].x);
+    uint lights_count = light_count();
     // Camera rays pass through lights that are not visible to the camera.
     bool camera_ray = bounce_total(get_u(SU_BOUNCE, path)) == 0u;
     for (uint light = 0u; light < lights_count; light++) {

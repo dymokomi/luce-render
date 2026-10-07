@@ -176,23 +176,28 @@ void prepare_surface(inout Surface s, vec3 wo, vec4 lambda) {
     float mu = clamp(wo.z, 0.0, 1.0);
     s.base = material_color(m, 0u, lambda) * base_rgb.w;
     s.diffuse_roughness = scalars.y;
-    s.metalness = clamp(scalars.x, 0.0, 1.0);
+    s.metalness = HAS_METAL ? clamp(scalars.x, 0.0, 1.0) : 0.0;
     s.specular_weight = max(specular_rgb.w, 0.0);
     s.metal_tint = material_color(m, 2u, lambda);
     s.specular_tint = s.metal_tint * s.specular_weight;
-    s.transmission = clamp(transmission_rgb.w, 0.0, 1.0);
+    s.transmission = HAS_TRANSMISSION ? clamp(transmission_rgb.w, 0.0, 1.0) : 0.0;
     s.transmission_tint = material_color(m, 8u, lambda);
     // Only a transmissive material has an inside; any other back face shades
     // like its front (a closed room's walls, seen from within).
     s.inside = s.inside && s.transmission > 0.0;
     // The coat (none from inside an object: its layers face the outside).
-    s.coat = s.inside ? 0.0 : clamp(coat_rgb.w, 0.0, 1.0);
+    s.coat = (HAS_COAT && !s.inside) ? clamp(coat_rgb.w, 0.0, 1.0) : 0.0;
     float coat_roughness = clamp(indices.y, 0.0, 1.0);
-    s.coat_alpha = ggx_alpha(coat_roughness, clamp(geometry.z, 0.0, 1.0));
     s.coat_eta = max(indices.z, 1.0001);
-    float e_coat_ggx = max(table_ggx(mu, coat_roughness), 1e-4);
-    s.coat_compensation = 1.0 + fresnel_dielectric_average(s.coat_eta) * (1.0 - e_coat_ggx) / e_coat_ggx;
-    s.coat_albedo = s.coat > 0.0 ? clamp(s.coat_compensation * table_dielectric(mu, coat_roughness, s.coat_eta), 0.0, 1.0) : 0.0;
+    s.coat_alpha = vec2(1.0);
+    s.coat_compensation = 1.0;
+    s.coat_albedo = 0.0;
+    if (HAS_COAT && s.coat > 0.0) {
+        s.coat_alpha = ggx_alpha(coat_roughness, clamp(geometry.z, 0.0, 1.0));
+        float e_coat_ggx = max(table_ggx(mu, coat_roughness), 1e-4);
+        s.coat_compensation = 1.0 + fresnel_dielectric_average(s.coat_eta) * (1.0 - e_coat_ggx) / e_coat_ggx;
+        s.coat_albedo = clamp(s.coat_compensation * table_dielectric(mu, coat_roughness, s.coat_eta), 0.0, 1.0);
+    }
     // The base, roughened under the coat; its index relative to the coat's.
     float roughness = clamp(scalars.z, 0.0, 1.0);
     float r4 = roughness * roughness * roughness * roughness;
@@ -213,7 +218,7 @@ void prepare_surface(inout Surface s, vec3 wo, vec4 lambda) {
     // the coat reflects back down (OpenPBR's Delta = (1 - K) / (1 - E_b K)).
     s.substrate = Spec(1.0);
     float substrate_rgb = 1.0;
-    if (s.coat > 0.0) {
+    if (HAS_COAT && s.coat > 0.0) {
         float k_smooth = fresnel_dielectric(mu, s.coat_eta);
         float k_rough = 1.0 - (1.0 - fresnel_dielectric_average(s.coat_eta)) / (s.coat_eta * s.coat_eta);
         float base_roughness = mix(1.0, roughness, s.metalness);
@@ -264,7 +269,7 @@ Spec evaluate_surface(Surface s, vec3 wi, vec3 wo, out float pdf) {
     float dielectric = 1.0 - s.metalness;
     if (wi.z < 0.0) {
         // Refraction through the dielectric base.
-        if (s.p_transmission <= 0.0) return Spec(0.0);
+        if (!HAS_TRANSMISSION || s.p_transmission <= 0.0) return Spec(0.0);
         vec3 h;
         if (!refraction_half(wi, wo, s.eta, h)) return Spec(0.0);
         float o_h = dot(wo, h), i_h = dot(wi, h);
@@ -279,7 +284,7 @@ Spec evaluate_surface(Surface s, vec3 wi, vec3 wo, out float pdf) {
     vec3 h = normalize(wi + wo);
     float cos_h = dot(wo, h);
     Spec f = Spec(0.0);
-    if (s.p_coat > 0.0) {
+    if (HAS_COAT && s.p_coat > 0.0) {
         float coat = ggx_d(h, s.coat_alpha) * ggx_g2(wi, wo, s.coat_alpha) / (4.0 * wi.z * wo.z);
         f += Spec(s.coat * fresnel_dielectric(cos_h, s.coat_eta) * s.coat_compensation * coat);
         pdf += s.p_coat * ggx_reflection_pdf(wo, h, s.coat_alpha);
@@ -292,7 +297,7 @@ Spec evaluate_surface(Surface s, vec3 wi, vec3 wo, out float pdf) {
     float microfacet = ggx_d(h, s.alpha) * ggx_g2(wi, wo, s.alpha) / (4.0 * wi.z * wo.z);
     if (dielectric > 0.0)
         below += s.specular_tint * (dielectric * fresnel_dielectric(cos_h, s.eta) * s.dielectric_compensation * microfacet);
-    if (s.metalness > 0.0 && !s.inside) {
+    if (HAS_METAL && s.metalness > 0.0 && !s.inside) {
         Spec average = (20.0 * s.base + 1.0) / 21.0;
         Spec compensation = 1.0 + average * s.metal_missing;
         below += min(Spec(1.0), s.specular_weight * fresnel_f82(s.base, s.metal_tint, cos_h)) * compensation * (s.metalness * microfacet);
@@ -317,7 +322,7 @@ bool sample_surface(Surface s, vec3 wo, vec3 u, out vec3 wi, out Spec weight, ou
     } else if ((pick -= s.p_coat) < s.p_specular + s.p_metal) {
         wi = reflect(-wo, ggx_sample(wo, s.alpha, u.xy));
         lobe = LOBE_GLOSSY;
-    } else if (s.p_transmission > 0.0) {
+    } else if (HAS_TRANSMISSION && s.p_transmission > 0.0) {
         vec3 h = ggx_sample(wo, s.alpha, u.xy);
         wi = refract(-wo, h, 1.0 / s.eta);
         if (dot(wi, wi) == 0.0) return false;   // total internal reflection
