@@ -47,7 +47,7 @@ layout(set = 0, binding = 7, std430) buffer Film { vec4 film[]; };
 // Scene-wide constants (src/render/integrator.lucb: fill_constants).
 layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[]; };
 
-#define K_INFO 0            // x lights, y max bounces, z indirect clamp (0 off)
+#define K_INFO 0            // x lights, y max bounces, z indirect clamp (0 off), w 1 when a material cuts out
 #define K_LIMITS 7          // the most diffuse, glossy and transmission bounces
 #define K_BACKGROUND_FIT 1
 #define K_BACKGROUND_RGB 2
@@ -65,6 +65,7 @@ layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[
 #define SV_SHADOW_DIRECTION 6u
 #define SV_SHADOW_RADIANCE 7u
 #define SV_HIT 8u           // t, -, barycentrics u, v
+#define SV_VERTEX 9u        // the last scattering point (origins move on through cut-outs; MIS pdfs are from here)
 #define SU_PIXEL 0u
 #define SU_BOUNCE 1u        // bounces so far: total, diffuse, glossy, transmission (a byte each)
 // What was hit: a triangle or LIGHT_HIT | light. Kept as an integer: bits stored

@@ -1,10 +1,19 @@
 #version 460
 // Each queued shadow ray: unblocked, its light sample joins the path's radiance.
-// The slot is the path's own, so no atomics are needed.
+// The slot is the path's own, so no atomics are needed. In scenes with cut-out
+// materials (constants K_INFO.w), a ray that is blocked walks on through the
+// cut-outs it meets, keeping (1 - opacity) of the light at each: the mean of
+// the stochastic pass-through shade_surface takes, so cut-outs cast the
+// shadows they should. Anything else opaque, glass included, blocks: light
+// through glass arrives on BSDF paths (and path guiding).
 #extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 64) in;
 #include "common.glsl"
 #include "trace.glsl"
+
+layout(set = 0, binding = 11, std430) readonly buffer Shading { uvec4 shading[]; };
+layout(set = 0, binding = 12, std430) readonly buffer Materials { vec4 materials[]; };
+#define MATERIAL_STRIDE 16u
 
 void main() {
     uint at = gl_GlobalInvocationID.x;
@@ -12,6 +21,31 @@ void main() {
     uint path = queue_path(Q_SHADOW, at);
     vec4 origin = get_v(SV_SHADOW_ORIGIN, path);
     vec3 direction = get_v(SV_SHADOW_DIRECTION, path).xyz;
-    if (trace_any(origin.xyz, direction, origin.w)) return;
-    set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + get_v(SV_SHADOW_RADIANCE, path));
+    if (!trace_any(origin.xyz, direction, origin.w)) {
+        set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + get_v(SV_SHADOW_RADIANCE, path));
+        return;
+    }
+    if (constants[K_INFO].w < 0.5) return;
+    vec3 from = origin.xyz;
+    float remaining = origin.w;
+    float kept = 1.0;
+    for (uint hop = 0u; hop < 16u; hop++) {
+        Hit hit = trace_closest(from, direction, remaining);
+        if (hit.triangle == NONE) {
+            set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + get_v(SV_SHADOW_RADIANCE, path) * kept);
+            return;
+        }
+        float opacity = clamp(materials[shading[hit.triangle].w * MATERIAL_STRIDE + 12u].x, 0.0, 1.0);
+        kept *= 1.0 - opacity;
+        if (kept < 1e-4) return;
+        // Step past the surface along the ray by the margin origins keep.
+        vec3 p = from + direction * hit.t;
+        float margin = 1e-4 * max(1.0, max(abs(p.x), max(abs(p.y), abs(p.z))));
+        from = p + direction * margin;
+        remaining -= hit.t + margin;
+        if (remaining <= 0.0) {
+            set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + get_v(SV_SHADOW_RADIANCE, path) * kept);
+            return;
+        }
+    }
 }

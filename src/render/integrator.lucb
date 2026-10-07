@@ -52,7 +52,7 @@ pub struct RenderSettings:
     pub static func of(width: u32, height: u32, samples: u32) -> RenderSettings:
         return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false, 1024, 1024, 1024, 0.0)
 
-let state_v_fields: usize = 9
+let state_v_fields: usize = 10
 let state_u_fields: usize = 4
 let queue_count: usize = 5
 let queue_base: usize = 32
@@ -153,6 +153,8 @@ pub struct Renderer:
     var frame: RayFrame
     var pool: usize
     var light_count: usize
+    ## Rounds of each pass beyond the bounces, for rays passing through cut-outs.
+    var through: usize
     ## The pass in flight, and what comes next: sample `sample`, band `band`.
     var pending: gpu.Compute?
     var sample: u32
@@ -204,11 +206,15 @@ pub struct Renderer:
         for k in 0..<(usize)4:
             rows[32 + k] = (f32)tree_row[k]
             rows[40 + k] = (f32)offsets_row[k]
-        var constants = try gpu.Buffer.create(device, u8[]((u8*)&rows[0], 256))
-        errdefer constants.destroy()
         var records = Growing[f32]()
         defer records.close()
-        for material in library.view(): try pack_material(material, &records)
+        var cutouts = false
+        for material in library.view():
+            try pack_material(material, &records)
+            cutouts = cutouts or material.geometry_opacity < 1.0
+        rows[3] = 1.0 if cutouts else 0.0
+        var constants = try gpu.Buffer.create(device, u8[]((u8*)&rows[0], 256))
+        errdefer constants.destroy()
         var materials = try buffer_of(device, u8[]((u8*)records.items.data, records.count * 4))
         errdefer materials.destroy()
         var tables = try make_tables(device)
@@ -224,7 +230,7 @@ pub struct Renderer:
         var output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
         errdefer output.destroy()
         let shown = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
-        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, none, 0, 0, 0)
+        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, 8 if cutouts else 0, none, 0, 0, 0)
 
     ## Start the next pass if the last has finished. True while there is work,
     ## running or to come; false once every sample is in the image.
@@ -317,8 +323,9 @@ pub struct Renderer:
         memory.copy(block[0..<64], u8[]((u8*)&frame[0], 64), 64)
         let groups = (u32)((count + 63) // 64)
         try self.dispatch(pass, &self.kernels.camera, block, start, count, 0, 0, groups, 1)
-        # One more round than bounces: the last BSDF rays still find lights.
-        for bounce in 0..<(usize)self.settings.max_bounces + 1:
+        # One more round than bounces: the last BSDF rays still find lights;
+        # with cut-outs, rounds for rays passing through them at the same bounce.
+        for bounce in 0..<(usize)self.settings.max_bounces + 1 + self.through:
             let current = (u32)(bounce % 2)
             try self.dispatch(pass, &self.kernels.schedule, block, start, count, current, 0, 1, 1)
             try self.indirect(pass, &self.kernels.intersect_closest, block, start, count, current, (usize)current)

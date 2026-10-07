@@ -29,6 +29,7 @@ pub func checks(device: gpu.Device) -> !:
     try area_light(device, false)
     try emissive_quad(device, true)
     try emissive_quad(device, false)
+    try cutout_shadow(device)
     try spectral_agrees(device, 0.0)
     try spectral_agrees(device, 3000.0)
     try hardware_agrees(device)
@@ -247,6 +248,45 @@ func emissive_quad(device: gpu.Device, spectral: bool) -> !:
     let expected = 0.5 / math.pi * 4.0 * 4.0 * corner_irradiance(0.5, 0.5, 1.0)
     if math.abs(measured.y / expected - 1.0) > 0.02:
         print(f"emissive quad (spectral {spectral}): {measured.x} {measured.y} {measured.z}, expected {expected}")
+        assert(false)
+
+## A 3 × 3 sheet between the rect light and the floor, reflecting nothing
+## itself: at opacity one half it passes exactly half of what it passes when
+## fully transparent. Shadow rays walk through cut-outs keeping (1 - opacity),
+## BSDF rays pass at random, and MIS weighs both from the floor.
+func cutout_shadow(device: gpu.Device) -> !:
+    let floor = try MeshPrimitives.grid(20.0, 8)
+    defer floor.release()
+    let sheet = try MeshPrimitives.grid(3.0, 1)
+    defer sheet.release()
+    let veiled = try MaterialAssignment.faces(sheet, "", "material", "materials/veil")
+    defer veiled.release()
+    let veil = try (try GeometrySet.of_mesh(veiled)).value().transformed(Vector3(0.0, 0.5, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer veil.release()
+    let both = try (try GeometrySet.of_mesh(floor)).value().merged(veil)
+    defer both.release()
+    var means: f64[2] = [0.0, 0.0]
+    for at in 0..<(usize)2:
+        let opacity = 0.5 if at == 0 else 0.0
+        let library = try both.value().with_material("materials/veil", "openpbr", "geometry_opacity\nbase_weight\nspecular_weight", [opacity, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        defer library.release()
+        # Seen from below the veil, looking at the floor under the light.
+        let pitch = -math.atan2(0.3, 3.0)
+        let viewed = try library.value().with_camera("/camera", Vector3(0.0, 0.3, 3.0), Vector3(pitch, 0.0, 0.0), 0, 200.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+        defer viewed.release()
+        let set = try viewed.value().with_light("/key", Vector3(0.0, 1.0, 0.0), Vector3(-0.5 * math.pi, 0.0, 0.0), 0, Vector3(1.0, 1.0, 1.0), 4.0, 0.0, 0.0, false, 1.0, 1.0, 0.5, 0.0, false)
+        defer set.release()
+        var settings = render.RenderSettings.of(32, 32, 256)
+        settings.spectral = false
+        settings.max_bounces = 1
+        settings.material.base_color = Vector3(0.5, 0.5, 0.5)
+        settings.material.specular_weight = 0.0
+        let pixels = try new f32[32 * 32 * 4] --- in memory.heap
+        defer free(pixels) in memory.heap
+        try rendered(device, set.value(), settings, pixels)
+        means[at] = window_mean(pixels, 32, 14, 14, 4).y
+    if math.abs(means[0] / means[1] - 0.5) > 0.015:
+        print(f"cut-out shadow: {means[0]} at opacity 0.5 against {means[1]} at 0")
         assert(false)
 
 func area_light(device: gpu.Device, spectral: bool) -> !:
