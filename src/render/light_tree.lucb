@@ -96,7 +96,7 @@ pub func build_light_tree(scene: const CompiledScene*, lights: const f32[], ligh
     for index in 0..<light_count:
         let row = lights[index * light_stride * 4..<(index + 1) * light_stride * 4]
         let kind = row[3]
-        if kind == 3.0: continue
+        if kind >= 3.0: continue
         let position = Vector3((f64)row[0], (f64)row[1], (f64)row[2])
         let u = Vector3((f64)row[4], (f64)row[5], (f64)row[6])
         let v = Vector3((f64)row[8], (f64)row[9], (f64)row[10])

@@ -152,7 +152,7 @@ void shade_camera(uint path) {
         uint light = pick_distant(u_light.x / p_distant, share);
         if (light != NONE && share > 0.0 && sample_light(light, p, u_light.yz, s)) {
             chance = p_distant * share;
-            emitted = light_radiance(light, lambda);
+            emitted = light_type(light) == LIGHT_DOME ? dome_radiance(light, s.direction, lambda) : light_radiance(light, lambda);
             sampled = true;
         }
     } else {

@@ -117,8 +117,20 @@ for the viewport.
 
 ## Lights
 
-- **UsdLux shapes:** rect, disk, sphere and distant, with dome later. Rect and disk
-  lights are also primitives in the BVH, so BSDF rays can hit them.
+- **UsdLux shapes:** rect, disk, sphere, distant and dome. Rect and disk lights
+  are hit by BSDF rays (lights.glsl's intersect_light).
+- **Dome lights** (environment.lucb): an OpenEXR lat-long image (linear
+  Rec.709, made ACEScg), its center down the light's -Z.
+  - **Sampling:** texels are constant and sampled in proportion to luminance
+    × sin θ (rows, then the row's texels, by binary search), so the pdf follows
+    the radiance exactly. Like distant lights, domes are chosen by power share
+    and MIS-weighted on misses.
+  - **Spectra:** texels become spectra linearly: three smooth basis spectra
+    that sum to the flat one, weighted by a 3 × 3 matrix of the ACEScg. White
+    stays flat and colors are exact without a per-texel fit.
+  - **Storage:** the data rides in the lights buffer after the light tree.
+  - **Checked:** a white furnace under a uniform dome; a floor under a sky with
+    a sun 1/512 of the texels agrees with the image's irradiance to 0.03%.
 - **Light tree:** pbrt-v4's light-bounds importance over a median-split binary
   tree, one emitter a leaf. It covers the lights that have a place and the emissive
   triangles. Each emitter's trail gives its pdf for MIS (light_tree.lucb,

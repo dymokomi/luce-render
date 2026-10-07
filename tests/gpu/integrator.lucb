@@ -12,6 +12,13 @@ from luce_gpu import gpu
 from luce_render import render
 from luce_geocore.geocore import Vector3, Mesh, MeshPrimitives, GeometrySet, MaterialAssignment
 import interop
+import c
+from luce_std import files
+from io import path
+from luce_exr import exr
+from luce_raster.model import Raster, SampleType
+from luce_raster.binary import Buffer
+from luce_geocore.core.growing import Growing
 
 pub func checks(device: gpu.Device) -> !:
     try furnace(device, true, 0.0)
@@ -35,6 +42,10 @@ pub func checks(device: gpu.Device) -> !:
     try emissive_quad(device, true, 1.0)
     try lit_room(device)
     try thin_lens(device)
+    try dome_furnace(device, true)
+    try dome_furnace(device, false)
+    try dome_sun(device, true)
+    try dome_sun(device, false)
     try cutout_shadow(device)
     try adaptive(device)
     try guided_room(device)
@@ -465,6 +476,94 @@ func thin_lens(device: gpu.Device) -> !:
         for p in 0..<(usize)(48 * 32): means[way] += (f64)pixels[p * 4 + 1]
     print(f"thin lens: light paths give {means[1] / means[0]} of the camera paths' mean")
     assert(math.abs(means[1] / means[0] - 1.0) < 0.005)
+
+## A white sphere under a white dome light with no image: the furnace again,
+## lit by the dome's light samples and BSDF hits under MIS instead of the
+## background.
+func dome_furnace(device: gpu.Device, spectral: bool) -> !:
+    let sphere = try MeshPrimitives.sphere(1.0, 32)
+    defer sphere.release()
+    let base = try GeometrySet.of_mesh(sphere)
+    defer base.release()
+    let viewed = try base.value().with_camera("/camera", Vector3(0.0, 1.0, 4.0), Vector3(), 0, 50.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer viewed.release()
+    let set = try viewed.value().with_light("/sky", Vector3(), Vector3(0.3, 1.0, 0.0), 4, Vector3(1.0, 1.0, 1.0), 1.0, 0.0, 0.0, false, 1.0, 1.0, 0.5, 0.0, true)
+    defer set.release()
+    var settings = render.RenderSettings.of(64, 48, 64)
+    settings.spectral = spectral
+    settings.max_bounces = 64
+    settings.material.base_color = Vector3(1.0, 1.0, 1.0)
+    let pixels = try new f32[64 * 48 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    try rendered(device, set.value(), settings, pixels)
+    let mean = window_mean(pixels, 64, 0, 0, 48)
+    let center = window_mean(pixels, 64, 24, 16, 16)
+    if math.abs(mean.y - 1.0) > 0.01 or math.abs(center.y - 1.0) > 0.02 or math.abs(center.x - 1.0) > 0.03:
+        print(f"dome furnace (spectral {spectral}): mean {mean.x} {mean.y} {mean.z}, on the sphere {center.x} {center.y} {center.z}")
+        assert(false)
+
+## The sky of dome_sun: a dim grey sky with a small sun 400 times brighter,
+## 64 × 32 texels, as an OpenEXR file at `file`; returns the irradiance a floor
+## facing +Y receives from it (the dome turned so its +Y is up).
+func write_sky(file: str) -> f64!:
+    let width: usize = 64
+    let height: usize = 32
+    var raster = Raster(width = width, height = height)
+    defer raster.close()
+    try raster.channel("B", SampleType.float32)
+    try raster.channel("G", SampleType.float32)
+    try raster.channel("R", SampleType.float32)
+    try raster.allocate()
+    var irradiance: f64 = 0.0
+    for y in 0..<height:
+        for x in 0..<width:
+            let sun = x >= 40 and x < 42 and y >= 8 and y < 10
+            let value = 200.0 if sun else 0.5
+            for k in 0..<(usize)3: raster.pixels[(y * width + x) * 3 + k] = value
+            # ∫ cos θ dω over the texel, in 8 × 8 pieces (cos θ is +Y's).
+            for sy in 0..<(usize)8:
+                let theta = math.pi * ((f64)y + ((f64)sy + 0.5) / 8.0) / (f64)height
+                let cos_theta = math.cos(theta)
+                if cos_theta <= 0.0: continue
+                irradiance += value * cos_theta * math.sin(theta) * (math.pi / (f64)height / 8.0) * (2.0 * math.pi / (f64)width)
+    var encoded = Buffer()
+    defer:
+        if encoded.data.length > 0: free(encoded.data) in memory.heap
+    try exr.encode(&raster, &encoded, "none")
+    try files.write((c.str)file, encoded.data[..<encoded.used])
+    return irradiance
+
+## A grey floor under a dome light whose image has a small bright sun: what
+## the floor reflects straight up is albedo / π × the image's irradiance, which
+## needs the image sampled by importance (the sun is 1/512 of the texels).
+func dome_sun(device: gpu.Device, spectral: bool) -> !:
+    var file = Growing[u8]()
+    defer file.close()
+    try file.assign(path.temp().bytes)
+    for byte in "/luce-render-sky.exr".bytes: try file.push(byte)
+    try file.push(0)
+    let name = (str)file.items[..<file.count - 1]
+    let irradiance = try write_sky(name)
+    let floor = try MeshPrimitives.grid(20.0, 8)
+    defer floor.release()
+    let base = try GeometrySet.of_mesh(floor)
+    defer base.release()
+    let viewed = try base.value().with_camera("/camera", Vector3(0.0, 4.0, 0.0), Vector3(-0.5 * math.pi, 0.0, 0.0), 0, 50.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer viewed.release()
+    let set = try viewed.value().with_light("/sky", Vector3(), Vector3(), 4, Vector3(1.0, 1.0, 1.0), 1.0, 0.0, 0.0, false, 1.0, 1.0, 0.5, 0.0, false, name)
+    defer set.release()
+    var settings = render.RenderSettings.of(32, 32, 256)
+    settings.spectral = spectral
+    settings.max_bounces = 1
+    settings.material.base_color = Vector3(0.5, 0.5, 0.5)
+    settings.material.specular_weight = 0.0
+    let pixels = try new f32[32 * 32 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    try rendered(device, set.value(), settings, pixels)
+    let measured = window_mean(pixels, 32, 0, 0, 32)
+    let expected = 0.5 / math.pi * irradiance
+    print(f"dome sun (spectral {spectral}): {measured.x} {measured.y} {measured.z}, expected {expected}")
+    assert(math.abs(measured.y / expected - 1.0) < 0.02)
 
 func area_light(device: gpu.Device, spectral: bool, light_tracing: f64) -> !:
     let floor = try MeshPrimitives.grid(20.0, 8)

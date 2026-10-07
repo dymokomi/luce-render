@@ -58,6 +58,27 @@ float blackbody(float lambda, float kelvin) {
     return r * r * r * r * r * (142.32492 / (exp(x) - 1.0));
 }
 
+// An environment texel's ACEScg as a Spec: three smooth spectra that sum to
+// the flat one (blue, green, red), weighted by K_BASIS's matrix of the color
+// (src/render/environment.lucb), or the RGB as it is.
+#define K_BASIS 18          // 3 rows: ACEScg to the basis spectra's weights
+float logistic(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+Spec spec_of_texel(vec3 rgb, vec4 lambda) {
+#if SPECTRAL
+    vec3 w = vec3(dot(constants[K_BASIS].xyz, rgb), dot(constants[K_BASIS + 1].xyz, rgb), dot(constants[K_BASIS + 2].xyz, rgb));
+    Spec s;
+    for (int i = 0; i < 4; i++) {
+        float blue = 1.0 - logistic((lambda[i] - 490.0) / 12.0);
+        float red = logistic((lambda[i] - 595.0) / 12.0);
+        s[i] = w.x * blue + w.y * (1.0 - blue - red) + w.z * red;
+    }
+    return s;
+#else
+    return vec4(rgb, 0.0);
+#endif
+}
+
 // A Spec's luminance as the film sees it (Y), for path guiding.
 float spec_luminance(Spec s, vec4 lambda) {
 #if SPECTRAL

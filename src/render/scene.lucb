@@ -138,15 +138,15 @@ func material_indices(materials: const Materials*, mesh: const Mesh*) -> u32[]!:
     let out = try new u32[faces] in memory.heap
     let attribute = mesh.find_attribute("material", 2)
     if attribute < 0 or materials.count() == 0: return out
-    let strings = (usize)(try mesh.attribute_string_count(attribute))
-    let looked = try new u32[strings] in memory.heap
+    let names = (usize)(try mesh.attribute_string_count(attribute))
+    let looked = try new u32[names] in memory.heap
     defer free(looked) in memory.heap
-    for at in 0..<strings:
+    for at in 0..<names:
         let found = materials.index_of(try mesh.attribute_string(attribute, (i64)at))
         looked[at] = (u32)(found + 1)
     for face in 0..<faces:
         let path = try mesh.attribute_text(attribute, (i64)face)
-        for at in 0..<strings:
+        for at in 0..<names:
             if (try mesh.attribute_string(attribute, (i64)at)) == path:
                 out[face] = looked[at]
                 break

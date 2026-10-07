@@ -16,6 +16,7 @@
 #       camera.lucb    a camera's primary-ray frame for a resolution
 #       device.lucb    GpuScene, the scene's buffers, and the primary-ray probe
 #       spectrum.lucb  color matching, spectral fits of colors, blackbodies, film matrix
+#       environment.lucb  a dome light's image, read and prepared for sampling by importance
 #       lights.lucb    UsdLux lights packed for the kernels
 #       materials.lucb OpenPBR Surface parameters packed for the kernels
 #       light_tree.lucb the light tree over lights and emissive triangles
@@ -32,6 +33,10 @@ import interop
 from luce_std import clock
 from luce_std import math
 from luce_std import math32
+from luce_std import files
+import strings
+from luce_exr import exr
+from luce_raster.model import Raster
 from luce_geocore.geocore import Vector3, Matrix4, Mesh, MeshPrimitives, GeometrySet, SceneObject, SceneKind, Camera, Projection, LightShape
 from luce_geocore.kernel import Float3, append_text, Instances, Component, SceneObjects, Materials, MaterialParameter, mesh_component, instances_component, scene_flattened, materials_flattened
 from luce_geocore.core.growing import Growing

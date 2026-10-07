@@ -4,6 +4,7 @@ bvh.lucb
 camera.lucb
 device.lucb
 spectrum.lucb
+environment.lucb
 lights.lucb
 materials.lucb
 light_tree.lucb

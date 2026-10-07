@@ -1,0 +1,156 @@
+#==============================================================================================
+#
+#   render/environment - A dome light's image, sampled by importance
+#
+#   DESCRIPTION:
+#       A dome light (UsdLuxDomeLight) wraps a lat-long image around the scene: the
+#       image's center looks down the light's -Z, its top is +Y. Pixels are read from
+#       OpenEXR (luce-exr) as linear Rec.709, the convention of HDR environments, and
+#       turned into ACEScg. Texels are constant (no filtering), so sampling a texel in
+#       proportion to its luminance times sin θ (its solid angle) makes the light's
+#       pdf follow its radiance exactly: the kernels (shaders/lights.glsl) search the
+#       rows' cumulative weights, then the chosen row's.
+#
+#       The spectral build turns a texel's ACEScg into a spectrum linearly: three
+#       smooth spectra that sum to the flat one (blue below ~490 nm, red above ~595,
+#       green between), weighted by a 3 × 3 matrix of ACEScg (basis_weights). Every
+#       texel then costs one matrix product, white stays flat, and colors are exact.
+#
+#==============================================================================================
+
+## Linear Rec.709 (sRGB primaries, D65) to ACEScg, Bradford-adapted.
+func rec709_to_acescg() -> Matrix3:
+    return Matrix3([0.613097, 0.339523, 0.047379,
+                    0.070194, 0.916354, 0.013452,
+                    0.020616, 0.109570, 0.869815])
+
+func logistic(x: f64) -> f64:
+    return 1.0 / (1.0 + math.exp(-x))
+
+## The basis spectra at `lambda` nm, as shaders/spectrum.glsl evaluates them:
+## blue, green, red.
+pub func basis_spectra(lambda: f64) -> Vector3:
+    let blue = 1.0 - logistic((lambda - 490.0) / 12.0)
+    let red = logistic((lambda - 595.0) / 12.0)
+    return Vector3(blue, 1.0 - blue - red, red)
+
+## The matrix from ACEScg to the basis spectra's weights: the inverse of
+## their colors through the film.
+pub func basis_weights() -> Matrix3:
+    let integrals = cmf_integrals()
+    var columns: Vector3[3] = [Vector3(), Vector3(), Vector3()]
+    var lambda = lambda_min
+    while lambda <= lambda_max:
+        let b = basis_spectra(lambda)
+        let matching = cmf(lambda)
+        columns[0] = columns[0].add(matching.multiply_scalar(b.x))
+        columns[1] = columns[1].add(matching.multiply_scalar(b.y))
+        columns[2] = columns[2].add(matching.multiply_scalar(b.z))
+        lambda += 1.0
+    let film = film_matrix()
+    var rgb: Vector3[3] = [Vector3(), Vector3(), Vector3()]
+    for k in 0..<(usize)3:
+        let xyz = Vector3(columns[k].x / integrals.x, columns[k].y / integrals.y, columns[k].z / integrals.z)
+        rgb[k] = film.apply(xyz)
+    # Columns: blue, green, red's ACEScg.
+    let colors = Matrix3([rgb[0].x, rgb[1].x, rgb[2].x, rgb[0].y, rgb[1].y, rgb[2].y, rgb[0].z, rgb[1].z, rgb[2].z])
+    return colors.inverse()
+
+pub struct Environment:
+    pub var width: usize
+    pub var height: usize
+    ## Four floats a texel, rows from the top: ACEScg radiance, and its weight
+    ## (luminance × sin θ).
+    pub var texels: Growing[f32]
+    ## Each row's cumulative weights (`width` a row, ending at 1), then the
+    ## rows' (`height`, ending at 1).
+    pub var cdf: Growing[f32]
+    ## The weights' sum, and the texels' mean luminance over the sphere.
+    pub var total: f64
+    pub var average: f64
+
+    pub func init():
+        self.width = 0
+        self.height = 0
+        self.texels = Growing[f32]()
+        self.cdf = Growing[f32]()
+        self.total = 0.0
+        self.average = 0.0
+
+    pub func close():
+        self.texels.close()
+        self.cdf.close()
+
+## The environment in image file `path` (OpenEXR, RGB or Y).
+pub func load_environment(path: str) -> Environment!:
+    var name: str
+    with memory.heap:
+        name = try strings.copy(path)
+    defer:
+        with memory.heap: strings.release(name)
+    let bytes = try files.read((c.str)name)
+    var raster = Raster(max_pixels = 67108864)
+    defer raster.close()
+    raster.encoded = try new u8[bytes.value.length] --- in memory.heap
+    memory.copy(raster.encoded, bytes.value, bytes.value.length)
+    bytes.release()
+    try exr.probe(&raster)
+    try raster.allocate()
+    for chunk in 0..<raster.chunks.length: try exr.decode_chunk(&raster, chunk)
+    var channel: i64[3] = [-1, -1, -1]
+    var grey: i64 = -1
+    for at in 0..<raster.channels.length:
+        let n = raster.channels[at].name
+        if n == "R": channel[0] = (i64)at
+        elif n == "G": channel[1] = (i64)at
+        elif n == "B": channel[2] = (i64)at
+        elif n == "Y": grey = (i64)at
+    if channel[0] < 0 or channel[1] < 0 or channel[2] < 0:
+        if grey < 0: error(invalid, "an environment image needs R, G and B channels, or Y")
+        channel = [grey, grey, grey]
+    return try environment_of(raster.width, raster.height, raster.pixels, raster.channels.length, channel)
+
+## An environment from `width` × `height` pixels of `stride` samples each,
+## its linear Rec.709 R, G and B at `channel`.
+pub func environment_of(width: usize, height: usize, pixels: const f64[], stride: usize, channel: const i64[]) -> Environment!:
+    var environment = Environment()
+    errdefer environment.close()
+    environment.width = width
+    environment.height = height
+    let to_acescg = rec709_to_acescg()
+    try environment.texels.reserve(width * height * 4)
+    try environment.cdf.reserve(width * height + height)
+    var rows = Growing[f64]()
+    defer rows.close()
+    var luminance_sum: f64 = 0.0
+    var solid_angle: f64 = 0.0
+    for y in 0..<height:
+        let sin_theta = math.sin(math.pi * ((f64)y + 0.5) / (f64)height)
+        var row: f64 = 0.0
+        let start = environment.cdf.count
+        for x in 0..<width:
+            let at = (y * width + x) * stride
+            let source = Vector3(pixels[at + (usize)channel[0]], pixels[at + (usize)channel[1]], pixels[at + (usize)channel[2]])
+            let raw = to_acescg.apply(source)
+            let rgb = Vector3(math.max(0.0, raw.x), math.max(0.0, raw.y), math.max(0.0, raw.z))
+            let lum = luminance(rgb)
+            let weight = lum * sin_theta
+            for value in [rgb.x, rgb.y, rgb.z, weight]: try environment.texels.push((f32)value)
+            row += weight
+            try environment.cdf.push((f32)row)
+            luminance_sum += lum * sin_theta
+            solid_angle += sin_theta
+        # The row's cumulative weights end at 1 (uniform across an empty row).
+        for x in 0..<width:
+            let at = start + x
+            environment.cdf.items[at] = (f32)((f64)environment.cdf.items[at] / row if row > 0.0 else ((f64)(x + 1) / (f64)width))
+        try rows.push(row)
+    var total: f64 = 0.0
+    for row in rows.view(): total += row
+    var running: f64 = 0.0
+    for y in 0..<height:
+        running += rows.items[y]
+        try environment.cdf.push((f32)(running / total if total > 0.0 else ((f64)(y + 1) / (f64)height)))
+    environment.total = total
+    environment.average = luminance_sum / solid_angle if solid_angle > 0.0 else 0.0
+    return environment

@@ -18,6 +18,16 @@ def package "luce-render" {
         str path = "../luce-gpu"
     }
 
+    def dependency "luce-exr" {
+        str owner = "dymokomi"
+        str path = "../luce-exr"
+    }
+
+    def dependency "luce-raster" {
+        str owner = "dymokomi"
+        str path = "../luce-raster"
+    }
+
     def dependency "luce-std" {
         str owner = "dymokomi"
         str path = "../luce-std"
