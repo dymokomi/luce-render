@@ -384,6 +384,7 @@ func guided_room(device: gpu.Device) -> !:
             settings.material.base_color = Vector3(0.3, 0.3, 0.3)
             settings.material.specular_weight = 0.0
             settings.guiding = round > 0 and way == 1
+            settings.light_tracing = 0.0
             settings.seed = (u32)(round + 1)
             var renderer = try render.Renderer.create(device, &scene, settings)
             defer renderer.destroy()

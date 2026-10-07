@@ -256,9 +256,66 @@ First numbers, on an M4 Max:
 | 256 × 256, 256 samples, unguided | MSE 0.0078 at 1.39 ms a sample |
 | 256 × 256, 256 samples, guided | MSE 0.0076 at 2.08 ms a sample (worse at equal time) |
 
+## Light tracing
+
+Caustics made the Cornell box's fireflies: light focused through the glass
+ball onto the floor, seen directly or after a bounce. Shadow rays cannot
+follow refraction, so camera paths found that light only by a lucky BSDF ray
+through the ball onto the small lamp. A clamp hid the fireflies by deleting
+59% of the caustic. [research/FIREFLIES-STUDY.md](research/FIREFLIES-STUDY.md)
+has the measurements and the literature.
+
+Light paths fix it without bias (`RenderSettings.light_tracing`, light paths a
+pixel a sample, 0.5 by default; the Render node's "Light paths"):
+
+- **Where they run:** in the camera paths' wavefront. They take the pool's
+  slots after the band's camera paths; `light_emit` starts them in the first
+  band's pass, and they share the rounds. `shade_surface` shades both kinds in
+  one dispatch, so their latencies overlap.
+- **What they do:** start at an emitter chosen by power, at a point by area,
+  in a cosine direction. At every surface they connect to the camera with a
+  shadow ray, and `intersect_shadow` splats what gets through atomically on a
+  fourth film plane. `film_convert` adds the splats over the light-tracing
+  samples taken.
+- **MIS over three techniques** (shaders/connect.glsl): the camera's BSDF hit
+  on a light, its light sample, and the light path's camera connection, each
+  weighed by the power heuristic over all three. Both sides carry the ratio of
+  the other side's path density to their own, settling each vertex's factor
+  once the direction beyond it is known. Light paths choose lobes by Fresnel
+  at normal incidence (`light_lobes`), so camera paths compute their reverse
+  pdfs without tables.
+- **Transport:** light paths weigh each bounce by the BSDF as the camera
+  evaluates it (radiance transport), with Veach's shading-normal correction.
+- **Visibility reads the same both ways:** light paths cross flat lights the
+  mirror way of camera rays, and a camera connection stops at a visible light
+  the camera's ray would hit first.
+
+Checked against closed forms (rect light and emissive quad with light paths)
+and against path tracing: the all-diffuse Cornell box agrees to 0.01%, and the
+lamp-in-a-shade room converges 22x lower MSE at equal samples.
+
+## Benchmark: the Cornell box, now
+
+512 × 512, 12 bounces, spectral, M4 Max (another GPU app running, so absolute
+times are about 15% high). Error is relative MSE against a 16384-sample
+light-traced reference; "trimmed" drops the worst 0.1% of pixels.
+
+| Light paths a pixel | ms a sample | relMSE at 512 samples | relMSE x time | trimmed x time |
+| --- | --- | --- | --- | --- |
+| 0 (path tracing) | 3.14 | 0.0392 | 0.123 | 0.090 |
+| 0.1 | 3.94 | 0.0086 | 0.034 | 0.016 |
+| 0.25 | 4.25 | 0.0059 | 0.025 | 0.012 |
+| 0.5 (default) | 4.79 | 0.0041 | 0.020 | 0.011 |
+| 1 | 5.88 | 0.0033 | 0.020 | 0.011 |
+
+Light tracing is about 6x more efficient at equal time (8x trimmed, 11x
+outside the glass ball). What noise is left is in caustics seen through glass
+(the ball's inside, the clear coat's reflection), which neither technique can
+sample: manifold next-event estimation is the next step for those
+(REALTIME-STUDY §3.6). Path guiding trained from light paths too (Vorba 2014)
+was tried and did not pay: it doubled the error on the gold and the coat.
+
 Next:
+- Manifold sampling for caustics seen through glass.
 - A denoiser.
-- Transparent shadows through glass and cut-outs.
 - Instancing as a BLAS per prototype.
-- Workgroup-aggregated queue appends and per-kernel timings.
-- Then path guiding.

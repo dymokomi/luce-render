@@ -282,3 +282,30 @@ It covers E S S D S S L, which nothing above does.
 - The Render node keeps "Clamp indirect", but its default becomes 0 (off) for final renders.
 - The inspector labels the clamp as biased.
 - The Cornell benchmark stays unclamped, so speed comparisons always measure the unbiased image.
+
+---
+
+## 4. Results (2026-10-07)
+
+§3.2 is built (docs/DESIGN.md, "Light tracing"); light paths are on by default
+at 0.5 a pixel.
+
+| Cornell box, 512 × 512, 512 samples | relMSE | ms a sample | relMSE x time |
+| --- | --- | --- | --- |
+| path tracing | 0.0392 | 3.14 | 0.123 |
+| + light paths, 0.5 a pixel | 0.0041 | 4.79 | 0.020 |
+
+- **Bias:** none measurable. The all-diffuse Cornell box agrees with path
+  tracing to 0.01%; with the glass, light paths sit inside path tracing's own
+  seed-to-seed spread (0.5% on the caustic floor).
+- **Two bugs that looked like physics, and taught the rules:**
+  - flat lights must stop light paths the mirror way they stop camera rays;
+  - a camera connection must stop at a visible light the camera would hit.
+
+  Each broke the reciprocity the weights assume.
+- **Guiding trained by light paths** (§3.3): tried; it doubled the error on the
+  gold ball and the clear coat (guided samples on glossy lobes) and did not help
+  the glass. Not kept.
+- **What remains:** caustics seen through glass or in a clear coat
+  (E S S D S S L). §3.4's manifold sampling is next.
+

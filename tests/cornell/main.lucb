@@ -132,14 +132,16 @@ pub func main(arguments: str[]) -> i32!:
     let pixels = try new f32[512 * 512 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     # LUCE_CORNELL_SAMPLES, LUCE_CORNELL_CLAMP, LUCE_CORNELL_LIGHT,
-    # LUCE_CORNELL_SEED and LUCE_CORNELL_BOUNCES change the image's samples,
-    # indirect clamp (none by default: the unbiased image), light paths
-    # (percent of a path a pixel), seed and bounce limit.
+    # LUCE_CORNELL_SEED, LUCE_CORNELL_BOUNCES and LUCE_CORNELL_GUIDING (1 on)
+    # change the image's samples, indirect clamp (none by default: the
+    # unbiased image), light paths (percent of a path a pixel; the renderer's
+    # default otherwise), seed, bounce limit and path guiding.
     var settings = render.RenderSettings.of(512, 512, (u32)number_of("LUCE_CORNELL_SAMPLES", 128.0))
     settings.clamp_indirect = number_of("LUCE_CORNELL_CLAMP", 0.0)
-    settings.light_tracing = number_of("LUCE_CORNELL_LIGHT", 0.0) / 100.0
+    settings.light_tracing = number_of("LUCE_CORNELL_LIGHT", settings.light_tracing * 100.0) / 100.0
     settings.seed = (u32)number_of("LUCE_CORNELL_SEED", 0.0)
     settings.max_bounces = (u32)number_of("LUCE_CORNELL_BOUNCES", 12.0)
+    settings.guiding = number_of("LUCE_CORNELL_GUIDING", 0.0) > 0.0
     settings.profile = os.env("LUCE_CORNELL_PROFILE") != none
     let ms = try render_image(device, &scene, settings, pixels)
     try files.ensure_directory("build")

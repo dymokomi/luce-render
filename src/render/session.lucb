@@ -32,6 +32,7 @@ pub struct RenderSession:
     var clamp_indirect: f64
     var noise_threshold: f64
     var guiding: bool
+    var light_tracing: f64
 
     pub func init():
         self.device = gpu.Device()
@@ -50,6 +51,7 @@ pub struct RenderSession:
         self.clamp_indirect = 0.0
         self.noise_threshold = 0.0
         self.guiding = false
+        self.light_tracing = RenderSettings.of(1, 1, 1).light_tracing
 
     pub static func make() -> interop.Reference[RenderSession]!:
         return try interop.Reference[RenderSession].adopt(try new RenderSession() in memory.heap, render_session_type, memory.heap)
@@ -82,6 +84,7 @@ pub struct RenderSession:
         settings.clamp_indirect = self.clamp_indirect
         settings.noise_threshold = self.noise_threshold
         settings.guiding = self.guiding
+        settings.light_tracing = self.light_tracing
         self.settings = settings
         self.waiting = scene
         self.started = clock.now()
@@ -97,14 +100,16 @@ pub struct RenderSession:
         self.material = openpbr_of(&library, 0)
 
     ## Bounce limits by kind, the indirect clamp (0 off), adaptive sampling's
-    ## noise threshold (0 off) and path guiding of the next `start`.
-    pub func set_limits(diffuse: i64, glossy: i64, transmission: i64, clamp_indirect: f64, noise_threshold: f64, guiding: bool):
+    ## noise threshold (0 off), path guiding and light paths a pixel (0 off) of
+    ## the next `start`.
+    pub func set_limits(diffuse: i64, glossy: i64, transmission: i64, clamp_indirect: f64, noise_threshold: f64, guiding: bool, light_tracing: f64):
         self.diffuse = (u32)math.max(0.0, (f64)diffuse)
         self.glossy = (u32)math.max(0.0, (f64)glossy)
         self.transmission = (u32)math.max(0.0, (f64)transmission)
         self.clamp_indirect = math.max(0.0, clamp_indirect)
         self.noise_threshold = math.max(0.0, noise_threshold)
         self.guiding = guiding
+        self.light_tracing = math.max(0.0, light_tracing)
 
     ## Advance the render a pass and draw it fitted into (x, y, width, height) of
     ## `target`; whether passes are still coming.
