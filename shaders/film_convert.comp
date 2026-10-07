@@ -1,0 +1,20 @@
+#version 450
+// The film's average per pixel as ACEScg in an rgba32f image: XYZ under E through
+// the film matrix in the spectral build, as is in the RGB build.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "common.glsl"
+layout(set = 0, binding = 8, rgba32f) writeonly uniform image2D image;
+
+void main() {
+    uint width = uint(params.du.w);
+    uint height = uint(params.dv.w);
+    uvec2 at = gl_GlobalInvocationID.xy;
+    if (at.x >= width || at.y >= height) return;
+    vec4 sum = film[at.y * width + at.x];
+    vec3 value = sum.xyz / max(sum.w, 1.0);
+#if SPECTRAL
+    value = vec3(dot(constants[K_FILM].xyz, value), dot(constants[K_FILM + 1].xyz, value), dot(constants[K_FILM + 2].xyz, value));
+#endif
+    imageStore(image, ivec2(at), vec4(value, 1.0));
+}

@@ -6,9 +6,9 @@ the scene into GPU buffers and records compute passes on luce-gpu. All tracing
 happens in GLSL compute kernels: Metal on macOS, Vulkan on Windows and Linux.
 There is no CPU renderer.
 
-It is early. The scene compiler, the BVH and the primary-ray probe work today.
-The integrator, OpenPBR materials and lights come next; docs/DESIGN.md has the
-plan.
+It is early. The v1 integrator renders Lambertian surfaces under UsdLux lights,
+spectral or RGB, and is checked against closed-form answers. OpenPBR's lobes come
+next; docs/DESIGN.md has the plan and the status.
 
 ```luce
 from luce_render import render
@@ -20,6 +20,11 @@ var on_gpu = render.GpuScene.upload(device, &scene)
 defer on_gpu.destroy()
 let frame = render.ray_frame(scene.objects.object(0), 1920, 1080)
 render.probe(device, &on_gpu, &frame, probes)      # each pixel's polygon and distance
+
+var renderer = render.Renderer.create(device, &scene, render.RenderSettings.of(1920, 1080, 128))
+defer renderer.destroy()
+while renderer.advance():                          # once per UI frame; never waits
+    show(renderer.image(), renderer.samples_done())    # an rgba32f ACEScg texture
 ```
 
 ## What it reads

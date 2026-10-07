@@ -34,9 +34,11 @@ pub struct GpuScene:
         self.indices.destroy()
         self.faces.destroy()
 
+## A buffer of `bytes`; an empty one still gets 64 zero bytes, since Metal wants
+## room for at least one element of whatever the kernel declares (a vec4, a node).
 func buffer_of(device: gpu.Device, bytes: const u8[]) -> gpu.Buffer!:
     if bytes.length == 0:
-        return try gpu.Buffer.allocate(device, 4)
+        return try gpu.Buffer.allocate(device, 64)
     return try gpu.Buffer.create(device, bytes)
 
 ## One pixel of a probe: the polygon hit (none: the ray missed) and its distance

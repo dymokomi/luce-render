@@ -1,0 +1,177 @@
+#==============================================================================================
+#
+#   render/spectrum - Color science shared by the host and the kernels
+#
+#   DESCRIPTION:
+#       Colors arrive as linear ACEScg. The spectral build renders wavelengths and its
+#       film accumulates XYZ relative to the equal-energy white E; the RGB build renders
+#       ACEScg directly. Both builds agree on white: ACEScg (1, 1, 1) is the constant
+#       spectrum 1, whose XYZ is (1, 1, 1) under E, and the film matrix (XYZ_E →
+#       Bradford to D60 → ACEScg) brings it back to (1, 1, 1).
+#
+#       - Color matching uses Wyman, Sloan and Shirley's multi-lobe fit of the CIE 1931
+#         2° observer (JCGT 2013), each channel normalized by its own integral over
+#         360–830 nm, so the constant spectrum 1 is exactly XYZ (1, 1, 1).
+#       - An ACEScg color becomes a spectrum by Jakob and Hanika's sigmoid of a
+#         quadratic (2019), fitted here per color by Gauss–Newton: scale ×
+#         S(c0 x² + c1 x + c2), x the wavelength mapped to 0..1 over 360–830 nm and
+#         S(z) = ½ + z / (2√(1 + z²)). Fitting at half the color's largest component
+#         keeps S away from its asymptotes; `scale` restores it.
+#       - Blackbody emitters are Planck's law normalized to luminance 1.
+#
+#       The kernels' copies of these formulas are in shaders/spectrum.glsl.
+#
+#==============================================================================================
+
+pub let lambda_min: f64 = 360.0
+pub let lambda_max: f64 = 830.0
+
+## A 3×3 matrix by rows, for color space conversions.
+pub struct Matrix3:
+    pub var m: f64[9]
+
+    pub func apply(v: Vector3) -> Vector3:
+        return Vector3(self.m[0] * v.x + self.m[1] * v.y + self.m[2] * v.z,
+                       self.m[3] * v.x + self.m[4] * v.y + self.m[5] * v.z,
+                       self.m[6] * v.x + self.m[7] * v.y + self.m[8] * v.z)
+
+    pub func times(other: Matrix3) -> Matrix3:
+        var out: f64[9]
+        for row in 0..<(usize)3:
+            for column in 0..<(usize)3:
+                var sum: f64 = 0.0
+                for k in 0..<(usize)3: sum += self.m[row * 3 + k] * other.m[k * 3 + column]
+                out[row * 3 + column] = sum
+        return Matrix3(out)
+
+    pub func inverse() -> Matrix3:
+        let a = self.m
+        let c0 = a[4] * a[8] - a[5] * a[7]
+        let c1 = a[5] * a[6] - a[3] * a[8]
+        let c2 = a[3] * a[7] - a[4] * a[6]
+        let d = 1.0 / (a[0] * c0 + a[1] * c1 + a[2] * c2)
+        return Matrix3([c0 * d, (a[2] * a[7] - a[1] * a[8]) * d, (a[1] * a[5] - a[2] * a[4]) * d,
+                        c1 * d, (a[0] * a[8] - a[2] * a[6]) * d, (a[2] * a[3] - a[0] * a[5]) * d,
+                        c2 * d, (a[1] * a[6] - a[0] * a[7]) * d, (a[0] * a[4] - a[1] * a[3]) * d])
+
+    static func diagonal(v: Vector3) -> Matrix3:
+        return Matrix3([v.x, 0.0, 0.0, 0.0, v.y, 0.0, 0.0, 0.0, v.z])
+
+## ACEScg (AP1 primaries, ACES white) to CIE XYZ.
+pub func acescg_to_xyz() -> Matrix3:
+    return Matrix3([0.6624541811, 0.1340042065, 0.1561876870,
+                    0.2722287168, 0.6740817658, 0.0536895174,
+                    -0.0055746495, 0.0040607335, 1.0103391003])
+
+## Bradford chromatic adaptation from white `source` to white `target` (XYZ).
+func bradford(source: Vector3, target: Vector3) -> Matrix3:
+    let cone = Matrix3([0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.0367, 0.0389, -0.0685, 1.0296])
+    let s = cone.apply(source)
+    let t = cone.apply(target)
+    return cone.inverse().times(Matrix3.diagonal(Vector3(t.x / s.x, t.y / s.y, t.z / s.z))).times(cone)
+
+## ACEScg to XYZ relative to white E: what the spectral build's spectra mean.
+pub func acescg_to_xyz_e() -> Matrix3:
+    let to_xyz = acescg_to_xyz()
+    return bradford(to_xyz.apply(Vector3(1.0, 1.0, 1.0)), Vector3(1.0, 1.0, 1.0)).times(to_xyz)
+
+## The spectral film's matrix: XYZ relative to E to ACEScg.
+pub func film_matrix() -> Matrix3:
+    return acescg_to_xyz_e().inverse()
+
+func lobe(x: f64, mean: f64, below: f64, above: f64) -> f64:
+    let t = (x - mean) / (below if x < mean else above)
+    return math.exp(-0.5 * t * t)
+
+## The CIE 1931 2° observer (Wyman et al.'s fit), unnormalized.
+pub func cmf(lambda: f64) -> Vector3:
+    let x = 1.056 * lobe(lambda, 599.8, 37.9, 31.0) + 0.362 * lobe(lambda, 442.0, 16.0, 26.7) - 0.065 * lobe(lambda, 501.1, 20.4, 26.2)
+    let y = 0.821 * lobe(lambda, 568.8, 46.9, 40.5) + 0.286 * lobe(lambda, 530.9, 16.3, 31.1)
+    let z = 1.217 * lobe(lambda, 437.0, 11.8, 36.0) + 0.681 * lobe(lambda, 459.0, 26.0, 13.8)
+    return Vector3(x, y, z)
+
+## Each channel's integral over 360–830 nm at 1 nm: the film divides by these.
+pub func cmf_integrals() -> Vector3:
+    var sum = Vector3()
+    var lambda = lambda_min
+    while lambda <= lambda_max:
+        sum = sum.add(cmf(lambda))
+        lambda += 1.0
+    return sum
+
+## Jakob–Hanika's algebraic sigmoid.
+func sigmoid(z: f64) -> f64:
+    return 0.5 + z / (2.0 * math.sqrt(1.0 + z * z))
+
+## A spectrum as the kernels evaluate it: scale × S(c0 x² + c1 x + c2).
+pub struct SpectrumFit:
+    pub var c0: f64
+    pub var c1: f64
+    pub var c2: f64
+    pub var scale: f64
+
+    pub func at(lambda: f64) -> f64:
+        let x = (lambda - lambda_min) / (lambda_max - lambda_min)
+        return self.scale * sigmoid((self.c0 * x + self.c1) * x + self.c2)
+
+## The XYZ (relative to E, normalized per channel) of the fit's sigmoid alone.
+func fit_xyz(k: Vector3, integrals: Vector3) -> Vector3:
+    var sum = Vector3()
+    var lambda = lambda_min
+    while lambda <= lambda_max:
+        let x = (lambda - lambda_min) / (lambda_max - lambda_min)
+        let s = sigmoid((k.x * x + k.y) * x + k.z)
+        sum = sum.add(cmf(lambda).multiply_scalar(s * 5.0))
+        lambda += 5.0
+    return Vector3(sum.x / integrals.x, sum.y / integrals.y, sum.z / integrals.z)
+
+func solve3(j: Matrix3, r: Vector3) -> Vector3:
+    return j.inverse().apply(r)
+
+## The spectrum of linear ACEScg `rgb` (components ≥ 0). Greys are exact
+## constants; other colors are fitted to their XYZ under E.
+pub func fit_spectrum(rgb: Vector3) -> SpectrumFit:
+    let largest = math.max(rgb.x, math.max(rgb.y, rgb.z))
+    if largest <= 0.0: return SpectrumFit(0.0, 0.0, 0.0, 0.0)
+    if math.abs(rgb.x - rgb.y) < 1e-6 * largest and math.abs(rgb.y - rgb.z) < 1e-6 * largest:
+        return SpectrumFit(0.0, 0.0, 0.0, 2.0 * largest)
+    # Fit the color at half its largest component; S(0) = ½ is the start.
+    let target = acescg_to_xyz_e().apply(rgb.multiply_scalar(0.5 / largest))
+    let integrals = cmf_integrals()
+    var k = Vector3()
+    for iteration in 0..<(usize)40:
+        _ = iteration
+        let r = fit_xyz(k, integrals).subtract(target)
+        if r.length() < 1e-7: break
+        # Numerical Jacobian, one column per coefficient.
+        let h: f64 = 1e-4
+        let jx = fit_xyz(Vector3(k.x + h, k.y, k.z), integrals).subtract(target).subtract(r).multiply_scalar(1.0 / h)
+        let jy = fit_xyz(Vector3(k.x, k.y + h, k.z), integrals).subtract(target).subtract(r).multiply_scalar(1.0 / h)
+        let jz = fit_xyz(Vector3(k.x, k.y, k.z + h), integrals).subtract(target).subtract(r).multiply_scalar(1.0 / h)
+        let j = Matrix3([jx.x, jy.x, jz.x, jx.y, jy.y, jz.y, jx.z, jy.z, jz.z])
+        let step = solve3(j, r)
+        if not step.is_finite(): break
+        # Damped: large steps in z swing the sigmoid to its asymptotes.
+        let size = step.length()
+        let longest: f64 = 20.0
+        k = k.subtract(step.multiply_scalar(longest / size if size > longest else 1.0))
+    return SpectrumFit(k.x, k.y, k.z, 2.0 * largest)
+
+## Planck's law at `lambda` nm and `kelvin`, divided by its value at its peak,
+## in the kernels' form (shaders/spectrum.glsl): with x = c2 / (λT), the peak is
+## at x = 4.965114, so B(λ)/B(peak) = (λpeak/λ)^5 (e^4.965114 - 1) / (e^x - 1).
+pub func blackbody(lambda: f64, kelvin: f64) -> f64:
+    let peak = 2.8977721e6 / kelvin
+    let x = 1.4387769e7 / (lambda * kelvin)
+    let r = peak / lambda
+    return r * r * r * r * r * ((math.exp(4.965114) - 1.0) / (math.exp(x) - 1.0))
+
+## The XYZ (relative to E) of the peak-normalized blackbody at `kelvin`.
+pub func blackbody_xyz(kelvin: f64) -> Vector3:
+    let integrals = cmf_integrals()
+    var sum = Vector3()
+    var lambda = lambda_min
+    while lambda <= lambda_max:
+        sum = sum.add(cmf(lambda).multiply_scalar(blackbody(lambda, kelvin)))
+        lambda += 1.0
+    return Vector3(sum.x / integrals.x, sum.y / integrals.y, sum.z / integrals.z)

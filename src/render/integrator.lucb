@@ -1,0 +1,313 @@
+#==============================================================================================
+#
+#   render/integrator - The wavefront path tracer's host side
+#
+#   DESCRIPTION:
+#       A Renderer owns a scene's buffers, the path state, the film and the output image,
+#       and records passes. A pass traces one sample for one band of pixels (at most
+#       `pool` paths): camera, then per bounce schedule → intersect_closest → schedule →
+#       shade_surface and shade_miss → schedule → intersect_shadow, then finish (paths
+#       into the film) and film_convert (the film's average into the image). Queue
+#       sizes never come back to the host: schedule writes indirect arguments.
+#
+#       `advance` is meant to be called once per UI frame: it starts the next pass
+#       only when the last one has finished, so the UI never waits and the GPU stays
+#       busy. Device work happens on the main thread.
+#
+#       Buffers, as shaders/common.glsl binds them: 0 nodes, 1 positions, 2 indices,
+#       3 lights, 4 state (vec4 fields), 5 state (uint fields), 6 queues, 7 film,
+#       8 the image, 9 constants.
+#
+#==============================================================================================
+
+## What to render and how.
+pub struct RenderSettings:
+    pub var width: u32
+    pub var height: u32
+    pub var samples: u32
+    ## The most surface interactions a path shades: 1 is direct light only.
+    pub var max_bounces: u32
+    pub var spectral: bool
+    ## The camera's index among the scene objects; -1 takes the first camera.
+    pub var camera: i64
+    ## Radiance from every direction no surface covers (linear ACEScg).
+    pub var background: Vector3
+    ## The default material's base color (until materials are assigned).
+    pub var base_color: Vector3
+    ## Paths in flight at once; 0 is min(2^20, pixels).
+    pub var pool: u32
+    pub var seed: u32
+
+    pub static func of(width: u32, height: u32, samples: u32) -> RenderSettings:
+        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), Vector3(0.8, 0.8, 0.8), 0, 1)
+
+let state_v_fields: usize = 9
+let state_u_fields: usize = 2
+let queue_count: usize = 5
+let queue_base: usize = 32
+let constants_rows: usize = 16
+let default_pool: usize = 1048576
+
+## The integrator's kernels in one build (spectral or RGB).
+struct Kernel:
+    var kernel: gpu.Kernel
+    var kinds: const u8[]
+
+    static func create(device: gpu.Device, words: const u32[], msl: c.str, group: const u32[], kinds: const u8[]) -> Kernel!:
+        return Kernel(try gpu.Kernel.create(device, words, msl, group, kinds), kinds)
+
+struct Kernels:
+    var camera: Kernel
+    var schedule: Kernel
+    var intersect_closest: Kernel
+    var shade_surface: Kernel
+    var shade_miss: Kernel
+    var intersect_shadow: Kernel
+    var finish: Kernel
+    var film_convert: Kernel
+
+    static func create(device: gpu.Device, spectral: bool) -> Kernels!:
+        if spectral:
+            var camera = try Kernel.create(device, camera_comp_words, camera_comp_msl, camera_comp_group, camera_comp_bindings)
+            errdefer camera.kernel.destroy()
+            var schedule = try Kernel.create(device, schedule_comp_words, schedule_comp_msl, schedule_comp_group, schedule_comp_bindings)
+            errdefer schedule.kernel.destroy()
+            var closest = try Kernel.create(device, intersect_closest_comp_words, intersect_closest_comp_msl, intersect_closest_comp_group, intersect_closest_comp_bindings)
+            errdefer closest.kernel.destroy()
+            var surface = try Kernel.create(device, shade_surface_comp_words, shade_surface_comp_msl, shade_surface_comp_group, shade_surface_comp_bindings)
+            errdefer surface.kernel.destroy()
+            var miss = try Kernel.create(device, shade_miss_comp_words, shade_miss_comp_msl, shade_miss_comp_group, shade_miss_comp_bindings)
+            errdefer miss.kernel.destroy()
+            var shadow = try Kernel.create(device, intersect_shadow_comp_words, intersect_shadow_comp_msl, intersect_shadow_comp_group, intersect_shadow_comp_bindings)
+            errdefer shadow.kernel.destroy()
+            var finish = try Kernel.create(device, finish_comp_words, finish_comp_msl, finish_comp_group, finish_comp_bindings)
+            errdefer finish.kernel.destroy()
+            let convert = try Kernel.create(device, film_convert_comp_words, film_convert_comp_msl, film_convert_comp_group, film_convert_comp_bindings)
+            return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert)
+        var camera = try Kernel.create(device, camera_rgb_comp_words, camera_rgb_comp_msl, camera_rgb_comp_group, camera_rgb_comp_bindings)
+        errdefer camera.kernel.destroy()
+        var schedule = try Kernel.create(device, schedule_rgb_comp_words, schedule_rgb_comp_msl, schedule_rgb_comp_group, schedule_rgb_comp_bindings)
+        errdefer schedule.kernel.destroy()
+        var closest = try Kernel.create(device, intersect_closest_rgb_comp_words, intersect_closest_rgb_comp_msl, intersect_closest_rgb_comp_group, intersect_closest_rgb_comp_bindings)
+        errdefer closest.kernel.destroy()
+        var surface = try Kernel.create(device, shade_surface_rgb_comp_words, shade_surface_rgb_comp_msl, shade_surface_rgb_comp_group, shade_surface_rgb_comp_bindings)
+        errdefer surface.kernel.destroy()
+        var miss = try Kernel.create(device, shade_miss_rgb_comp_words, shade_miss_rgb_comp_msl, shade_miss_rgb_comp_group, shade_miss_rgb_comp_bindings)
+        errdefer miss.kernel.destroy()
+        var shadow = try Kernel.create(device, intersect_shadow_rgb_comp_words, intersect_shadow_rgb_comp_msl, intersect_shadow_rgb_comp_group, intersect_shadow_rgb_comp_bindings)
+        errdefer shadow.kernel.destroy()
+        var finish = try Kernel.create(device, finish_rgb_comp_words, finish_rgb_comp_msl, finish_rgb_comp_group, finish_rgb_comp_bindings)
+        errdefer finish.kernel.destroy()
+        let convert = try Kernel.create(device, film_convert_rgb_comp_words, film_convert_rgb_comp_msl, film_convert_rgb_comp_group, film_convert_rgb_comp_bindings)
+        return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert)
+
+    func destroy():
+        self.camera.kernel.destroy()
+        self.schedule.kernel.destroy()
+        self.intersect_closest.kernel.destroy()
+        self.shade_surface.kernel.destroy()
+        self.shade_miss.kernel.destroy()
+        self.intersect_shadow.kernel.destroy()
+        self.finish.kernel.destroy()
+        self.film_convert.kernel.destroy()
+
+pub struct Renderer:
+    var device: gpu.Device
+    var settings: RenderSettings
+    var kernels: Kernels
+    var scene: GpuScene
+    var lights: gpu.Buffer
+    var constants: gpu.Buffer
+    var state_v: gpu.Buffer
+    var state_u: gpu.Buffer
+    var queues: gpu.Buffer
+    var film: gpu.Buffer
+    var output: gpu.Texture
+    var frame: RayFrame
+    var pool: usize
+    var light_count: usize
+    ## The pass in flight, and what comes next: sample `sample`, band `band`.
+    var pending: gpu.Compute?
+    var sample: u32
+    var band: usize
+    var completed: u32
+
+    ## A renderer of `scene` through its camera (see RenderSettings.camera). The
+    ## scene's buffers are uploaded; `scene` may be closed afterwards.
+    pub static func create(device: gpu.Device, scene: const CompiledScene*, settings: RenderSettings) -> Renderer!:
+        if settings.width == 0 or settings.height == 0 or settings.width > 16384 or settings.height > 16384: error(invalid, "an image is 1 to 16384 pixels on a side")
+        if settings.samples == 0 or settings.max_bounces == 0 or settings.max_bounces > 1024: error(invalid, "a render needs samples and 1 to 1024 bounces")
+        let camera = try find_camera(scene, settings.camera)
+        let frame = try ray_frame(scene.objects.object(camera), settings.width, settings.height)
+        let pixels = (usize)settings.width * (usize)settings.height
+        let pool = (usize)settings.pool if settings.pool > 0 else default_pool
+        let slots = pool if pool < pixels else pixels
+        var kernels = try Kernels.create(device, settings.spectral)
+        errdefer kernels.destroy()
+        var uploaded = try GpuScene.upload(device, scene)
+        errdefer uploaded.destroy()
+        var packed = Growing[f32]()
+        defer packed.close()
+        let light_count = try pack_lights(&scene.objects, scene_radius(scene), &packed)
+        var lights = try buffer_of(device, u8[]((u8*)packed.items.data, packed.count * 4))
+        errdefer lights.destroy()
+        var rows: f32[64]
+        try fill_constants(rows, settings, light_count)
+        var constants = try gpu.Buffer.create(device, u8[]((u8*)&rows[0], 256))
+        errdefer constants.destroy()
+        var state_v = try gpu.Buffer.allocate(device, state_v_fields * slots * 16)
+        errdefer state_v.destroy()
+        var state_u = try gpu.Buffer.allocate(device, state_u_fields * slots * 4)
+        errdefer state_u.destroy()
+        var queues = try gpu.Buffer.allocate(device, (queue_base + queue_count * slots) * 4)
+        errdefer queues.destroy()
+        var film = try gpu.Buffer.allocate(device, pixels * 16)
+        errdefer film.destroy()
+        let output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
+        return Renderer(device, settings, kernels, uploaded, lights, constants, state_v, state_u, queues, film, output, frame, slots, light_count, none, 0, 0, 0)
+
+    ## Start the next pass if the last has finished. True while there is work,
+    ## running or to come; false once every sample is in the image.
+    pub func advance() -> bool!:
+        if let running = self.pending:
+            if not (try running.done()): return true
+            var finished = running
+            try finished.wait()
+            finished.close()
+            self.pending = none
+        if self.sample >= self.settings.samples: return false
+        var pass = try gpu.Compute.begin(self.device)
+        errdefer pass.close()
+        try self.record(&pass)
+        try pass.submit()
+        self.pending = pass
+        let bands = (self.pixels() + self.pool - 1) // self.pool
+        self.band += 1
+        if self.band == bands:
+            self.band = 0
+            self.sample += 1
+        return true
+
+    ## Run every remaining pass to the end (offline renders and tests).
+    pub func finish() -> !:
+        while try self.advance():
+            if let running = self.pending:
+                var waiting = running
+                try waiting.wait()
+
+    ## Samples every pixel has, counting only passes that have finished.
+    pub func samples_done() -> u32:
+        if self.pending == none: return self.sample
+        # The pass in flight finishes sample - 1 when it was that sample's last band.
+        return self.sample - 1 if self.band == 0 else self.sample
+
+    pub func image() -> gpu.Texture:
+        return self.output
+
+    ## The image as rgba32f, row by row from the top (waits for work in flight).
+    pub func read(out: f32[]) -> !:
+        let pixels = self.pixels()
+        if out.length != pixels * 4: error(invalid, "reading the image needs four floats a pixel")
+        try self.output.read(u8[]((u8*)out.data, out.length * 4))
+
+    func pixels() -> usize:
+        return (usize)self.settings.width * (usize)self.settings.height
+
+    ## One pass: the band's sample from camera to film, and the image updated.
+    func record(pass: gpu.Compute*) -> !:
+        let start = self.band * self.pool
+        let remaining = self.pixels() - start
+        let count = self.pool if self.pool < remaining else remaining
+        var block: u8[96]
+        var frame: f32[16]
+        try self.frame.pack(frame)
+        memory.copy(block[0..<64], u8[]((u8*)&frame[0], 64), 64)
+        let groups = (u32)((count + 63) // 64)
+        try self.dispatch(pass, &self.kernels.camera, block, start, count, 0, 0, groups, 1)
+        # One more round than bounces: the last BSDF rays still find lights.
+        for bounce in 0..<(usize)self.settings.max_bounces + 1:
+            let current = (u32)(bounce % 2)
+            try self.dispatch(pass, &self.kernels.schedule, block, start, count, current, 0, 1, 1)
+            try self.indirect(pass, &self.kernels.intersect_closest, block, start, count, current, (usize)current)
+            try self.dispatch(pass, &self.kernels.schedule, block, start, count, current, 1, 1, 1)
+            try self.indirect(pass, &self.kernels.shade_surface, block, start, count, current, 2)
+            try self.indirect(pass, &self.kernels.shade_miss, block, start, count, current, 3)
+            try self.dispatch(pass, &self.kernels.schedule, block, start, count, current, 2, 1, 1)
+            try self.indirect(pass, &self.kernels.intersect_shadow, block, start, count, current, 4)
+        try self.dispatch(pass, &self.kernels.finish, block, start, count, 0, 0, groups, 1)
+        try self.dispatch(pass, &self.kernels.film_convert, block, start, count, 0, 0, (self.settings.width + 7) // 8, (self.settings.height + 7) // 8)
+
+    ## The push constants after the camera frame: band, sample and step.
+    func uniforms(block: u8[], start: usize, count: usize, current: u32, phase: u32):
+        let values: u32[8] = [(u32)start, (u32)count, self.sample, 0, current, phase, (u32)self.pool, self.settings.seed]
+        for at in 0..<(usize)8: memory.write[u32]((void*)&block[64 + at * 4], values[at])
+
+    func bindings(kernel: const Kernel*) -> gpu.Binding[10]:
+        var all: gpu.Binding[10] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
+                                    gpu.Binding(buffer = self.lights), gpu.Binding(buffer = self.state_v), gpu.Binding(buffer = self.state_u),
+                                    gpu.Binding(buffer = self.queues), gpu.Binding(buffer = self.film), gpu.Binding(texture = self.output),
+                                    gpu.Binding(buffer = self.constants)]
+        for at in 0..<(usize)10:
+            if at >= kernel.kinds.length or kernel.kinds[at] == 0: all[at] = gpu.Binding()
+        return all
+
+    func dispatch(pass: gpu.Compute*, kernel: const Kernel*, block: u8[], start: usize, count: usize, current: u32, phase: u32, x: u32, y: u32) -> !:
+        self.uniforms(block, start, count, current, phase)
+        let bound = self.bindings(kernel)
+        try pass.dispatch(kernel.kernel, bound, block, x, y)
+
+    ## A kernel over queue `queue`, sized by the arguments schedule left for it.
+    func indirect(pass: gpu.Compute*, kernel: const Kernel*, block: u8[], start: usize, count: usize, current: u32, queue: usize) -> !:
+        self.uniforms(block, start, count, current, 0)
+        let bound = self.bindings(kernel)
+        try pass.dispatch_indirect(kernel.kernel, bound, block, self.queues, (16 + 3 * queue) * 4)
+
+    pub func destroy():
+        if let running = self.pending:
+            var waiting = running
+            waiting.wait() catch failure: _ = failure
+            waiting.close()
+            self.pending = none
+        self.kernels.destroy()
+        self.scene.destroy()
+        self.lights.destroy()
+        self.constants.destroy()
+        self.state_v.destroy()
+        self.state_u.destroy()
+        self.queues.destroy()
+        self.film.destroy()
+        self.output.destroy()
+
+## The camera to render through: `index`, or the first camera when it is -1.
+func find_camera(scene: const CompiledScene*, index: i64) -> usize!:
+    if index >= 0:
+        if (usize)index < scene.objects.count() and scene.objects.object((usize)index).kind == SceneKind.camera: return (usize)index
+        error(invalid, "the scene object is not a camera")
+    for at in 0..<scene.objects.count():
+        if scene.objects.object(at).kind == SceneKind.camera: return at
+    error(invalid, "the scene has no camera")
+
+## Half the diagonal of the triangles' bounds (1 for an empty scene).
+func scene_radius(scene: const CompiledScene*) -> f64:
+    if scene.point_count() == 0: return 1.0
+    let root = scene.nodes.items[0]
+    let d = Vector3((f64)(root.hi.x - root.lo.x), (f64)(root.hi.y - root.lo.y), (f64)(root.hi.z - root.lo.z))
+    return math.max(1.0, 0.5 * d.length())
+
+## Constants rows (shaders/common.glsl K_*), 16 vec4s.
+func fill_constants(rows: f32[], settings: RenderSettings, light_count: usize) -> !:
+    for at in 0..<rows.length: rows[at] = 0.0
+    let film = film_matrix()
+    let integrals = cmf_integrals()
+    let background = fit_spectrum(settings.background)
+    let base = fit_spectrum(settings.base_color)
+    let values: f64[36] = [(f64)light_count, (f64)settings.max_bounces, 0.0, 0.0,
+                           background.c0, background.c1, background.c2, background.scale,
+                           settings.background.x, settings.background.y, settings.background.z, 0.0,
+                           film.m[0], film.m[1], film.m[2], 0.0,
+                           film.m[3], film.m[4], film.m[5], 0.0,
+                           film.m[6], film.m[7], film.m[8], 0.0,
+                           integrals.x, integrals.y, integrals.z, 0.0,
+                           base.c0, base.c1, base.c2, base.scale,
+                           settings.base_color.x, settings.base_color.y, settings.base_color.z, 0.0]
+    for at in 0..<(usize)36: rows[at] = (f32)values[at]

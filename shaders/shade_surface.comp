@@ -1,0 +1,97 @@
+#version 450
+// Shade each queued hit. A light adds its radiance (MIS-weighted against the
+// light sample the previous vertex took) and ends the path. A surface takes one
+// light sample (a shadow ray in the path's own slot) and one BSDF sample, then
+// continues or ends by Russian roulette and the bounce limit.
+//
+// v1 material: the default OpenPBR base color as a Lambertian diffuse.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "common.glsl"
+#include "sampler.glsl"
+#include "spectrum.glsl"
+#include "lights.glsl"
+
+vec3 point_of(uint index) {
+    return vec3(positions[index * 3u], positions[index * 3u + 1u], positions[index * 3u + 2u]);
+}
+
+void main() {
+    uint at = gl_GlobalInvocationID.x;
+    if (at >= queue_count(Q_SURFACE)) return;
+    uint path = queue_path(Q_SURFACE, at);
+    uint pixel = get_u(SU_PIXEL, path);
+    uint bounce = get_u(SU_BOUNCE, path);
+    vec4 hit = get_v(SV_HIT, path);
+    vec3 origin = get_v(SV_ORIGIN, path).xyz;
+    vec4 ray = get_v(SV_DIRECTION, path);
+    Spec throughput = get_v(SV_THROUGHPUT, path);
+    vec4 lambda = get_v(SV_LAMBDA, path);
+    uint what = floatBitsToUint(hit.y);
+
+    if ((what & LIGHT_HIT) != 0u) {
+        uint light = what & ~LIGHT_HIT;
+        float weight = 1.0;
+        if (bounce == 0u) {
+            if (!light_visible(light)) return;
+        } else if (ray.w > 0.0) {
+            weight = power_heuristic(ray.w, light_hit_pdf(light, origin, ray.xyz, hit.x));
+        }
+        set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + throughput * light_radiance(light, lambda) * weight);
+        return;
+    }
+
+    // A surface reached past the bounce limit ends the path. The ray that got
+    // here was still traced, so its light hits (and their MIS weights) count.
+    if (bounce >= uint(constants[K_INFO].y)) return;
+
+    uint triangle = what;
+    vec3 p0 = point_of(indices[triangle * 3u]);
+    vec3 normal = normalize(cross(point_of(indices[triangle * 3u + 1u]) - p0, point_of(indices[triangle * 3u + 2u]) - p0));
+    if (dot(normal, ray.xyz) > 0.0) normal = -normal;
+    vec3 p = origin + hit.x * ray.xyz;
+    vec3 from = offset_origin(p, normal);
+    Spec albedo = spec_of(constants[K_BASE_FIT], constants[K_BASE_RGB].xyz, lambda);
+
+    // One light sample.
+    uint lights_count = uint(constants[K_INFO].x);
+    if (lights_count > 0u) {
+        vec4 u = sample4(pixel, params.sample_index, GROUP_LIGHT(bounce));
+        float select_pdf;
+        uint light = pick_light(u.x, select_pdf);
+        LightSample s;
+        if (select_pdf > 0.0 && sample_light(light, p, u.yz, s)) {
+            float cosine = dot(normal, s.direction);
+            if (cosine > 0.0) {
+                float light_pdf = s.pdf * select_pdf;
+                float weight = s.delta ? 1.0 : power_heuristic(light_pdf, cosine / PI);
+                Spec contribution = throughput * albedo * (cosine / PI) * light_radiance(light, lambda) * (weight / light_pdf);
+                float length = s.distance >= INFINITY ? INFINITY : s.distance * (1.0 - 1e-4);
+                set_v(SV_SHADOW_ORIGIN, path, vec4(from, length));
+                set_v(SV_SHADOW_DIRECTION, path, vec4(s.direction, 0.0));
+                set_v(SV_SHADOW_RADIANCE, path, contribution);
+                queue_push(Q_SHADOW, path);
+            }
+        }
+    }
+
+    // One BSDF sample: cosine-weighted, so the throughput takes the albedo.
+    vec4 u = sample4(pixel, params.sample_index, GROUP_BSDF(bounce));
+    vec2 disk = concentric(u.xy);
+    float z = sqrt(max(0.0, 1.0 - dot(disk, disk)));
+    vec3 t, b;
+    basis(normal, t, b);
+    vec3 direction = normalize(t * disk.x + b * disk.y + normal * z);
+    throughput *= albedo;
+    bounce += 1u;
+    if (bounce >= 3u) {
+        float survive = min(0.95, spec_max(throughput));
+        if (u.z >= survive) return;
+        throughput /= survive;
+    }
+    set_u(SU_BOUNCE, path, bounce);
+    set_v(SV_ORIGIN, path, vec4(from, 0.0));
+    set_v(SV_DIRECTION, path, vec4(direction, z / PI));
+    set_v(SV_THROUGHPUT, path, throughput);
+    queue_push(Q_CLOSEST + 1u - params.current, path);
+}

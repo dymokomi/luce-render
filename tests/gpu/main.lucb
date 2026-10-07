@@ -7,6 +7,7 @@ from luce_gpu import gpu
 from luce_render import render
 from luce_geocore.geocore import Vector3, Mesh, MeshPrimitives, GeometrySet
 from luce_geocore.core.growing import Growing
+import integrator
 
 pub func main(arguments: str[]) -> i32!:
     _ = arguments
@@ -42,6 +43,8 @@ pub func main(arguments: str[]) -> i32!:
         let frame = try render.ray_frame(scene.objects.object(camera), 96, 64)
         try compare(device, &scene, &on_gpu, &frame, scene.objects.path(camera))
     print(f"PASS probe: BVH traversal on the GPU agrees with brute force over {scene.triangle_count()} triangles, perspective and orthographic")
+    try integrator.checks(device)
+    print("PASS integrator: white furnace, area light irradiance, spectral against RGB (both builds)")
     return 0
 
 ## Every pixel's GPU hit against the nearest of all triangles in f64. Pixels whose

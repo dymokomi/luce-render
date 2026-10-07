@@ -1,0 +1,152 @@
+## The integrator against answers known in closed form:
+## - a white furnace: a white diffuse sphere under a uniform white background
+##   is exactly the background everywhere, in both builds;
+## - a square area light over a grey plane: the radiance straight below its
+##   center is albedo / π × the rectangle's irradiance;
+## - spectral against RGB: a colored light (and a blackbody) on a white plane
+##   agree between the builds within the spectral upsampling's error.
+import memory
+from luce_std import math
+from luce_std import clock
+from luce_gpu import gpu
+from luce_render import render
+from luce_geocore.geocore import Vector3, Mesh, MeshPrimitives, GeometrySet
+
+pub func checks(device: gpu.Device) -> !:
+    try furnace(device, true)
+    try furnace(device, false)
+    try area_light(device, true)
+    try area_light(device, false)
+    try spectral_agrees(device, 0.0)
+    try spectral_agrees(device, 3000.0)
+    try timing(device)
+
+## Mean of the image's rgb over a window of pixels.
+func window_mean(pixels: const f32[], width: usize, x0: usize, y0: usize, size: usize) -> Vector3:
+    var sum = Vector3()
+    for y in y0..<y0 + size:
+        for x in x0..<x0 + size:
+            let at = (y * width + x) * 4
+            sum = sum.add(Vector3((f64)pixels[at], (f64)pixels[at + 1], (f64)pixels[at + 2]))
+    return sum.multiply_scalar(1.0 / (f64)(size * size))
+
+func rendered(device: gpu.Device, set: const GeometrySet*, settings: render.RenderSettings, out: f32[]) -> !:
+    var scene = try render.compile_scene(set)
+    defer scene.close()
+    var renderer = try render.Renderer.create(device, &scene, settings)
+    defer renderer.destroy()
+    try renderer.finish()
+    assert(renderer.samples_done() == settings.samples)
+    try renderer.read(out)
+
+func furnace(device: gpu.Device, spectral: bool) -> !:
+    let sphere = try MeshPrimitives.sphere(1.0, 32)
+    defer sphere.release()
+    let base = try GeometrySet.of_mesh(sphere)
+    defer base.release()
+    let set = try base.value().with_camera("/camera", Vector3(0.0, 0.0, 4.0), Vector3(), 0, 50.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer set.release()
+    var settings = render.RenderSettings.of(64, 48, 64)
+    settings.spectral = spectral
+    settings.max_bounces = 64
+    settings.background = Vector3(1.0, 1.0, 1.0)
+    settings.base_color = Vector3(1.0, 1.0, 1.0)
+    let pixels = try new f32[64 * 48 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    try rendered(device, set.value(), settings, pixels)
+    let mean = window_mean(pixels, 64, 0, 0, 48)
+    let center = window_mean(pixels, 64, 24, 16, 16)
+    if math.abs(mean.x - 1.0) > 0.01 or math.abs(mean.y - 1.0) > 0.01 or math.abs(mean.z - 1.0) > 0.01 or math.abs(center.y - 1.0) > 0.02:
+        print(f"furnace (spectral {spectral}): mean {mean.x} {mean.y} {mean.z}, on the sphere {center.x} {center.y} {center.z}")
+        assert(false)
+
+## The irradiance at a point under the corner of an x × y rectangle of radiance
+## 1 at height h, parallel to the receiving plane.
+func corner_irradiance(x: f64, y: f64, h: f64) -> f64:
+    let a = math.sqrt(x * x + h * h)
+    let b = math.sqrt(y * y + h * h)
+    return 0.5 * (x / a * math.atan(y / a) + y / b * math.atan(x / b))
+
+func area_light(device: gpu.Device, spectral: bool) -> !:
+    let floor = try MeshPrimitives.grid(20.0, 8)
+    defer floor.release()
+    let base = try GeometrySet.of_mesh(floor)
+    defer base.release()
+    # Seen from the side, so the light stays out of the picture: the image
+    # center looks at the floor straight below the light.
+    let pitch = -math.atan2(0.5, 3.0)
+    let viewed = try base.value().with_camera("/camera", Vector3(0.0, 0.5, 3.0), Vector3(pitch, 0.0, 0.0), 0, 200.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer viewed.release()
+    let set = try viewed.value().with_light("/key", Vector3(0.0, 1.0, 0.0), Vector3(-0.5 * math.pi, 0.0, 0.0), 0, Vector3(1.0, 1.0, 1.0), 4.0, 0.0, 0.0, false, 1.0, 1.0, 0.5, 0.0, false)
+    defer set.release()
+    var settings = render.RenderSettings.of(32, 32, 256)
+    settings.spectral = spectral
+    settings.max_bounces = 1
+    settings.base_color = Vector3(0.5, 0.5, 0.5)
+    let pixels = try new f32[32 * 32 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    try rendered(device, set.value(), settings, pixels)
+    let measured = window_mean(pixels, 32, 14, 14, 4)
+    let expected = 0.5 / math.pi * 4.0 * 4.0 * corner_irradiance(0.5, 0.5, 1.0)
+    if math.abs(measured.y / expected - 1.0) > 0.02 or math.abs(measured.x / expected - 1.0) > 0.03:
+        print(f"area light (spectral {spectral}): {measured.x} {measured.y} {measured.z}, expected {expected}")
+        assert(false)
+
+## A colored light, or a white one at a color temperature: products of two
+## spectra are not products of their RGBs, so the two are checked apart.
+func spectral_agrees(device: gpu.Device, kelvin: f64) -> !:
+    let color = Vector3(1.0, 0.4, 0.1) if kelvin == 0.0 else Vector3(1.0, 1.0, 1.0)
+    let floor = try MeshPrimitives.grid(20.0, 8)
+    defer floor.release()
+    let base = try GeometrySet.of_mesh(floor)
+    defer base.release()
+    let pitch = -math.atan2(2.0, 4.0)
+    let viewed = try base.value().with_camera("/camera", Vector3(0.0, 2.0, 4.0), Vector3(pitch, 0.0, 0.0), 0, 35.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer viewed.release()
+    let set = try viewed.value().with_light("/key", Vector3(0.0, 2.0, 0.0), Vector3(-0.5 * math.pi, 0.0, 0.0), 0, color, 10.0, 0.0, kelvin, true, 2.0, 2.0, 0.5, 0.0, false)
+    defer set.release()
+    let pixels = try new f32[48 * 32 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    var means: Vector3[2] = [Vector3(), Vector3()]
+    for build in 0..<(usize)2:
+        var settings = render.RenderSettings.of(48, 32, 64)
+        settings.spectral = build == 0
+        settings.max_bounces = 4
+        settings.base_color = Vector3(0.9, 0.9, 0.9)
+        try rendered(device, set.value(), settings, pixels)
+        means[build] = window_mean(pixels, 48, 8, 0, 32)
+    let s = means[0]
+    let r = means[1]
+    if math.abs(s.x / r.x - 1.0) > 0.03 or math.abs(s.y / r.y - 1.0) > 0.03 or math.abs(s.z / r.z - 1.0) > 0.06:
+        print(f"spectral against RGB ({kelvin} K): {s.x} {s.y} {s.z} against {r.x} {r.y} {r.z}")
+        assert(false)
+
+## A 1920 × 1080 image of a sphere on a floor under an area light, 16 samples:
+## printed, not checked.
+func timing(device: gpu.Device) -> !:
+    let sphere = try MeshPrimitives.sphere(1.0, 64)
+    defer sphere.release()
+    let floor = try MeshPrimitives.grid(20.0, 64)
+    defer floor.release()
+    let ball = try GeometrySet.of_mesh(sphere)
+    defer ball.release()
+    let ground = try (try GeometrySet.of_mesh(floor)).value().transformed(Vector3(0.0, -1.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer ground.release()
+    let both = try ball.value().merged(ground)
+    defer both.release()
+    let viewed = try both.value().with_camera("/camera", Vector3(0.0, 1.0, 5.0), Vector3(-0.2, 0.0, 0.0), 0, 35.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer viewed.release()
+    let set = try viewed.value().with_light("/key", Vector3(2.0, 4.0, 2.0), Vector3(-1.0, 0.6, 0.0), 0, Vector3(1.0, 1.0, 1.0), 20.0, 0.0, 0.0, true, 2.0, 2.0, 0.5, 0.0, false)
+    defer set.release()
+    var scene = try render.compile_scene(set.value())
+    defer scene.close()
+    for build in 0..<(usize)2:
+        var settings = render.RenderSettings.of(1920, 1080, 16)
+        settings.spectral = build == 0
+        settings.background = Vector3(0.1, 0.1, 0.1)
+        var renderer = try render.Renderer.create(device, &scene, settings)
+        defer renderer.destroy()
+        let start = clock.now()
+        try renderer.finish()
+        let seconds = start.elapsed().seconds()
+        print(f"timing ({"spectral" if build == 0 else "RGB"}): 1920x1080, {scene.triangle_count()} triangles, 16 samples, 12 bounces: {seconds * 1000.0 / 16.0} ms a sample")

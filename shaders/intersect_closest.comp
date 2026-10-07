@@ -1,0 +1,37 @@
+#version 450
+// The nearest triangle or light along each queued ray: hits go to the surface
+// queue, misses to the miss queue.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "common.glsl"
+#include "spectrum.glsl"
+#include "lights.glsl"
+#include "bvh.glsl"
+
+void main() {
+    uint queue = Q_CLOSEST + params.current;
+    uint at = gl_GlobalInvocationID.x;
+    if (at >= queue_count(queue)) return;
+    uint path = queue_path(queue, at);
+    vec3 origin = get_v(SV_ORIGIN, path).xyz;
+    vec3 direction = get_v(SV_DIRECTION, path).xyz;
+    Hit hit = trace_closest(origin, direction, INFINITY);
+    uint what = hit.triangle;
+    uint lights_count = uint(constants[K_INFO].x);
+    // Camera rays pass through lights that are not visible to the camera.
+    bool camera_ray = get_u(SU_BOUNCE, path) == 0u;
+    for (uint light = 0u; light < lights_count; light++) {
+        if (camera_ray && !light_visible(light)) continue;
+        float t = intersect_light(light, origin, direction, hit.t);
+        if (t < hit.t) {
+            hit.t = t;
+            what = LIGHT_HIT | light;
+        }
+    }
+    if (what == NONE) {
+        queue_push(Q_MISS, path);
+        return;
+    }
+    set_v(SV_HIT, path, vec4(hit.t, uintBitsToFloat(what), hit.uv));
+    queue_push(Q_SURFACE, path);
+}

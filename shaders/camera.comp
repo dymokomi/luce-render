@@ -1,0 +1,32 @@
+#version 450
+// Start one path per pixel of the band: a jittered primary ray, four wavelengths
+// (spectral), unit throughput, no radiance, queued for the first closest hit.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "common.glsl"
+#include "sampler.glsl"
+#include "spectrum.glsl"
+
+void main() {
+    uint path = gl_GlobalInvocationID.x;
+    if (path >= params.band_count) return;
+    if (path == 0u) queues[Q_CLOSEST] = params.band_count;
+    uint pixel = params.band_start + path;
+    uint width = uint(params.du.w);
+    vec4 u = sample4(pixel, params.sample_index, GROUP_CAMERA);
+    vec2 film_at = vec2(float(pixel % width) + u.x, float(pixel / width) + u.y);
+    vec3 film = params.corner.xyz + film_at.x * params.du.xyz + film_at.y * params.dv.xyz;
+    bool orthographic = params.position.w > 0.5;
+    vec3 origin = orthographic ? params.position.xyz + film : params.position.xyz;
+    vec3 direction = normalize(orthographic ? cross(params.du.xyz, params.dv.xyz) : film);
+    set_u(SU_PIXEL, path, pixel);
+    set_u(SU_BOUNCE, path, 0u);
+    set_v(SV_ORIGIN, path, vec4(origin, 0.0));
+    set_v(SV_DIRECTION, path, vec4(direction, 0.0));
+    set_v(SV_THROUGHPUT, path, vec4(1.0));
+    set_v(SV_RADIANCE, path, vec4(0.0));
+#if SPECTRAL
+    set_v(SV_LAMBDA, path, sample_wavelengths(sample4(pixel, params.sample_index, GROUP_WAVELENGTH).x));
+#endif
+    queues[QUEUE_BASE + Q_CLOSEST * params.pool + path] = path;
+}

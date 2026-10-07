@@ -18,9 +18,11 @@ SHADERS = ROOT / 'shaders'
 OUTPUT = ROOT / 'src' / 'render' / 'kernels.lucb'
 
 # (source, stem, defines): kernels as the host creates them.
-KERNELS = [
-    ('probe.comp', 'probe', ''),
-]
+KERNELS = [('probe.comp', 'probe', '')]
+# The integrator, spectral and RGB.
+for name in ['camera', 'schedule', 'intersect_closest', 'shade_surface', 'shade_miss', 'intersect_shadow', 'finish', 'film_convert']:
+    KERNELS.append((f'{name}.comp', f'{name}', 'SPECTRAL=1'))
+    KERNELS.append((f'{name}.comp', f'{name}_rgb', 'SPECTRAL=0'))
 
 def main() -> int:
     specs = []

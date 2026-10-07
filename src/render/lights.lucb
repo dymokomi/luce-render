@@ -1,0 +1,94 @@
+#==============================================================================================
+#
+#   render/lights - UsdLux lights in the kernels' records
+#
+#   DESCRIPTION:
+#       Each light becomes `light_stride` vec4s (shaders/lights.glsl has the layout). Its
+#       radiance is color × intensity × 2^exposure, divided by its area when it
+#       normalizes, as UsdLux defines it. A color temperature multiplies by the blackbody
+#       of that temperature at luminance 1. A distant light's intensity is the irradiance
+#       it delivers, spread over its angular size (a delta when the angle is 0). Lights
+#       are chosen for light samples in proportion to an estimate of their power.
+#
+#==============================================================================================
+
+pub let light_stride: usize = 7
+
+## ACEScg luminance weights (the Y row of ACEScg to XYZ).
+func luminance(rgb: Vector3) -> f64:
+    return 0.2722287168 * rgb.x + 0.6740817658 * rgb.y + 0.0536895174 * rgb.z
+
+## The records of the scene's lights, and their count; `radius` bounds the scene
+## (for a distant light's share of the power).
+pub func pack_lights(objects: const SceneObjects*, radius: f64, out: Growing[f32]*) -> usize!:
+    out.clear()
+    var powers = Growing[f64]()
+    defer powers.close()
+    let to_acescg = film_matrix()
+    for index in 0..<objects.count():
+        let item = objects.object(index)
+        if item.kind != SceneKind.light: continue
+        let light = item.light
+        let m = item.matrix
+        let position = m.translation
+        let emits = try m.z.multiply_scalar(-1.0).normalized()
+        var u = Vector3()
+        var v = Vector3()
+        var size: f64 = 0.0
+        var area: f64 = 0.0
+        var cos_half: f64 = 1.0
+        var kind: f64 = 0.0
+        if light.shape == LightShape.rect:
+            u = m.transform_direction(Vector3(0.5 * light.width, 0.0, 0.0))
+            v = m.transform_direction(Vector3(0.0, 0.5 * light.height, 0.0))
+            area = 4.0 * u.cross(v).length()
+        elif light.shape == LightShape.disk:
+            kind = 1.0
+            u = m.transform_direction(Vector3(light.radius, 0.0, 0.0))
+            v = m.transform_direction(Vector3(0.0, light.radius, 0.0))
+            area = math.pi * u.cross(v).length()
+        elif light.shape == LightShape.sphere:
+            kind = 2.0
+            size = light.radius * math.cbrt(math.abs(m.determinant()))
+            area = 4.0 * math.pi * size * size
+        else:
+            kind = 3.0
+            cos_half = math.cos(0.5 * light.angle * math.pi / 180.0)
+        var scale = light.intensity * math.exp2(light.exposure)
+        if kind < 3.0 and light.normalize:
+            if area <= 0.0: continue
+            scale = scale / area
+        if kind == 3.0 and cos_half < 1.0 - 1e-7:
+            scale = scale / (2.0 * math.pi * (1.0 - cos_half))
+        var rgb = light.color.multiply_scalar(scale)
+        var fit = fit_spectrum(light.color)
+        fit.scale = fit.scale * scale
+        var flags: f64 = 1.0 if light.visible else 0.0
+        if light.temperature > 0.0:
+            let tint = blackbody_xyz(light.temperature)
+            # Luminance 1: the kernels' blackbody is peak-normalized.
+            fit.scale = fit.scale / tint.y
+            let tinted = to_acescg.apply(tint.multiply_scalar(1.0 / tint.y))
+            rgb = Vector3(rgb.x * tinted.x, rgb.y * tinted.y, rgb.z * tinted.z)
+            flags += 2.0
+        let reach = area if kind < 3.0 else math.pi * radius * radius
+        try powers.push(math.max(0.0, luminance(rgb)) * reach * (1.0 if kind == 3.0 else math.pi))
+        let rows: f64[28] = [position.x, position.y, position.z, kind,
+                             u.x, u.y, u.z, size,
+                             v.x, v.y, v.z, cos_half,
+                             emits.x, emits.y, emits.z, area,
+                             fit.c0, fit.c1, fit.c2, fit.scale,
+                             rgb.x, rgb.y, rgb.z, flags,
+                             light.temperature, 0.0, 0.0, 0.0]
+        for value in rows: try out.push((f32)value)
+    let count = powers.count
+    var total: f64 = 0.0
+    for power in powers.view(): total += power
+    var running: f64 = 0.0
+    for index in 0..<count:
+        let chance = powers.items[index] / total if total > 0.0 else 1.0 / (f64)count
+        running += chance
+        let row = (index * light_stride + 6) * 4
+        out.items[row + 1] = (f32)chance
+        out.items[row + 2] = (f32)running if index + 1 < count else 2.0
+    return count

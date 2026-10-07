@@ -1,0 +1,17 @@
+#version 450
+// Each queued shadow ray: unblocked, its light sample joins the path's radiance.
+// The slot is the path's own, so no atomics are needed.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "common.glsl"
+#include "bvh.glsl"
+
+void main() {
+    uint at = gl_GlobalInvocationID.x;
+    if (at >= queue_count(Q_SHADOW)) return;
+    uint path = queue_path(Q_SHADOW, at);
+    vec4 origin = get_v(SV_SHADOW_ORIGIN, path);
+    vec3 direction = get_v(SV_SHADOW_DIRECTION, path).xyz;
+    if (trace_any(origin.xyz, direction, origin.w)) return;
+    set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + get_v(SV_SHADOW_RADIANCE, path));
+}

@@ -3,5 +3,8 @@ scene.lucb
 bvh.lucb
 camera.lucb
 device.lucb
+spectrum.lucb
+lights.lucb
+integrator.lucb
 kernels.lucb
 tests.lucb

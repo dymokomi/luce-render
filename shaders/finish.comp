@@ -1,0 +1,16 @@
+#version 450
+// The band's paths into the film: one sample per pixel per pass, so no atomics.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "common.glsl"
+#include "spectrum.glsl"
+
+void main() {
+    uint path = gl_GlobalInvocationID.x;
+    if (path >= params.band_count) return;
+    uint pixel = get_u(SU_PIXEL, path);
+    vec3 value = spec_to_film(get_v(SV_RADIANCE, path), get_v(SV_LAMBDA, path));
+    // A NaN or infinity would spoil the pixel for good; drop the sample instead.
+    if (any(isnan(value)) || any(isinf(value))) value = vec3(0.0);
+    film[pixel] += vec4(value, 1.0);
+}

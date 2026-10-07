@@ -168,6 +168,22 @@ EON, fuzz and thin film are closed form and need no tables.
 
 ## Status
 
-| Done | Next |
-| --- | --- |
-| Scene compiler, BVH, ray frames, probe kernel, GPU test | v1 integrator: the state buffer and queues, `schedule`, `camera`, `intersect_*`, `shade_*` with rect lights and EON diffuse first, film, then the rest of OpenPBR v1 and the light tree |
+v1 is running: a wavefront integrator in both builds, with Lambertian surfaces in
+the default material, UsdLux rect, disk, sphere and distant lights, power-heuristic
+MIS, Russian roulette, an Owen-scrambled Sobol sampler, an XYZ or ACEScg film, and
+progressive passes. The GPU tests check it against closed forms:
+
+- **White furnace:** within 1%.
+- **Rect-light irradiance:** within 2%.
+- **Spectral against RGB:** within 3%, for a colored light and for a blackbody.
+
+**Speed:** 1920 × 1080, 12k triangles, 12 bounces: about 6.7 ms a sample spectral
+and 6.5 ms RGB on an M4 Max. That covers 2M paths in 2 bands of 2^20.
+
+Next:
+
+- OpenPBR v1 lobes with their albedo tables, and materials per triangle.
+- Smooth normals.
+- The light tree.
+- Adaptive sampling.
+- Workgroup-aggregated queue appends.

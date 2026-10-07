@@ -63,7 +63,8 @@ pub func build_bvh(scene: CompiledScene*) -> !:
     let count = scene.triangle_count()
     scene.nodes.clear()
     if count == 0:
-        try scene.nodes.push(BvhNode(Float3(0.0, 0.0, 0.0), 0, Float3(0.0, 0.0, 0.0), 0))
+        # An inside-out box no ray enters, so traversal stops at the root.
+        try scene.nodes.push(BvhNode(Float3(1.0, 1.0, 1.0), 0, Float3(-1.0, -1.0, -1.0), 0))
         return
     let boxes = try new Box[count] --- in memory.heap
     defer free(boxes) in memory.heap

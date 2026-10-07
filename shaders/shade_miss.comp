@@ -1,0 +1,33 @@
+#version 450
+// Rays that left the scene: the background, and distant lights with a size,
+// MIS-weighted against their light samples. The path ends.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "common.glsl"
+#include "spectrum.glsl"
+#include "lights.glsl"
+
+void main() {
+    uint at = gl_GlobalInvocationID.x;
+    if (at >= queue_count(Q_MISS)) return;
+    uint path = queue_path(Q_MISS, at);
+    uint bounce = get_u(SU_BOUNCE, path);
+    vec4 ray = get_v(SV_DIRECTION, path);
+    Spec throughput = get_v(SV_THROUGHPUT, path);
+    vec4 lambda = get_v(SV_LAMBDA, path);
+    Spec radiance = spec_of(constants[K_BACKGROUND_FIT], constants[K_BACKGROUND_RGB].xyz, lambda);
+    uint lights_count = uint(constants[K_INFO].x);
+    for (uint light = 0u; light < lights_count; light++) {
+        if (light_type(light) != LIGHT_DISTANT) continue;
+        float cos_half = light_at(light, 2u).w;
+        if (cos_half >= 1.0 - 1e-7 || dot(ray.xyz, -light_at(light, 3u).xyz) < cos_half) continue;
+        float weight = 1.0;
+        if (bounce == 0u) {
+            if (!light_visible(light)) continue;
+        } else if (ray.w > 0.0) {
+            weight = power_heuristic(ray.w, light_hit_pdf(light, vec3(0.0), ray.xyz, INFINITY));
+        }
+        radiance += light_radiance(light, lambda) * weight;
+    }
+    set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + throughput * radiance);
+}

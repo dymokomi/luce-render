@@ -79,3 +79,35 @@ test "a camera's ray frame fits its film horizontally and looks down -Z":
     # Half as tall as wide: the top edge at atan(0.5).
     let (_, top) = frame.ray(100.0, 0.0)
     assert(math.abs(top.y - 0.5) < 1e-9)
+
+test "a color's spectrum fit returns it through the film, and white is a constant":
+    let to_acescg = film_matrix()
+    let white = fit_spectrum(Vector3(1.0, 1.0, 1.0))
+    assert(white.c0 == 0.0 and white.c1 == 0.0 and white.c2 == 0.0 and math.abs(white.at(500.0) - 1.0) < 1e-12)
+    # A constant spectrum of 1 is XYZ (1, 1, 1) under E, which is ACEScg white.
+    let back = to_acescg.apply(Vector3(1.0, 1.0, 1.0))
+    assert(math.abs(back.x - 1.0) < 1e-6 and math.abs(back.y - 1.0) < 1e-6 and math.abs(back.z - 1.0) < 1e-6)
+    let integrals = cmf_integrals()
+    for color in [Vector3(0.8, 0.2, 0.1), Vector3(0.05, 0.5, 0.2), Vector3(0.1, 0.2, 0.9), Vector3(0.9, 0.9, 0.2)]:
+        let fit = fit_spectrum(color)
+        var sum = Vector3()
+        var lambda = lambda_min
+        while lambda <= lambda_max:
+            sum = sum.add(cmf(lambda).multiply_scalar(fit.at(lambda)))
+            lambda += 1.0
+        let rgb = to_acescg.apply(Vector3(sum.x / integrals.x, sum.y / integrals.y, sum.z / integrals.z))
+        assert(math.abs(rgb.x - color.x) < 0.01 and math.abs(rgb.y - color.y) < 0.01 and math.abs(rgb.z - color.z) < 0.01)
+
+test "a blackbody near 5455 K (white E's color) is neutral; 3000 K is warm and 9000 K cool":
+    let to_acescg = film_matrix()
+    let neutral = blackbody_xyz(5455.0)
+    let n = to_acescg.apply(neutral.multiply_scalar(1.0 / neutral.y))
+    # E sits just off the Planckian locus, so its blackbody is a little green.
+    assert(math.abs(n.x - 1.0) < 0.06 and math.abs(n.y - 1.0) < 0.06 and math.abs(n.z - 1.0) < 0.06)
+    let warm = blackbody_xyz(3000.0)
+    let w = to_acescg.apply(warm.multiply_scalar(1.0 / warm.y))
+    assert(w.x > 1.2 * w.y and w.y > w.z)
+    let cool = blackbody_xyz(9000.0)
+    let k = to_acescg.apply(cool.multiply_scalar(1.0 / cool.y))
+    assert(k.z > k.y and k.y > k.x)
+
