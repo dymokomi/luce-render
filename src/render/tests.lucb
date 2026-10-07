@@ -1,0 +1,81 @@
+#==============================================================================================
+#
+#   render/tests - Tests of the host side: scene compilation, the BVH and ray frames
+#
+#==============================================================================================
+
+## Every triangle in exactly one leaf, every leaf's triangles inside its box, and
+## every child's box inside its parent's.
+func check_bvh(scene: const CompiledScene*):
+    let count = scene.triangle_count()
+    var seen = Growing[u32]()
+    defer seen.close()
+    seen.fill(count, 0) catch failure: trap(failure.message)
+    let p = scene.positions.view()
+    for node in scene.nodes.view():
+        if node.count == 0:
+            if count == 0: continue
+            for child in [node.first, node.first + 1]:
+                let inner = scene.nodes.items[(usize)child]
+                assert(inner.lo.x >= node.lo.x and inner.lo.y >= node.lo.y and inner.lo.z >= node.lo.z)
+                assert(inner.hi.x <= node.hi.x and inner.hi.y <= node.hi.y and inner.hi.z <= node.hi.z)
+            continue
+        for slot in node.first..<node.first + node.count:
+            seen.items[(usize)slot] += 1
+            for k in 0..<(u32)3:
+                let i = (usize)scene.indices.items[(usize)(slot * 3 + k)] * 3
+                assert(p[i] >= node.lo.x and p[i] <= node.hi.x and p[i + 1] >= node.lo.y and p[i + 1] <= node.hi.y and p[i + 2] >= node.lo.z and p[i + 2] <= node.hi.z)
+    for at in 0..<count: assert(seen.items[at] == 1)
+
+test "a cube compiles to 12 triangles of 6 faces under one BVH":
+    let cube = Mesh.cube(2.0) catch failure: trap(failure.message)
+    defer cube.release()
+    let set = GeometrySet.of_mesh(cube) catch failure: trap(failure.message)
+    defer set.release()
+    var scene = compile_scene(set.value()) catch failure: trap(failure.message)
+    defer scene.close()
+    assert(scene.triangle_count() == 12 and scene.point_count() == 8 and scene.skipped == 0)
+    var faces: u32[6]
+    for face in scene.faces.view(): faces[(usize)face] += 1
+    for count in faces: assert(count == 2)
+    check_bvh(&scene)
+
+test "instances are placed and many triangles split into leaves of at most 16":
+    let grid = MeshPrimitives.grid(10.0, 40) catch failure: trap(failure.message)
+    defer grid.release()
+    let plane = GeometrySet.of_mesh(grid) catch failure: trap(failure.message)
+    defer plane.release()
+    # The grid itself, and a copy of it as an instance 5 units up.
+    let base = GeometrySet.of_mesh(grid) catch failure: trap(failure.message)
+    defer base.release()
+    let placed = base.value().with_instance(plane, Vector3(0.0, 5.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0), true) catch failure: trap(failure.message)
+    defer placed.release()
+    var scene = compile_scene(placed.value()) catch failure: trap(failure.message)
+    defer scene.close()
+    assert(scene.triangle_count() == 2 * 2 * 40 * 40)
+    var high: f32 = -1.0
+    for at in 0..<scene.point_count(): high = math32.max(high, scene.positions.items[at * 3 + 1])
+    assert(high == 5.0)
+    for node in scene.nodes.view(): assert(node.count <= 16)
+    assert(scene.nodes.count > 100)
+    check_bvh(&scene)
+
+test "a camera's ray frame fits its film horizontally and looks down -Z":
+    let cube = Mesh.cube(1.0) catch failure: trap(failure.message)
+    defer cube.release()
+    let base = GeometrySet.of_mesh(cube) catch failure: trap(failure.message)
+    defer base.release()
+    let with_camera = base.value().with_camera("/cam", Vector3(0.0, 0.0, 5.0), Vector3(), 0, 18.0, 36.0, 24.0, 0.1, 100.0, 0.0, 5.0) catch failure: trap(failure.message)
+    defer with_camera.release()
+    var scene = compile_scene(with_camera.value()) catch failure: trap(failure.message)
+    defer scene.close()
+    assert(scene.objects.count() == 1)
+    let frame = ray_frame(scene.objects.object(0), 200, 100) catch failure: trap(failure.message)
+    # 36 mm across at 18 mm: 90° horizontally, so the left edge runs at 45°.
+    let (origin, left) = frame.ray(0.0, 50.0)
+    assert(origin.z == 5.0 and math.abs(left.x + 1.0) < 1e-9 and math.abs(left.z + 1.0) < 1e-9)
+    let (_, center) = frame.ray(100.0, 50.0)
+    assert(math.abs(center.x) < 1e-9 and math.abs(center.y) < 1e-9 and center.z == -1.0)
+    # Half as tall as wide: the top edge at atan(0.5).
+    let (_, top) = frame.ray(100.0, 0.0)
+    assert(math.abs(top.y - 0.5) < 1e-9)

@@ -1,0 +1,195 @@
+#==============================================================================================
+#
+#   render/bvh - A binned-SAH bounding volume hierarchy over the triangles
+#
+#   DESCRIPTION:
+#       A binary BVH built top down: each node splits its triangles at the best of 12
+#       centroid bins on each axis by the surface area heuristic (Wald 2007), or stays a
+#       leaf when that is cheaper (at most 4 triangles a leaf unless they cannot be
+#       separated). Children are stored as a pair, so an interior node names only its
+#       first child. The kernels traverse it with a short stack; it is the software path,
+#       and the layout hardware ray tracing does not need.
+#
+#       Node layout (32 bytes, std430 { vec3 lo; uint first; vec3 hi; uint count; }):
+#       an interior node has count 0 and children at `first` and `first + 1`; a leaf
+#       has `count` triangles from triangle `first` in the reordered index list.
+#
+#==============================================================================================
+
+pub struct BvhNode:
+    pub var lo: Float3
+    pub var first: u32
+    pub var hi: Float3
+    pub var count: u32
+
+let bins: usize = 12
+let leaf_size: usize = 4
+## Larger groups that SAH would still keep together are split by count.
+let leaf_limit: usize = 16
+
+struct Box:
+    var lo: Float3
+    var hi: Float3
+
+    static func empty() -> Box:
+        return Box(Float3(3.0e38, 3.0e38, 3.0e38), Float3(-3.0e38, -3.0e38, -3.0e38))
+
+    func grow(other: Box) -> Box:
+        return Box(Float3(math32.min(self.lo.x, other.lo.x), math32.min(self.lo.y, other.lo.y), math32.min(self.lo.z, other.lo.z)),
+                   Float3(math32.max(self.hi.x, other.hi.x), math32.max(self.hi.y, other.hi.y), math32.max(self.hi.z, other.hi.z)))
+
+    func grow_point(p: Float3) -> Box:
+        return self.grow(Box(p, p))
+
+    func area() -> f32:
+        let x = self.hi.x - self.lo.x
+        let y = self.hi.y - self.lo.y
+        let z = self.hi.z - self.lo.z
+        if x < 0.0 or y < 0.0 or z < 0.0: return 0.0
+        return 2.0 * (x * y + y * z + z * x)
+
+func axis_of(p: Float3, axis: usize) -> f32:
+    if axis == 0: return p.x
+    if axis == 1: return p.y
+    return p.z
+
+struct Pending:
+    var node: usize
+    var first: usize
+    var count: usize
+
+## Build the scene's BVH and reorder its triangles (and their faces) into leaf order.
+pub func build_bvh(scene: CompiledScene*) -> !:
+    let count = scene.triangle_count()
+    scene.nodes.clear()
+    if count == 0:
+        try scene.nodes.push(BvhNode(Float3(0.0, 0.0, 0.0), 0, Float3(0.0, 0.0, 0.0), 0))
+        return
+    let boxes = try new Box[count] --- in memory.heap
+    defer free(boxes) in memory.heap
+    let centers = try new Float3[count] --- in memory.heap
+    defer free(centers) in memory.heap
+    let order = try new u32[count] --- in memory.heap
+    defer free(order) in memory.heap
+    let p = scene.positions.view()
+    for at in 0..<count:
+        var box = Box.empty()
+        for k in 0..<(usize)3:
+            let i = (usize)scene.indices.items[at * 3 + k] * 3
+            box = box.grow_point(Float3(p[i], p[i + 1], p[i + 2]))
+        boxes[at] = box
+        centers[at] = Float3(0.5 * (box.lo.x + box.hi.x), 0.5 * (box.lo.y + box.hi.y), 0.5 * (box.lo.z + box.hi.z))
+        order[at] = (u32)at
+    try scene.nodes.reserve(2 * count)
+    try scene.nodes.push(BvhNode(Float3(0.0, 0.0, 0.0), 0, Float3(0.0, 0.0, 0.0), 0))
+    var stack = Growing[Pending]()
+    defer stack.close()
+    try stack.push(Pending(0, 0, count))
+    while stack.count > 0:
+        stack.count -= 1
+        let job = stack.items[stack.count]
+        var bounds = Box.empty()
+        var middle = Box.empty()
+        for at in job.first..<job.first + job.count:
+            bounds = bounds.grow(boxes[(usize)order[at]])
+            middle = middle.grow_point(centers[(usize)order[at]])
+        let split = best_split(boxes, centers, order[job.first..<job.first + job.count], middle)
+        let leaf_cost = (f32)job.count
+        var left_count: usize = 0
+        if job.count > leaf_size and (split.cost < leaf_cost or job.count > leaf_limit):
+            if split.axis >= 0 and split.cost < 3.0e38:
+                left_count = partition(centers, order[job.first..<job.first + job.count], middle, (usize)split.axis, split.bin)
+            if left_count == 0 or left_count == job.count:
+                # Centroids that bins cannot separate: halve by count.
+                left_count = job.count // 2
+        if left_count == 0:
+            scene.nodes.items[job.node] = BvhNode(bounds.lo, (u32)job.first, bounds.hi, (u32)job.count)
+            continue
+        let child = scene.nodes.count
+        try scene.nodes.push(BvhNode(Float3(0.0, 0.0, 0.0), 0, Float3(0.0, 0.0, 0.0), 0))
+        try scene.nodes.push(BvhNode(Float3(0.0, 0.0, 0.0), 0, Float3(0.0, 0.0, 0.0), 0))
+        scene.nodes.items[job.node] = BvhNode(bounds.lo, (u32)child, bounds.hi, 0)
+        try stack.push(Pending(child + 1, job.first + left_count, job.count - left_count))
+        try stack.push(Pending(child, job.first, left_count))
+    try reorder(scene, order)
+
+struct Split:
+    var axis: i64
+    var bin: usize
+    var cost: f32
+
+func bin_of(center: Float3, middle: Box, axis: usize) -> usize:
+    let lo = axis_of(middle.lo, axis)
+    let extent = axis_of(middle.hi, axis) - lo
+    if extent <= 0.0: return 0
+    let at = (i64)((f32)bins * (axis_of(center, axis) - lo) / extent)
+    if at < 0: return 0
+    return (usize)at if at < (i64)bins else bins - 1
+
+## The cheapest bin boundary on any axis: SAH cost relative to the node's area,
+## in triangle intersections (one traversal step costs one).
+func best_split(boxes: const Box[], centers: const Float3[], order: const u32[], middle: Box) -> Split:
+    var best = Split(-1, 0, 3.0e38)
+    var parent = Box.empty()
+    for index in order: parent = parent.grow(boxes[(usize)index])
+    let area = parent.area()
+    if area <= 0.0: return best
+    for axis in 0..<(usize)3:
+        if axis_of(middle.hi, axis) - axis_of(middle.lo, axis) <= 0.0: continue
+        var counts: usize[12]
+        var bounds: Box[12]
+        for b in 0..<bins:
+            counts[b] = 0
+            bounds[b] = Box.empty()
+        for index in order:
+            let b = bin_of(centers[(usize)index], middle, axis)
+            counts[b] += 1
+            bounds[b] = bounds[b].grow(boxes[(usize)index])
+        # Sweep from the right for the right side's areas, then from the left.
+        var right_area: f32[12]
+        var right_count: usize[12]
+        var sweep = Box.empty()
+        var total: usize = 0
+        var b = bins - 1
+        while b > 0:
+            sweep = sweep.grow(bounds[b])
+            total += counts[b]
+            right_area[b] = sweep.area()
+            right_count[b] = total
+            b -= 1
+        var left = Box.empty()
+        var left_count: usize = 0
+        for split in 1..<bins:
+            left = left.grow(bounds[split - 1])
+            left_count += counts[split - 1]
+            if left_count == 0 or right_count[split] == 0: continue
+            let cost = 1.0 + (left.area() * (f32)left_count + right_area[split] * (f32)right_count[split]) / area
+            if cost < best.cost: best = Split((i64)axis, split, cost)
+    return best
+
+## Triangles of bins below `bin` first; the count of those.
+func partition(centers: const Float3[], order: u32[], middle: Box, axis: usize, bin: usize) -> usize:
+    var low: usize = 0
+    var high = order.length
+    while low < high:
+        if bin_of(centers[(usize)order[low]], middle, axis) < bin:
+            low += 1
+        else:
+            high -= 1
+            let held = order[low]
+            order[low] = order[high]
+            order[high] = held
+    return low
+
+func reorder(scene: CompiledScene*, order: const u32[]) -> !:
+    let count = order.length
+    let indices = try new u32[count * 3] --- in memory.heap
+    defer free(indices) in memory.heap
+    let faces = try new u32[count] --- in memory.heap
+    defer free(faces) in memory.heap
+    for at in 0..<count:
+        let source = (usize)order[at]
+        for k in 0..<(usize)3: indices[at * 3 + k] = scene.indices.items[source * 3 + k]
+        faces[at] = scene.faces.items[source]
+    memory.copy(scene.indices.items, indices, count * 3)
+    memory.copy(scene.faces.items, faces, count)

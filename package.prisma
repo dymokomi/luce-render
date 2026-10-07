@@ -1,0 +1,25 @@
+#prisma 4.0
+def package "luce-render" {
+    str owner = "dymokomi"
+    str version = "0.1.0"
+    str kind = "package"
+    str language = "luce-base"
+    str description = "A spectral GPU path tracer for Luce: USD-shaped cameras and lights, OpenPBR materials, wavefront kernels on luce-gpu compute."
+    str readme = "README.md"
+    str[] public = ["render"]
+
+    def dependency "luce-geocore" {
+        str owner = "dymokomi"
+        str path = "../luce-geocore"
+    }
+
+    def dependency "luce-gpu" {
+        str owner = "dymokomi"
+        str path = "../luce-gpu"
+    }
+
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str path = "../luce-std"
+    }
+}

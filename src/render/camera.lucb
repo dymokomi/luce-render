@@ -1,0 +1,66 @@
+#==============================================================================================
+#
+#   render/camera - Primary rays of a camera at a resolution
+#
+#   DESCRIPTION:
+#       A camera looks down its local -Z with +Y up. Its film back fits the image
+#       horizontally (USD's default conform policy): the horizontal aperture spans the
+#       width and the vertical extent follows the image's aspect. Pixel (x, y), y down,
+#       with a sample offset (sx, sy) in 0..1 gets the ray
+#
+#           perspective:   from `position`, along corner + (x+sx)·du + (y+sy)·dv
+#           orthographic:  from position + corner + (x+sx)·du + (y+sy)·dv, along forward
+#
+#       Scale in the camera's placement does not change its view: its axes are
+#       normalized. Orthographic apertures are in tenths of a scene unit, as in USD.
+#
+#==============================================================================================
+
+## What the kernels need to make primary rays: 16 floats, as push constants
+## (vec4 position + orthographic flag, vec4 corner, vec4 du + width, vec4 dv + height).
+pub struct RayFrame:
+    pub var position: Vector3
+    pub var corner: Vector3
+    pub var du: Vector3
+    pub var dv: Vector3
+    pub var forward: Vector3
+    pub var orthographic: bool
+    pub var width: u32
+    pub var height: u32
+
+    ## The 64-byte block the kernels read.
+    pub func pack(out: f32[]) -> !:
+        if out.length < 16: error(invalid, "a ray frame packs into 16 floats")
+        let values: f64[16] = [self.position.x, self.position.y, self.position.z, 1.0 if self.orthographic else 0.0,
+                               self.corner.x, self.corner.y, self.corner.z, 0.0,
+                               self.du.x, self.du.y, self.du.z, (f64)self.width,
+                               self.dv.x, self.dv.y, self.dv.z, (f64)self.height]
+        for at in 0..<(usize)16: out[at] = (f32)values[at]
+
+    ## The ray through pixel (x, y) at sample offset (sx, sy): origin and
+    ## (unnormalized) direction. For tests and picking; rendering makes rays on the GPU.
+    pub func ray(x: f64, y: f64) -> (Vector3, Vector3):
+        let film = self.corner.add(self.du.multiply_scalar(x)).add(self.dv.multiply_scalar(y))
+        if self.orthographic: return (self.position.add(film), self.forward)
+        return (self.position, film)
+
+## The ray frame of `object` (a camera) for a `width` × `height` image.
+pub func ray_frame(object: SceneObject, width: u32, height: u32) -> RayFrame!:
+    if object.kind != SceneKind.camera: error(invalid, "a ray frame needs a camera")
+    if width == 0 or height == 0: error(invalid, "an image needs pixels")
+    let camera = object.camera
+    let m = object.matrix
+    let right = try m.x.normalized()
+    let up = try m.y.normalized()
+    let back = try m.z.normalized()
+    let forward = back.multiply_scalar(-1.0)
+    let aspect = (f64)height / (f64)width
+    let orthographic = camera.projection == Projection.orthographic
+    # Half the film's extent: at unit distance for perspective, in scene units
+    # for orthographic.
+    let half_width = 0.05 * camera.horizontal_aperture if orthographic else 0.5 * camera.horizontal_aperture / camera.focal_length
+    let half_height = half_width * aspect
+    let corner = right.multiply_scalar(-half_width).add(up.multiply_scalar(half_height)).add(Vector3() if orthographic else forward)
+    let du = right.multiply_scalar(2.0 * half_width / (f64)width)
+    let dv = up.multiply_scalar(-2.0 * half_height / (f64)height)
+    return RayFrame(m.translation, corner, du, dv, forward, orthographic, width, height)

@@ -1,0 +1,101 @@
+#==============================================================================================
+#
+#   render/scene - A scene in the kernels' layout
+#
+#   DESCRIPTION:
+#       Every polygon of a set and its visible instances as world-space triangles: f32
+#       positions (x, y, z per point), three point indices per triangle, and each
+#       triangle's polygon (its face in its mesh, offset by the faces of the meshes
+#       before it). Cameras and lights come flattened to world space. Analytic CAD has
+#       no triangles until a Tessellate node; such components are counted in
+#       `skipped`, not drawn.
+#
+#       Instances are realized into one triangle list for now; a two-level hierarchy
+#       (one BVH per prototype, instances above) replaces this with hardware ray tracing.
+#
+#==============================================================================================
+
+pub struct CompiledScene:
+    pub var positions: Growing[f32]
+    ## Three point indices per triangle; build_bvh reorders them into leaf order.
+    pub var indices: Growing[u32]
+    ## Each triangle's polygon, reordered with it.
+    pub var faces: Growing[u32]
+    pub var nodes: Growing[BvhNode]
+    pub var objects: SceneObjects
+    ## Components with no triangles to trace (CAD before Tessellate).
+    pub var skipped: usize
+
+    pub func init():
+        self.positions = Growing[f32]()
+        self.indices = Growing[u32]()
+        self.faces = Growing[u32]()
+        self.nodes = Growing[BvhNode]()
+        self.objects = SceneObjects()
+        self.skipped = 0
+
+    pub func triangle_count() -> usize:
+        return self.indices.count // 3
+
+    pub func point_count() -> usize:
+        return self.positions.count // 3
+
+    pub func close():
+        self.positions.close()
+        self.indices.close()
+        self.faces.close()
+        self.nodes.close()
+        self.objects.close()
+
+## `set` compiled: its triangles in world space with their BVH, and its cameras
+## and lights.
+pub func compile_scene(set: const GeometrySet*) -> CompiledScene!:
+    var scene = CompiledScene()
+    errdefer scene.close()
+    var face_base: u32 = 0
+    try add_set(&scene, set, Matrix4(), &face_base, 0)
+    if scene.point_count() > 4294967295: error(limit, "a scene holds at most 2^32 points")
+    try scene_flattened(set, Matrix4(), &scene.objects)
+    try build_bvh(&scene)
+    return scene
+
+func add_set(scene: CompiledScene*, set: const GeometrySet*, matrix: Matrix4, face_base: u32*, depth: usize) -> !:
+    if depth > 64: error(invalid, "instances nest more than 64 deep")
+    for index in 0..<set.component_count():
+        let entry = set.component(index)
+        if entry.kind == mesh_component():
+            try add_mesh(scene, (const Mesh*)entry.data, matrix, face_base)
+        elif entry.kind == instances_component():
+            let instances = (const Instances*)entry.data
+            for at in 0..<instances.count():
+                let item = instances.item(at)
+                if not item.visible: continue
+                try add_set(scene, item.set, matrix.multiply(item.matrix()), face_base, depth + 1)
+        elif entry.kind.unrealizable != "":
+            scene.skipped += 1
+
+## One mesh's points placed by `matrix`, and its display triangles.
+func add_mesh(scene: CompiledScene*, mesh: const Mesh*, matrix: Matrix4, face_base: u32*) -> !:
+    let points = mesh.point_span()
+    let origin = mesh.position_origin()
+    let corners = mesh.corner_span()
+    let triangles = mesh.triangle_span()
+    let corner_faces = try mesh.corner_face_span()
+    let base = (u32)scene.point_count()
+    try scene.positions.reserve(scene.positions.count + points.length * 3)
+    for point in points:
+        let placed = matrix.transform_point(point.vector().add(origin))
+        scene.positions.items[scene.positions.count] = (f32)placed.x
+        scene.positions.items[scene.positions.count + 1] = (f32)placed.y
+        scene.positions.items[scene.positions.count + 2] = (f32)placed.z
+        scene.positions.count += 3
+    let count = triangles.length // 3
+    try scene.indices.reserve(scene.indices.count + count * 3)
+    try scene.faces.reserve(scene.faces.count + count)
+    for at in 0..<count:
+        for k in 0..<(usize)3:
+            scene.indices.items[scene.indices.count + k] = base + (u32)corners[(usize)triangles[at * 3 + k]]
+        scene.indices.count += 3
+        scene.faces.items[scene.faces.count] = *face_base + (u32)corner_faces[(usize)triangles[at * 3]]
+        scene.faces.count += 1
+    *face_base += (u32)mesh.face_count()

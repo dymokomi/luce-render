@@ -1,0 +1,72 @@
+#==============================================================================================
+#
+#   render/device - A compiled scene on the GPU, and the primary-ray probe
+#
+#   DESCRIPTION:
+#       GpuScene holds the scene buffers every tracing kernel binds at 0..3 (BVH nodes,
+#       positions, indices, faces). `probe` traces one ray per pixel through a camera's
+#       frame and reads back each pixel's polygon and distance: the check that the GPU
+#       BVH agrees with the host, and what picking through a render camera uses.
+#       Device calls happen on the main thread (luce-gpu's rule).
+#
+#==============================================================================================
+
+pub struct GpuScene:
+    pub var nodes: gpu.Buffer
+    pub var positions: gpu.Buffer
+    pub var indices: gpu.Buffer
+    pub var faces: gpu.Buffer
+
+    ## The scene's buffers on `device`; an empty array still gets a word.
+    pub static func upload(device: gpu.Device, scene: const CompiledScene*) -> GpuScene!:
+        var nodes = try buffer_of(device, u8[]((u8*)scene.nodes.items.data, scene.nodes.count * memory.size_of(BvhNode)))
+        errdefer nodes.destroy()
+        var positions = try buffer_of(device, u8[]((u8*)scene.positions.items.data, scene.positions.count * 4))
+        errdefer positions.destroy()
+        var indices = try buffer_of(device, u8[]((u8*)scene.indices.items.data, scene.indices.count * 4))
+        errdefer indices.destroy()
+        let faces = try buffer_of(device, u8[]((u8*)scene.faces.items.data, scene.faces.count * 4))
+        return GpuScene(nodes, positions, indices, faces)
+
+    pub func destroy():
+        self.nodes.destroy()
+        self.positions.destroy()
+        self.indices.destroy()
+        self.faces.destroy()
+
+func buffer_of(device: gpu.Device, bytes: const u8[]) -> gpu.Buffer!:
+    if bytes.length == 0:
+        return try gpu.Buffer.allocate(device, 4)
+    return try gpu.Buffer.create(device, bytes)
+
+## One pixel of a probe: the polygon hit (none: the ray missed) and its distance
+## along the frame's unnormalized direction.
+pub struct Probe:
+    pub let face: u32?
+    pub let distance: f32
+
+## Trace `frame`'s pixel-center rays through `scene`: width × height probes, row
+## by row from the top, into `out`.
+pub func probe(device: gpu.Device, scene: const GpuScene*, frame: const RayFrame*, out: Probe[]) -> !:
+    let count = (usize)frame.width * (usize)frame.height
+    if out.length != count: error(invalid, "a probe needs one result per pixel")
+    var kernel = try gpu.Kernel.create(device, probe_comp_words, probe_comp_msl, probe_comp_group, probe_comp_bindings)
+    defer kernel.destroy()
+    var results = try gpu.Buffer.allocate(device, count * 8)
+    defer results.destroy()
+    var block: f32[16]
+    try frame.pack(block)
+    var pass = try gpu.Compute.begin(device)
+    defer pass.close()
+    let bindings: gpu.Binding[5] = [gpu.Binding(buffer = scene.nodes), gpu.Binding(buffer = scene.positions), gpu.Binding(buffer = scene.indices),
+                                    gpu.Binding(buffer = scene.faces), gpu.Binding(buffer = results)]
+    try pass.dispatch(kernel, bindings, u8[]((u8*)&block[0], 64), (frame.width + 7) // 8, (frame.height + 7) // 8)
+    try pass.submit()
+    try pass.wait()
+    let bytes = try new u8[count * 8] --- in memory.heap
+    defer free(bytes) in memory.heap
+    try results.read(0, bytes)
+    for at in 0..<count:
+        let face = memory.read[u32]((const void*)&bytes[at * 8])
+        let distance = memory.read[f32]((const void*)&bytes[at * 8 + 4])
+        out[at] = Probe(none if face == 4294967295 else face, distance)

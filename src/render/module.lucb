@@ -1,0 +1,34 @@
+#==============================================================================================
+#
+#   render - A spectral GPU path tracer
+#
+#   DESCRIPTION:
+#       luce-render turns a luce-geocore GeometrySet (meshes, instances, and the scene
+#       component's cameras and lights) into GPU buffers and traces it with compute
+#       kernels on luce-gpu. There is no CPU renderer: the host only compiles the scene
+#       and records passes. See docs/DESIGN.md.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb    imports and error codes
+#       scene.lucb     CompiledScene: world-space triangles, faces and scene objects
+#       bvh.lucb       a binned-SAH BVH over the triangles, in the kernels' node layout
+#       camera.lucb    a camera's primary-ray frame for a resolution
+#       device.lucb    GpuScene, the scene's buffers, and the primary-ray probe
+#       kernels.lucb   the GLSL kernels, embedded (tools/build_kernels.py; do not edit)
+#       tests.lucb     tests of the host side
+#
+#==============================================================================================
+
+import c
+import memory
+from luce_std import math
+from luce_std import math32
+from luce_geocore.geocore import Vector3, Matrix4, Mesh, MeshPrimitives, GeometrySet, SceneObject, SceneKind, Camera, Projection
+from luce_geocore.kernel import Float3, Instances, Component, SceneObjects, mesh_component, instances_component, scene_flattened
+from luce_geocore.core.growing import Growing
+from luce_gpu import gpu
+
+## Errors: an unusable input (no camera, no pixels), and a scene past a limit.
+pub let invalid: ErrorCode = ErrorCode.package(400)
+pub let limit: ErrorCode = ErrorCode.package(401)

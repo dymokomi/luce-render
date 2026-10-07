@@ -1,0 +1,34 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Primary-ray probe: each pixel's ray through the BVH, its hit polygon and distance.
+// The scene and camera checks compare it with the host's ray frame; picking can use it.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "scene.glsl"
+
+layout(set = 0, binding = 3, std430) readonly buffer Faces { uint faces[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer Out { uvec2 probes[]; };
+
+layout(push_constant) uniform Params {
+    vec4 position;   // xyz, w: 1 orthographic
+    vec4 corner;
+    vec4 du;         // w: width
+    vec4 dv;         // w: height
+} frame;
+
+#include "bvh.glsl"
+
+void main() {
+    uint width = uint(frame.du.w);
+    uint height = uint(frame.dv.w);
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= width || pixel.y >= height) return;
+    vec3 film = frame.corner.xyz + (float(pixel.x) + 0.5) * frame.du.xyz + (float(pixel.y) + 0.5) * frame.dv.xyz;
+    bool orthographic = frame.position.w > 0.5;
+    vec3 origin = orthographic ? frame.position.xyz + film : frame.position.xyz;
+    vec3 forward = cross(frame.du.xyz, frame.dv.xyz);
+    vec3 direction = orthographic ? normalize(forward) : film;
+    Hit hit = trace_closest(origin, direction, 3.0e38);
+    uint face = hit.triangle == 0xffffffffu ? 0xffffffffu : faces[hit.triangle];
+    probes[pixel.y * width + pixel.x] = uvec2(face, floatBitsToUint(hit.t));
+}

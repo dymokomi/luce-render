@@ -1,0 +1,107 @@
+## GPU checks of luce-render: the probe kernel's BVH traversal against a brute-force
+## intersection of every triangle, through perspective and orthographic cameras.
+## Without a GPU this prints "skip: no GPU" and passes.
+import memory
+from luce_std import math
+from luce_gpu import gpu
+from luce_render import render
+from luce_geocore.geocore import Vector3, Mesh, MeshPrimitives, GeometrySet
+from luce_geocore.core.growing import Growing
+
+pub func main(arguments: str[]) -> i32!:
+    _ = arguments
+    var device = gpu.Device.open() catch failure:
+        if failure.code == gpu.unavailable:
+            print("skip: no GPU")
+            return 0
+        error(failure.code, failure.message)
+    defer device.destroy()
+    let sphere = try MeshPrimitives.sphere(1.0, 24)
+    defer sphere.release()
+    let cube = try Mesh.cube(1.0)
+    defer cube.release()
+    let floor = try MeshPrimitives.grid(12.0, 6)
+    defer floor.release()
+    let base = try GeometrySet.of_mesh(sphere)
+    defer base.release()
+    let with_cube = try (try GeometrySet.of_mesh(cube)).value().transformed(Vector3(2.0, 0.0, -1.0), Vector3(0.3, 0.6, 0.0), Vector3(1.0, 1.0, 1.0))
+    defer with_cube.release()
+    let with_floor = try (try GeometrySet.of_mesh(floor)).value().transformed(Vector3(0.0, -1.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer with_floor.release()
+    let joined = try (try base.value().merged(with_cube)).value().merged(with_floor)
+    defer joined.release()
+    let perspective = try joined.value().with_camera("/perspective", Vector3(0.5, 1.0, 6.0), Vector3(-0.15, 0.05, 0.0), 0, 35.0, 36.0, 24.0, 0.1, 100.0, 0.0, 5.0)
+    defer perspective.release()
+    let both = try perspective.value().with_camera("/orthographic", Vector3(0.0, 0.0, 8.0), Vector3(-0.3, 0.2, 0.0), 1, 50.0, 60.0, 40.0, 0.1, 100.0, 0.0, 5.0)
+    defer both.release()
+    var scene = try render.compile_scene(both.value())
+    defer scene.close()
+    var on_gpu = try render.GpuScene.upload(device, &scene)
+    defer on_gpu.destroy()
+    for camera in 0..<scene.objects.count():
+        let frame = try render.ray_frame(scene.objects.object(camera), 96, 64)
+        try compare(device, &scene, &on_gpu, &frame, scene.objects.path(camera))
+    print(f"PASS probe: BVH traversal on the GPU agrees with brute force over {scene.triangle_count()} triangles, perspective and orthographic")
+    return 0
+
+## Every pixel's GPU hit against the nearest of all triangles in f64. Pixels whose
+## nearest two hits are nearly equally far (edges between faces) may differ.
+func compare(device: gpu.Device, scene: const render.CompiledScene*, on_gpu: const render.GpuScene*, frame: const render.RayFrame*, name: str) -> !:
+    let count = (usize)frame.width * (usize)frame.height
+    let probes = try new render.Probe[count] --- in memory.heap
+    defer free(probes) in memory.heap
+    try render.probe(device, on_gpu, frame, probes)
+    var hits: usize = 0
+    var differ: usize = 0
+    for y in 0..<(usize)frame.height:
+        for x in 0..<(usize)frame.width:
+            let (origin, direction) = frame.ray((f64)x + 0.5, (f64)y + 0.5)
+            let (face, distance, margin) = nearest(scene, origin, direction)
+            let got = probes[y * (usize)frame.width + x]
+            if face >= 0: hits += 1
+            let agrees = (got.face == none and face < 0) or (got.face != none and face >= 0 and (got.face else 0) == (u32)face and math.abs((f64)got.distance - distance) <= 1e-4 * distance)
+            if not agrees and margin > 1e-3: differ += 1
+    if hits <= count // 2 or differ > 0:
+        print(f"{name}: {hits} of {count} pixels hit, {differ} disagree with brute force")
+    assert(hits > count // 2 and differ == 0)
+
+## The nearest polygon along the ray (-1: none), its distance, and how much
+## farther the next different polygon is (relative).
+func nearest(scene: const render.CompiledScene*, origin: Vector3, direction: Vector3) -> (i64, f64, f64):
+    var best: f64 = 1.0e300
+    var face: i64 = -1
+    var second: f64 = 1.0e300
+    let p = scene.positions.view()
+    for at in 0..<scene.triangle_count():
+        let t = hit(p, scene.indices.items[at * 3..<at * 3 + 3], origin, direction)
+        if t < 0.0: continue
+        let polygon = (i64)scene.faces.items[at]
+        if t < best:
+            if polygon != face: second = best
+            best = t
+            face = polygon
+        elif t < second and polygon != face:
+            second = t
+    let margin = (second - best) / best if face >= 0 else 1.0
+    return (face, best, margin)
+
+func point(p: const f32[], index: u32) -> Vector3:
+    let i = (usize)index * 3
+    return Vector3((f64)p[i], (f64)p[i + 1], (f64)p[i + 2])
+
+## Möller–Trumbore in f64; -1 when the ray misses.
+func hit(p: const f32[], corners: const u32[], origin: Vector3, direction: Vector3) -> f64:
+    let a = point(p, corners[0])
+    let e1 = point(p, corners[1]).subtract(a)
+    let e2 = point(p, corners[2]).subtract(a)
+    let q = direction.cross(e2)
+    let determinant = e1.dot(q)
+    if math.abs(determinant) < 1e-30: return -1.0
+    let s = origin.subtract(a)
+    let u = s.dot(q) / determinant
+    if u < 0.0 or u > 1.0: return -1.0
+    let r = s.cross(e1)
+    let v = direction.dot(r) / determinant
+    if v < 0.0 or u + v > 1.0: return -1.0
+    let t = e2.dot(r) / determinant
+    return t if t > 0.0 else -1.0
