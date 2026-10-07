@@ -37,7 +37,7 @@ pub struct RenderSettings:
     pub var background: Vector3
     ## The material every surface has (until materials are assigned).
     pub var material: OpenPbr
-    ## Paths in flight at once; 0 is min(2^20, pixels).
+    ## Paths in flight at once; 0 is min(2^21, pixels).
     pub var pool: u32
     pub var seed: u32
     ## Trace with the software BVH even where the device has ray queries.
@@ -52,16 +52,33 @@ pub struct RenderSettings:
     ## pixel takes every sample), checked every 4 samples after `adaptive_minimum`.
     pub var noise_threshold: f64
     pub var adaptive_minimum: u32
+    ## Time each kernel on the GPU (Renderer.kernel_times); a little slower.
+    pub var profile: bool
 
     pub static func of(width: u32, height: u32, samples: u32) -> RenderSettings:
-        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false, 1024, 1024, 1024, 0.0, 0.0, 16)
+        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false, 1024, 1024, 1024, 0.0, 0.0, 16, false)
 
 let state_v_fields: usize = 10
 let state_u_fields: usize = 4
 let queue_count: usize = 5
 let queue_base: usize = 32
 let constants_rows: usize = 16
-let default_pool: usize = 1048576
+## 2^21 paths (about 410 MB of state): a 1920 × 1080 image in one band, which
+## halves the per-dispatch overhead of two (measured: 9.9 to 9.0 ms a sample).
+let default_pool: usize = 2097152
+
+## Profiling buckets (Renderer.kernel_times).
+let kind_camera: u8 = 0
+let kind_closest: u8 = 1
+let kind_surface: u8 = 2
+let kind_miss: u8 = 3
+let kind_shadow: u8 = 4
+let kind_schedule: u8 = 5
+let kind_finish: u8 = 6
+let kind_convert: u8 = 7
+let kind_adaptive: u8 = 8
+let kind_rest: u8 = 9
+pub let kernel_names: str[10] = ["camera", "intersect closest", "shade surface", "shade miss", "intersect shadow", "schedule", "finish", "film convert", "adaptive", "later rounds"]
 
 ## The integrator's kernels in one build (spectral or RGB).
 struct Kernel:
@@ -170,6 +187,10 @@ pub struct Renderer:
     var sample: u32
     var band: usize
     var completed: u32
+    ## Profiling: the kind of each timestamp of the pass in flight (kind_*), and
+    ## the nanoseconds each kind has taken in finished passes.
+    var marks: Growing[u8]
+    var kernel_ns: f64[10]
 
     ## A renderer of `scene` through its camera (see RenderSettings.camera). The
     ## scene's buffers are uploaded; `scene` may be closed afterwards.
@@ -240,7 +261,7 @@ pub struct Renderer:
         var output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
         errdefer output.destroy()
         let shown = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
-        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, 8 if cutouts else 0, none, 0, 0, 0)
+        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, 8 if cutouts else 0, none, 0, 0, 0, Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     ## Start the next pass if the last has finished. True while there is work,
     ## running or to come; false once every sample is in the image.
@@ -249,6 +270,11 @@ pub struct Renderer:
             if not (try running.done()): return true
             var finished = running
             try finished.wait()
+            if self.settings.profile and self.marks.count > 1:
+                var stamps: u64[64]
+                try finished.timestamps(stamps[..<self.marks.count])
+                for at in 1..<self.marks.count:
+                    self.kernel_ns[(usize)self.marks.items[at]] += (f64)(stamps[at] - stamps[at - 1])
             finished.close()
             self.pending = none
         if self.sample >= self.settings.samples:
@@ -268,7 +294,10 @@ pub struct Renderer:
         self.display_stale = false
         var pass = try gpu.Compute.begin(self.device)
         errdefer pass.close()
+        self.marks.clear()
+        if self.settings.profile: try self.mark(&pass, kind_rest)
         try self.record(&pass)
+        if self.settings.profile: try self.mark(&pass, kind_rest)
         try pass.submit()
         self.pending = pass
         let bands = (self.pixels() + self.pool - 1) // self.pool
@@ -390,12 +419,37 @@ pub struct Renderer:
         self.uniforms(block, start, count, current, phase)
         let bound = self.bindings(kernel)
         try pass.dispatch(kernel.kernel, bound, block, x, y)
+        if self.settings.profile and self.marks.count < 62: try self.mark(pass, self.kind_of(kernel))
+
+    ## Profiling: a timestamp after the commands so far, charged to `kind`.
+    func mark(pass: gpu.Compute*, kind: u8) -> !:
+        _ = try pass.timestamp()
+        try self.marks.push(kind)
+
+    func kind_of(kernel: const Kernel*) -> u8:
+        if kernel == &self.kernels.camera: return kind_camera
+        if kernel == &self.kernels.intersect_closest: return kind_closest
+        if kernel == &self.kernels.shade_surface: return kind_surface
+        if kernel == &self.kernels.shade_miss: return kind_miss
+        if kernel == &self.kernels.intersect_shadow: return kind_shadow
+        if kernel == &self.kernels.schedule: return kind_schedule
+        if kernel == &self.kernels.finish: return kind_finish
+        if kernel == &self.kernels.film_convert: return kind_convert
+        return kind_adaptive
+
+    ## Milliseconds each kernel kind has taken over the finished passes, with
+    ## `profile` on, in the order of `kernel_names`: what the first 60 commands
+    ## of each pass took, and the rest under "later rounds".
+    pub func kernel_times(out: f64[]) -> !:
+        if out.length < 10: error(invalid, "kernel times need ten numbers")
+        for at in 0..<(usize)10: out[at] = self.kernel_ns[at] * 1e-6
 
     ## A kernel over queue `queue`, sized by the arguments schedule left for it.
     func indirect(pass: gpu.Compute*, kernel: const Kernel*, block: u8[], start: usize, count: usize, current: u32, queue: usize) -> !:
         self.uniforms(block, start, count, current, 0)
         let bound = self.bindings(kernel)
         try pass.dispatch_indirect(kernel.kernel, bound, block, self.queues, (16 + 3 * queue) * 4)
+        if self.settings.profile and self.marks.count < 62: try self.mark(pass, self.kind_of(kernel))
 
     pub func destroy():
         if let running = self.pending:
@@ -416,6 +470,7 @@ pub struct Renderer:
         self.film.destroy()
         self.output.destroy()
         self.shown.destroy()
+        self.marks.close()
 
 ## The albedo tables energy compensation reads (shaders/microfacet.glsl),
 ## computed on the device by the same GGX code the shading kernels run.

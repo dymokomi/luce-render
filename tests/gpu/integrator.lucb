@@ -442,4 +442,15 @@ func timing(device: gpu.Device) -> !:
         let start = clock.now()
         try renderer.finish()
         let seconds = start.elapsed().seconds()
+        if build == 0:
+            # Where the time goes, from a profiled run of the same image.
+            var profiled_settings = settings
+            profiled_settings.profile = true
+            var profiled = try render.Renderer.create(device, &scene, profiled_settings)
+            defer profiled.destroy()
+            try profiled.finish()
+            var times: f64[10]
+            try profiled.kernel_times(times)
+            for at in 0..<(usize)10:
+                if times[at] > 0.0: print(f"  {render.kernel_names[at]}: {times[at] / 16.0} ms a sample")
         print(f"timing ({"RGB" if build == 1 else "spectral"}, {"ray queries" if renderer.ray_traced() else "software BVH"}): 1920x1080, {scene.triangle_count()} triangles, 16 samples, 12 bounces: {seconds * 1000.0 / 16.0} ms a sample")
