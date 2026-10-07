@@ -374,6 +374,26 @@ these were taken. The Cornell box at 1024 × 1024, spectral, 12 bounces:
   about 1.7 times a camera vertex: it connects to the camera and evaluates the
   material twice.
 
+### Against Cycles
+
+The Cornell box was rebuilt for Cycles (Blender 5.1.2, Metal, Principled in
+place of OpenPBR, 12 bounces, no adaptive sampling, denoising or clamp). The
+driver stays local, in .donors/render/cycles_cornell.py. Results on the M4 Max,
+512 × 512:
+
+| | ms a sample | variance at equal time (1.6 s, relative) |
+| --- | --- | --- |
+| Cycles | 3.12 | 0.0074 |
+| luce-render, path tracing, RGB / spectral | 2.96 / 3.11 | 0.0018 (spectral) |
+| luce-render, light paths 0.5 (default), RGB / spectral | 4.5 / 5.2 | 0.00043 / 0.00059 |
+
+Variance is measured between two seeds of each renderer, since their
+materials differ.
+- **Per sample:** speed is even.
+- **At equal time:** the default is 13–17 times less noisy than Cycles.
+- **Startup:** from launch to first sample takes 0.14 s; Cycles' first
+  render spends 60 s compiling Metal kernels.
+
 Next:
 - Manifold sampling for caustics seen through glass.
 - A denoiser.
