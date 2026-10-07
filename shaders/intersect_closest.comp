@@ -1,4 +1,4 @@
-#version 450
+#version 460
 // The nearest triangle or light along each queued ray: hits go to the surface
 // queue, misses to the miss queue.
 #extension GL_GOOGLE_include_directive : require
@@ -6,7 +6,7 @@ layout(local_size_x = 64) in;
 #include "common.glsl"
 #include "spectrum.glsl"
 #include "lights.glsl"
-#include "bvh.glsl"
+#include "trace.glsl"
 
 void main() {
     uint queue = Q_CLOSEST + params.current;

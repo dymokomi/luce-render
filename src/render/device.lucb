@@ -18,9 +18,15 @@ pub struct GpuScene:
     pub var indices: gpu.Buffer
     pub var faces: gpu.Buffer
     pub var shading: gpu.Buffer
+    ## Hardware ray tracing's view of the triangles, where the device has it
+    ## (and the scene has triangles): one BLAS and a one-instance TLAS.
+    pub var accelerated: bool
+    pub var blas: gpu.Blas
+    pub var tlas: gpu.Tlas
 
-    ## The scene's buffers on `device`; an empty array still gets a word.
-    pub static func upload(device: gpu.Device, scene: const CompiledScene*) -> GpuScene!:
+    ## The scene's buffers on `device`; an empty array still gets a word. With
+    ## `accelerate` and a device that traces rays, the TLAS is built too.
+    pub static func upload(device: gpu.Device, scene: const CompiledScene*, accelerate: bool = true) -> GpuScene!:
         var nodes = try buffer_of(device, u8[]((u8*)scene.nodes.items.data, scene.nodes.count * memory.size_of(BvhNode)))
         errdefer nodes.destroy()
         var positions = try buffer_of(device, u8[]((u8*)scene.positions.items.data, scene.positions.count * 4))
@@ -29,8 +35,23 @@ pub struct GpuScene:
         errdefer indices.destroy()
         var faces = try buffer_of(device, u8[]((u8*)scene.faces.items.data, scene.faces.count * 4))
         errdefer faces.destroy()
-        let shading = try buffer_of(device, u8[]((u8*)scene.shading.items.data, scene.shading.count * 4))
-        return GpuScene(nodes, positions, indices, faces, shading)
+        var shading = try buffer_of(device, u8[]((u8*)scene.shading.items.data, scene.shading.count * 4))
+        errdefer shading.destroy()
+        if not accelerate or scene.triangle_count() == 0 or not (try device.limits()).ray_query:
+            return GpuScene(nodes, positions, indices, faces, shading, false, gpu.Blas(), gpu.Tlas())
+        let triangles = gpu.Triangles(vertices = positions, vertex_count = (u32)scene.point_count(), indices = indices, triangle_count = (u32)scene.triangle_count())
+        var blas = try gpu.Blas.create(device, triangles, false)
+        errdefer blas.destroy()
+        var tlas = try gpu.Tlas.create(device, 1)
+        errdefer tlas.destroy()
+        var pass = try gpu.Compute.begin(device)
+        defer pass.close()
+        try pass.build_blas(blas, triangles)
+        let instances: gpu.Instance[1] = [gpu.Instance(blas = blas)]
+        try pass.build_tlas(tlas, instances)
+        # Later passes are ordered after this one; nothing waits for it.
+        try pass.submit()
+        return GpuScene(nodes, positions, indices, faces, shading, true, blas, tlas)
 
     pub func destroy():
         self.nodes.destroy()
@@ -38,6 +59,9 @@ pub struct GpuScene:
         self.indices.destroy()
         self.faces.destroy()
         self.shading.destroy()
+        if self.accelerated:
+            self.tlas.destroy()
+            self.blas.destroy()
 
 ## A buffer of `bytes`; an empty one still gets 64 zero bytes, since Metal wants
 ## room for at least one element of whatever the kernel declares (a vec4, a node).

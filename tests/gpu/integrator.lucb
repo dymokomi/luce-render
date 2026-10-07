@@ -24,6 +24,7 @@ pub func checks(device: gpu.Device) -> !:
     try area_light(device, false)
     try spectral_agrees(device, 0.0)
     try spectral_agrees(device, 3000.0)
+    try hardware_agrees(device)
     try timing(device)
 
 ## Mean of the image's rgb over a window of pixels.
@@ -176,6 +177,42 @@ func spectral_agrees(device: gpu.Device, kelvin: f64) -> !:
         print(f"spectral against RGB ({kelvin} K): {s.x} {s.y} {s.z} against {r.x} {r.y} {r.z}")
         assert(false)
 
+## Hardware ray queries and the software BVH render the same image: the same
+## samples meet the same triangles, so pixels differ only by float rounding.
+func hardware_agrees(device: gpu.Device) -> !:
+    if not (try device.limits()).ray_query:
+        print("skip: no ray queries on this device")
+        return
+    let floor = try MeshPrimitives.grid(20.0, 8)
+    defer floor.release()
+    let sphere = try MeshPrimitives.sphere(1.0, 32)
+    defer sphere.release()
+    let both = try (try GeometrySet.of_mesh(floor)).value().merged(try GeometrySet.of_mesh(sphere))
+    defer both.release()
+    let viewed = try both.value().with_camera("/camera", Vector3(0.0, 1.5, 5.0), Vector3(-0.2, 0.0, 0.0), 0, 35.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer viewed.release()
+    let set = try viewed.value().with_light("/key", Vector3(1.0, 4.0, 1.0), Vector3(-1.2, 0.3, 0.0), 0, Vector3(1.0, 1.0, 1.0), 20.0, 0.0, 0.0, true, 2.0, 2.0, 0.5, 0.0, false)
+    defer set.release()
+    let pixels = try new f32[64 * 48 * 4 * 2] --- in memory.heap
+    defer free(pixels) in memory.heap
+    for build in 0..<(usize)2:
+        var settings = render.RenderSettings.of(64, 48, 32)
+        settings.software_bvh = build == 1
+        try rendered(device, set.value(), settings, pixels[build * 64 * 48 * 4..<(build + 1) * 64 * 48 * 4])
+    var hardware = Vector3()
+    var software = Vector3()
+    var differ: usize = 0
+    for at in 0..<(usize)(64 * 48):
+        let a = Vector3((f64)pixels[at * 4], (f64)pixels[at * 4 + 1], (f64)pixels[at * 4 + 2])
+        let b = Vector3((f64)pixels[64 * 48 * 4 + at * 4], (f64)pixels[64 * 48 * 4 + at * 4 + 1], (f64)pixels[64 * 48 * 4 + at * 4 + 2])
+        hardware = hardware.add(a)
+        software = software.add(b)
+        if a.subtract(b).length() > 0.05 * math.max(0.1, b.length()): differ += 1
+    # A few pixels may take another branch where a ray grazes an edge.
+    if differ > 30 or math.abs(hardware.y / software.y - 1.0) > 0.005:
+        print(f"hardware against software: {differ} pixels differ; sums {hardware.y} and {software.y}")
+        assert(false)
+
 ## A 1920 × 1080 image of a sphere on a floor under an area light, 16 samples:
 ## printed, not checked.
 func timing(device: gpu.Device) -> !:
@@ -195,13 +232,14 @@ func timing(device: gpu.Device) -> !:
     defer set.release()
     var scene = try render.compile_scene(set.value())
     defer scene.close()
-    for build in 0..<(usize)2:
+    for build in 0..<(usize)3:
         var settings = render.RenderSettings.of(1920, 1080, 16)
-        settings.spectral = build == 0
+        settings.spectral = build != 1
+        settings.software_bvh = build == 2
         settings.background = Vector3(0.1, 0.1, 0.1)
         var renderer = try render.Renderer.create(device, &scene, settings)
         defer renderer.destroy()
         let start = clock.now()
         try renderer.finish()
         let seconds = start.elapsed().seconds()
-        print(f"timing ({"spectral" if build == 0 else "RGB"}): 1920x1080, {scene.triangle_count()} triangles, 16 samples, 12 bounces: {seconds * 1000.0 / 16.0} ms a sample")
+        print(f"timing ({"RGB" if build == 1 else "spectral"}, {"ray queries" if renderer.ray_traced() else "software BVH"}): 1920x1080, {scene.triangle_count()} triangles, 16 samples, 12 bounces: {seconds * 1000.0 / 16.0} ms a sample")

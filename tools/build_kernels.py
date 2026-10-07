@@ -20,9 +20,14 @@ OUTPUT = ROOT / 'src' / 'render' / 'kernels.lucb'
 # (source, stem, defines): kernels as the host creates them.
 KERNELS = [('probe.comp', 'probe', ''), ('tables.comp', 'tables', '')]
 # The integrator, spectral and RGB.
-for name in ['camera', 'schedule', 'intersect_closest', 'shade_surface', 'shade_miss', 'intersect_shadow', 'finish', 'film_convert']:
+for name in ['camera', 'schedule', 'shade_surface', 'shade_miss', 'finish', 'film_convert']:
     KERNELS.append((f'{name}.comp', f'{name}', 'SPECTRAL=1'))
     KERNELS.append((f'{name}.comp', f'{name}_rgb', 'SPECTRAL=0'))
+# Intersection reads no spectra, so both builds share it: on the software
+# BVH, or by hardware ray queries where the device has them.
+for name in ['intersect_closest', 'intersect_shadow']:
+    KERNELS.append((f'{name}.comp', f'{name}', 'RAY_QUERY=0'))
+    KERNELS.append((f'{name}.comp', f'{name}_rq', 'RAY_QUERY=1'))
 
 def main() -> int:
     specs = []
@@ -31,7 +36,8 @@ def main() -> int:
         if defines:
             spec += ':' + defines
         specs.append(spec)
-    command = [sys.executable, str(EMBED), str(OUTPUT), '--public', '--shared', '-I', str(SHADERS)] + specs
+    # Vulkan 1.2 SPIR-V: ray queries need it, and every device we run has it.
+    command = [sys.executable, str(EMBED), str(OUTPUT), '--public', '--shared', '--target-env', 'vulkan1.2', '-I', str(SHADERS)] + specs
     return subprocess.call(command)
 
 if __name__ == '__main__':

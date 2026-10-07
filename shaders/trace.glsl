@@ -1,0 +1,38 @@
+// Tracing for the integrator: hardware ray queries against the scene's TLAS
+// (binding 14) when built with RAY_QUERY=1, else the software BVH. Both give
+// the same Hit: t, the triangle slot (the BLAS is built from the reordered
+// indices, so its primitive index is the slot) and the barycentrics of
+// vertices 1 and 2.
+
+#if RAY_QUERY
+#extension GL_EXT_ray_query : require
+
+struct Hit {
+    float t;
+    uint triangle;
+    vec2 uv;
+};
+
+layout(set = 0, binding = 14) uniform accelerationStructureEXT scene_tlas;
+
+Hit trace_closest(vec3 origin, vec3 direction, float t_max) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene_tlas, gl_RayFlagsOpaqueEXT, 0xffu, origin, 0.0, direction, t_max);
+    while (rayQueryProceedEXT(query)) {
+    }
+    if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionTriangleEXT)
+        return Hit(t_max, 0xffffffffu, vec2(0.0));
+    return Hit(rayQueryGetIntersectionTEXT(query, true), uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true)),
+               rayQueryGetIntersectionBarycentricsEXT(query, true));
+}
+
+bool trace_any(vec3 origin, vec3 direction, float t_max) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene_tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xffu, origin, 0.0, direction, t_max);
+    while (rayQueryProceedEXT(query)) {
+    }
+    return rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+}
+#else
+#include "bvh.glsl"
+#endif

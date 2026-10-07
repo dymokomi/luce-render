@@ -6,6 +6,9 @@
 #ifndef SPECTRAL
 #define SPECTRAL 1
 #endif
+#ifndef RAY_QUERY
+#define RAY_QUERY 0
+#endif
 
 #define PI 3.14159265358979323846
 #define INFINITY 3.0e38

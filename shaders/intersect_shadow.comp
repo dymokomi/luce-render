@@ -1,10 +1,10 @@
-#version 450
+#version 460
 // Each queued shadow ray: unblocked, its light sample joins the path's radiance.
 // The slot is the path's own, so no atomics are needed.
 #extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 64) in;
 #include "common.glsl"
-#include "bvh.glsl"
+#include "trace.glsl"
 
 void main() {
     uint at = gl_GlobalInvocationID.x;

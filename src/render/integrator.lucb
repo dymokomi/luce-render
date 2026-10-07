@@ -17,7 +17,8 @@
 #       Buffers, as shaders/common.glsl binds them: 0 nodes, 1 positions, 2 indices,
 #       3 lights, 4 state (vec4 fields), 5 state (uint fields), 6 queues, 7 film,
 #       8 the image (ACEScg), 9 constants, 10 the display image (exposed, Rec.709),
-#       11 triangle shading attributes, 12 materials, 13 albedo tables.
+#       11 triangle shading attributes, 12 materials, 13 albedo tables, 14 the TLAS
+#       (hardware ray queries; otherwise intersection walks the BVH in 0..2).
 #
 #==============================================================================================
 
@@ -38,9 +39,11 @@ pub struct RenderSettings:
     ## Paths in flight at once; 0 is min(2^20, pixels).
     pub var pool: u32
     pub var seed: u32
+    ## Trace with the software BVH even where the device has ray queries.
+    pub var software_bvh: bool
 
     pub static func of(width: u32, height: u32, samples: u32) -> RenderSettings:
-        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1)
+        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false)
 
 let state_v_fields: usize = 9
 let state_u_fields: usize = 3
@@ -67,19 +70,20 @@ struct Kernels:
     var finish: Kernel
     var film_convert: Kernel
 
-    static func create(device: gpu.Device, spectral: bool) -> Kernels!:
+    ## The build's kernels; intersection by hardware ray queries when `rays`.
+    static func create(device: gpu.Device, spectral: bool, rays: bool) -> Kernels!:
         if spectral:
             var camera = try Kernel.create(device, camera_comp_words, camera_comp_msl, camera_comp_group, camera_comp_bindings)
             errdefer camera.kernel.destroy()
             var schedule = try Kernel.create(device, schedule_comp_words, schedule_comp_msl, schedule_comp_group, schedule_comp_bindings)
             errdefer schedule.kernel.destroy()
-            var closest = try Kernel.create(device, intersect_closest_comp_words, intersect_closest_comp_msl, intersect_closest_comp_group, intersect_closest_comp_bindings)
+            var closest = try intersect_kernel(device, rays)
             errdefer closest.kernel.destroy()
             var surface = try Kernel.create(device, shade_surface_comp_words, shade_surface_comp_msl, shade_surface_comp_group, shade_surface_comp_bindings)
             errdefer surface.kernel.destroy()
             var miss = try Kernel.create(device, shade_miss_comp_words, shade_miss_comp_msl, shade_miss_comp_group, shade_miss_comp_bindings)
             errdefer miss.kernel.destroy()
-            var shadow = try Kernel.create(device, intersect_shadow_comp_words, intersect_shadow_comp_msl, intersect_shadow_comp_group, intersect_shadow_comp_bindings)
+            var shadow = try shadow_kernel(device, rays)
             errdefer shadow.kernel.destroy()
             var finish = try Kernel.create(device, finish_comp_words, finish_comp_msl, finish_comp_group, finish_comp_bindings)
             errdefer finish.kernel.destroy()
@@ -89,13 +93,13 @@ struct Kernels:
         errdefer camera.kernel.destroy()
         var schedule = try Kernel.create(device, schedule_rgb_comp_words, schedule_rgb_comp_msl, schedule_rgb_comp_group, schedule_rgb_comp_bindings)
         errdefer schedule.kernel.destroy()
-        var closest = try Kernel.create(device, intersect_closest_rgb_comp_words, intersect_closest_rgb_comp_msl, intersect_closest_rgb_comp_group, intersect_closest_rgb_comp_bindings)
+        var closest = try intersect_kernel(device, rays)
         errdefer closest.kernel.destroy()
         var surface = try Kernel.create(device, shade_surface_rgb_comp_words, shade_surface_rgb_comp_msl, shade_surface_rgb_comp_group, shade_surface_rgb_comp_bindings)
         errdefer surface.kernel.destroy()
         var miss = try Kernel.create(device, shade_miss_rgb_comp_words, shade_miss_rgb_comp_msl, shade_miss_rgb_comp_group, shade_miss_rgb_comp_bindings)
         errdefer miss.kernel.destroy()
-        var shadow = try Kernel.create(device, intersect_shadow_rgb_comp_words, intersect_shadow_rgb_comp_msl, intersect_shadow_rgb_comp_group, intersect_shadow_rgb_comp_bindings)
+        var shadow = try shadow_kernel(device, rays)
         errdefer shadow.kernel.destroy()
         var finish = try Kernel.create(device, finish_rgb_comp_words, finish_rgb_comp_msl, finish_rgb_comp_group, finish_rgb_comp_bindings)
         errdefer finish.kernel.destroy()
@@ -111,6 +115,15 @@ struct Kernels:
         self.intersect_shadow.kernel.destroy()
         self.finish.kernel.destroy()
         self.film_convert.kernel.destroy()
+
+## Intersection kernels serve both builds: they read no spectra.
+func intersect_kernel(device: gpu.Device, rays: bool) -> Kernel!:
+    if rays: return try Kernel.create(device, intersect_closest_rq_comp_words, intersect_closest_rq_comp_msl, intersect_closest_rq_comp_group, intersect_closest_rq_comp_bindings)
+    return try Kernel.create(device, intersect_closest_comp_words, intersect_closest_comp_msl, intersect_closest_comp_group, intersect_closest_comp_bindings)
+
+func shadow_kernel(device: gpu.Device, rays: bool) -> Kernel!:
+    if rays: return try Kernel.create(device, intersect_shadow_rq_comp_words, intersect_shadow_rq_comp_msl, intersect_shadow_rq_comp_group, intersect_shadow_rq_comp_bindings)
+    return try Kernel.create(device, intersect_shadow_comp_words, intersect_shadow_comp_msl, intersect_shadow_comp_group, intersect_shadow_comp_bindings)
 
 pub struct Renderer:
     var device: gpu.Device
@@ -148,10 +161,10 @@ pub struct Renderer:
         let pixels = (usize)settings.width * (usize)settings.height
         let pool = (usize)settings.pool if settings.pool > 0 else default_pool
         let slots = pool if pool < pixels else pixels
-        var kernels = try Kernels.create(device, settings.spectral)
-        errdefer kernels.destroy()
-        var uploaded = try GpuScene.upload(device, scene)
+        var uploaded = try GpuScene.upload(device, scene, not settings.software_bvh)
         errdefer uploaded.destroy()
+        var kernels = try Kernels.create(device, settings.spectral, uploaded.accelerated)
+        errdefer kernels.destroy()
         var packed = Growing[f32]()
         defer packed.close()
         let light_count = try pack_lights(&scene.objects, scene_radius(scene), &packed)
@@ -245,6 +258,10 @@ pub struct Renderer:
         try self.constants.upload(9 * 16, u8[]((u8*)&row[0], 16))
         self.display_stale = true
 
+    ## Whether intersection uses hardware ray queries.
+    pub func ray_traced() -> bool:
+        return self.scene.accelerated
+
     pub func render_settings() -> RenderSettings:
         return self.settings
 
@@ -286,14 +303,15 @@ pub struct Renderer:
         let values: u32[8] = [(u32)start, (u32)count, self.sample, 0, current, phase, (u32)self.pool, self.settings.seed]
         for at in 0..<(usize)8: memory.write[u32]((void*)&block[64 + at * 4], values[at])
 
-    func bindings(kernel: const Kernel*) -> gpu.Binding[14]:
-        var all: gpu.Binding[14] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
+    func bindings(kernel: const Kernel*) -> gpu.Binding[15]:
+        var all: gpu.Binding[15] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
                                     gpu.Binding(buffer = self.lights), gpu.Binding(buffer = self.state_v), gpu.Binding(buffer = self.state_u),
                                     gpu.Binding(buffer = self.queues), gpu.Binding(buffer = self.film), gpu.Binding(texture = self.output),
                                     gpu.Binding(buffer = self.constants), gpu.Binding(texture = self.shown),
                                     gpu.Binding(buffer = self.scene.shading), gpu.Binding(buffer = self.materials),
-                                    gpu.Binding(buffer = self.tables)]
-        for at in 0..<(usize)14:
+                                    gpu.Binding(buffer = self.tables), gpu.Binding()]
+        if self.scene.accelerated: all[14] = gpu.Binding(accel = self.scene.tlas)
+        for at in 0..<(usize)15:
             if at >= kernel.kinds.length or kernel.kinds[at] == 0: all[at] = gpu.Binding()
         return all
 
