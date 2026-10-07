@@ -1,6 +1,7 @@
 #version 450
 // Start one path per pixel of the band: a jittered primary ray, four wavelengths
 // (spectral), unit throughput, no radiance, queued for the first closest hit.
+// Pixels adaptive sampling has found converged start none (pixel NONE).
 #extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 64) in;
 #include "common.glsl"
@@ -10,8 +11,11 @@ layout(local_size_x = 64) in;
 void main() {
     uint path = gl_GlobalInvocationID.x;
     if (path >= params.band_count) return;
-    if (path == 0u) queues[Q_CLOSEST] = params.band_count;
     uint pixel = params.band_start + path;
+    if (film_at(FILM_HALF, pixel).w > 0.5) {
+        set_u(SU_PIXEL, path, NONE);
+        return;
+    }
     uint width = uint(params.du.w);
     vec4 u = sample4(pixel, params.sample_index, GROUP_CAMERA);
     vec2 film_at = vec2(float(pixel % width) + u.x, float(pixel / width) + u.y);
@@ -28,5 +32,5 @@ void main() {
 #if SPECTRAL
     set_v(SV_LAMBDA, path, sample_wavelengths(sample4(pixel, params.sample_index, GROUP_WAVELENGTH).x));
 #endif
-    queues[QUEUE_BASE + Q_CLOSEST * params.pool + path] = path;
+    queue_push(Q_CLOSEST, path);
 }

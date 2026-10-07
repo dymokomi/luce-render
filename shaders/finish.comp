@@ -9,8 +9,11 @@ void main() {
     uint path = gl_GlobalInvocationID.x;
     if (path >= params.band_count) return;
     uint pixel = get_u(SU_PIXEL, path);
+    if (pixel == NONE) return;
     vec3 value = spec_to_film(get_v(SV_RADIANCE, path), get_v(SV_LAMBDA, path));
     // A NaN or infinity would spoil the pixel for good; drop the sample instead.
     if (any(isnan(value)) || any(isinf(value))) value = vec3(0.0);
     film[pixel] += vec4(value, 1.0);
+    // Adaptive sampling's second estimate: every other sample, twice.
+    if ((params.sample_index & 1u) == 1u) film[film_pixels() + pixel] += vec4(2.0 * value, 0.0);
 }

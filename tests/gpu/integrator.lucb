@@ -30,6 +30,7 @@ pub func checks(device: gpu.Device) -> !:
     try emissive_quad(device, true)
     try emissive_quad(device, false)
     try cutout_shadow(device)
+    try adaptive(device)
     try spectral_agrees(device, 0.0)
     try spectral_agrees(device, 3000.0)
     try hardware_agrees(device)
@@ -287,6 +288,38 @@ func cutout_shadow(device: gpu.Device) -> !:
         means[at] = window_mean(pixels, 32, 14, 14, 4).y
     if math.abs(means[0] / means[1] - 0.5) > 0.015:
         print(f"cut-out shadow: {means[0]} at opacity 0.5 against {means[1]} at 0")
+        assert(false)
+
+## A sphere under an area light, half the frame empty sky: with adaptive
+## sampling the image is the same (it only stops sampling where it is clean)
+## and the empty sky stops early.
+func adaptive(device: gpu.Device) -> !:
+    let sphere = try MeshPrimitives.sphere(1.0, 32)
+    defer sphere.release()
+    let base = try GeometrySet.of_mesh(sphere)
+    defer base.release()
+    let viewed = try base.value().with_camera("/camera", Vector3(1.5, 1.0, 5.0), Vector3(), 0, 35.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer viewed.release()
+    let set = try viewed.value().with_light("/key", Vector3(1.0, 4.0, 1.0), Vector3(-1.2, 0.3, 0.0), 0, Vector3(1.0, 1.0, 1.0), 20.0, 0.0, 0.0, true, 2.0, 2.0, 0.5, 0.0, false)
+    defer set.release()
+    var scene = try render.compile_scene(set.value())
+    defer scene.close()
+    var sums: f64[2] = [0.0, 0.0]
+    var stopped: usize = 0
+    let pixels = try new f32[64 * 48 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    for at in 0..<(usize)2:
+        var settings = render.RenderSettings.of(64, 48, 64)
+        settings.spectral = false
+        settings.noise_threshold = 0.01 if at == 0 else 0.0
+        var renderer = try render.Renderer.create(device, &scene, settings)
+        defer renderer.destroy()
+        try renderer.finish()
+        try renderer.read(pixels)
+        for p in 0..<(usize)(64 * 48): sums[at] += (f64)pixels[p * 4 + 1]
+        if at == 0: stopped = try renderer.converged_pixels()
+    if math.abs(sums[0] / sums[1] - 1.0) > 0.01 or stopped < 64 * 48 // 3:
+        print(f"adaptive: image sums {sums[0]} against {sums[1]}, {stopped} of {64 * 48} pixels stopped")
         assert(false)
 
 func area_light(device: gpu.Device, spectral: bool) -> !:

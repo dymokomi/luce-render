@@ -42,8 +42,16 @@ layout(set = 0, binding = 4, std430) buffer StateV { vec4 state_v[]; };
 layout(set = 0, binding = 5, std430) buffer StateU { uint state_u[]; };
 // Queue counters [0..15], indirect arguments [16..31], then each queue's paths.
 layout(set = 0, binding = 6, std430) buffer Queues { uint queues[]; };
-// The film: xyz the sum of samples (XYZ under E, or ACEScg), w their count.
+// The film, three planes of a vec4 a pixel (FILM_* below): the sum of samples
+// (XYZ under E, or ACEScg; w their count), adaptive sampling's half buffer
+// (twice the odd samples; w 1 once the pixel has converged), and a scratch
+// plane for the convergence check.
 layout(set = 0, binding = 7, std430) buffer Film { vec4 film[]; };
+uint film_pixels() { return uint(params.du.w) * uint(params.dv.w); }
+#define FILM_SUM 0u
+#define FILM_HALF 1u
+#define FILM_SCRATCH 2u
+vec4 film_at(uint plane, uint pixel) { return film[plane * film_pixels() + pixel]; }
 // Scene-wide constants (src/render/integrator.lucb: fill_constants).
 layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[]; };
 
@@ -54,6 +62,7 @@ layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[
 #define K_FILM 3            // 3 rows: XYZ under E to ACEScg
 #define K_CMF 6             // xyz: the color matching integrals
 #define K_DISPLAY 9         // x exposure in stops, y view (0 standard, 1 neutral)
+#define K_ADAPTIVE 11       // x noise threshold (0: off), y the samples before checks
 
 // State fields.
 #define SV_ORIGIN 0u

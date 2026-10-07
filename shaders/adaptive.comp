@@ -1,0 +1,40 @@
+#version 450
+// Adaptive sampling's convergence check (Cycles' film_adaptive_sampling, after
+// Dammertz et al., "A hierarchical automatic stopping condition for Monte
+// Carlo global illumination"): a pixel's error is how far its full estimate I
+// and its half estimate A (odd samples, twice) differ, relative to the square
+// root of its brightness.
+//   phase 0: each pixel's own verdict into the scratch plane
+//   phase 1: a pixel is converged when its whole 3 × 3 neighbourhood is, so
+//            noise at a converged pixel's edge keeps it sampling
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "common.glsl"
+
+void main() {
+    uint width = uint(params.du.w);
+    uint height = uint(params.dv.w);
+    uvec2 at = gl_GlobalInvocationID.xy;
+    if (at.x >= width || at.y >= height) return;
+    uint pixel = at.y * width + at.x;
+    if (params.phase == 0u) {
+        vec4 sum = film_at(FILM_SUM, pixel);
+        vec4 half_sum = film_at(FILM_HALF, pixel);
+        float scale = 1.0 / max(sum.w, 1.0);
+        float difference = (abs(sum.x - half_sum.x) + abs(sum.y - half_sum.y) + abs(sum.z - half_sum.z)) * scale;
+        float brightness = max(0.0, (sum.x + sum.y + sum.z) * scale);
+        float error = difference / (0.0001 + sqrt(brightness));
+        film[FILM_SCRATCH * film_pixels() + pixel] = vec4(error < constants[K_ADAPTIVE].x ? 1.0 : 0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+    float converged = 1.0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            ivec2 n = ivec2(at) + ivec2(dx, dy);
+            if (n.x < 0 || n.y < 0 || n.x >= int(width) || n.y >= int(height)) continue;
+            converged = min(converged, film_at(FILM_SCRATCH, uint(n.y) * width + uint(n.x)).x);
+        }
+    }
+    vec4 half_sum = film_at(FILM_HALF, pixel);
+    film[FILM_HALF * film_pixels() + pixel] = vec4(half_sum.xyz, converged);
+}

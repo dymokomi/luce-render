@@ -48,9 +48,13 @@ pub struct RenderSettings:
     pub var transmission_bounces: u32
     ## Indirect samples are clipped to this brightness against fireflies; 0 is off.
     pub var clamp_indirect: f64
+    ## Adaptive sampling: a pixel stops once its noise falls below this (0: every
+    ## pixel takes every sample), checked every 4 samples after `adaptive_minimum`.
+    pub var noise_threshold: f64
+    pub var adaptive_minimum: u32
 
     pub static func of(width: u32, height: u32, samples: u32) -> RenderSettings:
-        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false, 1024, 1024, 1024, 0.0)
+        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false, 1024, 1024, 1024, 0.0, 0.0, 16)
 
 let state_v_fields: usize = 10
 let state_u_fields: usize = 4
@@ -76,6 +80,7 @@ struct Kernels:
     var intersect_shadow: Kernel
     var finish: Kernel
     var film_convert: Kernel
+    var adaptive: Kernel
 
     ## The build's kernels; intersection by hardware ray queries when `rays`.
     static func create(device: gpu.Device, spectral: bool, rays: bool) -> Kernels!:
@@ -94,8 +99,10 @@ struct Kernels:
             errdefer shadow.kernel.destroy()
             var finish = try Kernel.create(device, finish_comp_words, finish_comp_msl, finish_comp_group, finish_comp_bindings)
             errdefer finish.kernel.destroy()
-            let convert = try Kernel.create(device, film_convert_comp_words, film_convert_comp_msl, film_convert_comp_group, film_convert_comp_bindings)
-            return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert)
+            var convert = try Kernel.create(device, film_convert_comp_words, film_convert_comp_msl, film_convert_comp_group, film_convert_comp_bindings)
+            errdefer convert.kernel.destroy()
+            let adaptive = try Kernel.create(device, adaptive_comp_words, adaptive_comp_msl, adaptive_comp_group, adaptive_comp_bindings)
+            return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert, adaptive)
         var camera = try Kernel.create(device, camera_rgb_comp_words, camera_rgb_comp_msl, camera_rgb_comp_group, camera_rgb_comp_bindings)
         errdefer camera.kernel.destroy()
         var schedule = try Kernel.create(device, schedule_rgb_comp_words, schedule_rgb_comp_msl, schedule_rgb_comp_group, schedule_rgb_comp_bindings)
@@ -110,8 +117,10 @@ struct Kernels:
         errdefer shadow.kernel.destroy()
         var finish = try Kernel.create(device, finish_rgb_comp_words, finish_rgb_comp_msl, finish_rgb_comp_group, finish_rgb_comp_bindings)
         errdefer finish.kernel.destroy()
-        let convert = try Kernel.create(device, film_convert_rgb_comp_words, film_convert_rgb_comp_msl, film_convert_rgb_comp_group, film_convert_rgb_comp_bindings)
-        return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert)
+        var convert = try Kernel.create(device, film_convert_rgb_comp_words, film_convert_rgb_comp_msl, film_convert_rgb_comp_group, film_convert_rgb_comp_bindings)
+        errdefer convert.kernel.destroy()
+        let adaptive = try Kernel.create(device, adaptive_rgb_comp_words, adaptive_rgb_comp_msl, adaptive_rgb_comp_group, adaptive_rgb_comp_bindings)
+        return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert, adaptive)
 
     func destroy():
         self.camera.kernel.destroy()
@@ -122,6 +131,7 @@ struct Kernels:
         self.intersect_shadow.kernel.destroy()
         self.finish.kernel.destroy()
         self.film_convert.kernel.destroy()
+        self.adaptive.kernel.destroy()
 
 ## Intersection kernels serve both builds: they read no spectra.
 func intersect_kernel(device: gpu.Device, rays: bool) -> Kernel!:
@@ -225,7 +235,7 @@ pub struct Renderer:
         errdefer state_u.destroy()
         var queues = try gpu.Buffer.allocate(device, (queue_base + queue_count * slots) * 4)
         errdefer queues.destroy()
-        var film = try gpu.Buffer.allocate(device, pixels * 16)
+        var film = try gpu.Buffer.allocate(device, 3 * pixels * 16)
         errdefer film.destroy()
         var output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
         errdefer output.destroy()
@@ -296,6 +306,17 @@ pub struct Renderer:
         try self.constants.upload(9 * 16, u8[]((u8*)&row[0], 16))
         self.display_stale = true
 
+    ## How many pixels adaptive sampling has stopped (waits for work in flight).
+    pub func converged_pixels() -> usize!:
+        let pixels = self.pixels()
+        let bytes = try new u8[pixels * 16] --- in memory.heap
+        defer free(bytes) in memory.heap
+        try self.film.read(pixels * 16, bytes)
+        var count: usize = 0
+        for at in 0..<pixels:
+            if memory.read[f32]((const void*)&bytes[at * 16 + 12]) > 0.5: count += 1
+        return count
+
     ## Whether intersection uses hardware ray queries.
     pub func ray_traced() -> bool:
         return self.scene.accelerated
@@ -322,6 +343,8 @@ pub struct Renderer:
         try self.frame.pack(frame)
         memory.copy(block[0..<64], u8[]((u8*)&frame[0], 64), 64)
         let groups = (u32)((count + 63) // 64)
+        # The camera queues only pixels still sampling, by atomics from zero.
+        try pass.fill(self.queues, 0, 4, 0)
         try self.dispatch(pass, &self.kernels.camera, block, start, count, 0, 0, groups, 1)
         # One more round than bounces: the last BSDF rays still find lights;
         # with cut-outs, rounds for rays passing through them at the same bounce.
@@ -335,6 +358,15 @@ pub struct Renderer:
             try self.dispatch(pass, &self.kernels.schedule, block, start, count, current, 2, 1, 1)
             try self.indirect(pass, &self.kernels.intersect_shadow, block, start, count, current, 4)
         try self.dispatch(pass, &self.kernels.finish, block, start, count, 0, 0, groups, 1)
+        # After the last band of every 4th sample past the minimum, check which
+        # pixels have converged.
+        let bands = (self.pixels() + self.pool - 1) // self.pool
+        let taken = self.sample + 1
+        if self.settings.noise_threshold > 0.0 and self.band + 1 == bands and taken >= self.settings.adaptive_minimum and taken % 4 == 0:
+            let x = (self.settings.width + 7) // 8
+            let y = (self.settings.height + 7) // 8
+            try self.dispatch(pass, &self.kernels.adaptive, block, start, count, 0, 0, x, y)
+            try self.dispatch(pass, &self.kernels.adaptive, block, start, count, 0, 1, x, y)
         try self.dispatch(pass, &self.kernels.film_convert, block, start, count, 0, 0, (self.settings.width + 7) // 8, (self.settings.height + 7) // 8)
 
     ## The push constants after the camera frame: band, sample and step.
@@ -435,4 +467,6 @@ func fill_constants(rows: f32[], settings: RenderSettings, light_count: usize) -
                            film.m[6], film.m[7], film.m[8], 0.0,
                            integrals.x, integrals.y, integrals.z, 0.0,
                            (f64)settings.diffuse_bounces, (f64)settings.glossy_bounces, (f64)settings.transmission_bounces, 0.0]
+    rows[44] = (f32)settings.noise_threshold
+    rows[45] = (f32)settings.adaptive_minimum
     for at in 0..<(usize)32: rows[at] = (f32)values[at]
