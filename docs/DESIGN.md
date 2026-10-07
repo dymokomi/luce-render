@@ -222,11 +222,19 @@ Performance, after BACKENDS-STUDY.md:
   sample 8.4 to about 7.2 ms spectral and 7.8 to 6.6 ms RGB, at 1080p on an
   M4 Max.
 
+- **No separate scheduling kernel.** Each kernel's last workgroup writes the
+  next kernels' indirect arguments, so a round is 4 dispatches instead of 7:
+  ~7.1 to 6.9 ms.
+- **Mid-pass path refill: not done, as it doesn't pay here.** Going from 4 to 12
+  bounces costs only 0.35 ms (5%), the most refill could recover; tail rounds
+  are real work.
+- **Material sorting: waits** for multi-material benchmark scenes. Every test
+  scene has one material, where sorting only costs.
+
 Next:
 
-- Fold `schedule` into its producers.
-- Refill paths mid-pass with a larger pool.
-- Sort shading by material.
+- A benchmark scene set (REALTIME-STUDY §4.3): interior, product,
+  many-material, glass. Optimizations are judged on it.
 - A denoiser.
 - Transparent shadows through glass and cut-outs.
 - Instancing as a BLAS per prototype.
