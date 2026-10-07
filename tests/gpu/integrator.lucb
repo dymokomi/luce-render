@@ -16,6 +16,8 @@ pub func checks(device: gpu.Device) -> !:
     try furnace(device, true, 0.0)
     try furnace(device, false, 0.0)
     try furnace(device, true, 1.0)
+    try metal_furnace(device, true, 0.5)
+    try metal_furnace(device, false, 1.0)
     try emission(device, false)
     try emission(device, true)
     try area_light(device, true)
@@ -66,6 +68,30 @@ func furnace(device: gpu.Device, spectral: bool, roughness: f64) -> !:
         print(f"furnace (spectral {spectral}, roughness {roughness}): mean {mean.x} {mean.y} {mean.z}, on the sphere {center.x} {center.y} {center.z}")
         assert(false)
 
+## A white metal (F0 = 1) of any roughness reflects everything: multiple
+## scattering between microfacets is restored by the energy compensation.
+func metal_furnace(device: gpu.Device, spectral: bool, roughness: f64) -> !:
+    let sphere = try MeshPrimitives.sphere(1.0, 32)
+    defer sphere.release()
+    let base = try GeometrySet.of_mesh(sphere)
+    defer base.release()
+    let set = try base.value().with_camera("/camera", Vector3(0.0, 1.0, 4.0), Vector3(), 0, 50.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer set.release()
+    var settings = render.RenderSettings.of(64, 48, 64)
+    settings.spectral = spectral
+    settings.max_bounces = 64
+    settings.background = Vector3(1.0, 1.0, 1.0)
+    settings.material.base_color = Vector3(1.0, 1.0, 1.0)
+    settings.material.base_metalness = 1.0
+    settings.material.specular_roughness = roughness
+    let pixels = try new f32[64 * 48 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    try rendered(device, set.value(), settings, pixels)
+    let center = window_mean(pixels, 64, 24, 16, 16)
+    if math.abs(center.y - 1.0) > 0.02:
+        print(f"metal furnace (spectral {spectral}, roughness {roughness}): on the sphere {center.x} {center.y} {center.z}")
+        assert(false)
+
 ## A sphere of emission luminance 3 and a reddish color in the dark shows its
 ## emission exactly; the base reflects nothing, as nothing else lights it.
 func emission(device: gpu.Device, spectral: bool) -> !:
@@ -111,6 +137,7 @@ func area_light(device: gpu.Device, spectral: bool) -> !:
     settings.spectral = spectral
     settings.max_bounces = 1
     settings.material.base_color = Vector3(0.5, 0.5, 0.5)
+    settings.material.specular_weight = 0.0
     let pixels = try new f32[32 * 32 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try rendered(device, set.value(), settings, pixels)

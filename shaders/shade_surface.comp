@@ -11,6 +11,7 @@ layout(local_size_x = 64) in;
 #include "sampler.glsl"
 #include "spectrum.glsl"
 #include "lights.glsl"
+#include "microfacet.glsl"
 #include "openpbr.glsl"
 
 vec3 point_of(uint index) {
@@ -60,9 +61,8 @@ void main() {
     basis(normal, surface.tangent, surface.bitangent);
     surface.geometric = geometric;
     surface.material = attributes.w;
-    surface.base = material_color(attributes.w, 0u, lambda) * material_at(attributes.w, 1u).w;
-    surface.diffuse_roughness = material_at(attributes.w, 10u).y;
     vec3 wo = to_local(surface, -ray.xyz);
+    prepare_surface(surface, wo, lambda);
 
     // Emission: surfaces are not light-sampled yet, so it takes no MIS weight.
     if (material_at(attributes.w, 7u).w > 0.0) {

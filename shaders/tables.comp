@@ -1,0 +1,62 @@
+#version 450
+// Tabulate the albedos energy compensation needs (shaders/microfacet.glsl):
+// each thread one node, averaging F · G2 / G1 over visible-normal samples
+// (the estimator of ∫ f cos for that sampling) on a stratified grid. Nodes
+// include both ends of every axis (table_mu, table_roughness, table_z), so
+// lookups never extrapolate.
+//   phase 0: E_ggx(mu, r) and E_dielectric(mu, r, z)
+//   phase 1: E_ggx average over mu (2 ∫ E mu dmu), from phase 0's table
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#define SPECTRAL 0
+#define PI 3.14159265358979323846
+#define INFINITY 3.0e38
+#include "microfacet.glsl"
+
+layout(set = 0, binding = 0, std430) buffer Tables { float tables[]; };
+layout(push_constant) uniform Params { uint phase; } params;
+
+#define SAMPLES 32u
+
+float albedo(float mu, float roughness, float eta) {
+    vec3 wo = vec3(sqrt(1.0 - mu * mu), 0.0, mu);
+    vec2 alpha = ggx_alpha(roughness, 0.0);
+    float sum = 0.0;
+    for (uint i = 0u; i < SAMPLES; i++) {
+        for (uint j = 0u; j < SAMPLES; j++) {
+            vec2 u = (vec2(i, j) + 0.5) / float(SAMPLES);
+            vec3 h = ggx_sample(wo, alpha, u);
+            vec3 wi = reflect(-wo, h);
+            if (wi.z <= 0.0) continue;
+            float f = eta > 0.0 ? fresnel_dielectric(dot(wo, h), eta) : 1.0;
+            sum += f * ggx_g2(wi, wo, alpha) / ggx_g1(wo, alpha);
+        }
+    }
+    return sum / float(SAMPLES * SAMPLES);
+}
+
+void main() {
+    uint cell = gl_GlobalInvocationID.x;
+    if (params.phase == 0u) {
+        uint plane = TABLE_MU * TABLE_ROUGHNESS;
+        if (cell >= plane * (1u + TABLE_ETA)) return;
+        uint layer = cell / plane;
+        uint at = cell % plane;
+        float mu = table_mu(at % TABLE_MU);
+        float roughness = table_roughness(at / TABLE_MU);
+        if (layer == 0u) {
+            tables[TABLE_GGX + at] = albedo(mu, roughness, -1.0);
+        } else {
+            tables[TABLE_DIELECTRIC + (layer - 1u) * plane + at] = albedo(mu, roughness, eta_of_z(table_z(layer - 1u)));
+        }
+        return;
+    }
+    if (cell >= TABLE_ROUGHNESS) return;
+    // 2 ∫ E(mu) mu dmu by the trapezoid rule over the mu nodes.
+    float sum = 0.0;
+    for (uint m = 0u; m + 1u < TABLE_MU; m++) {
+        float a = table_mu(m), b = table_mu(m + 1u);
+        sum += 0.5 * (tables[TABLE_GGX + cell * TABLE_MU + m] * a + tables[TABLE_GGX + cell * TABLE_MU + m + 1u] * b) * (b - a);
+    }
+    tables[TABLE_GGX_AVERAGE + cell] = 2.0 * sum;
+}

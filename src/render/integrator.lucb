@@ -17,7 +17,7 @@
 #       Buffers, as shaders/common.glsl binds them: 0 nodes, 1 positions, 2 indices,
 #       3 lights, 4 state (vec4 fields), 5 state (uint fields), 6 queues, 7 film,
 #       8 the image (ACEScg), 9 constants, 10 the display image (exposed, Rec.709),
-#       11 triangle shading attributes, 12 materials.
+#       11 triangle shading attributes, 12 materials, 13 albedo tables.
 #
 #==============================================================================================
 
@@ -120,6 +120,7 @@ pub struct Renderer:
     var lights: gpu.Buffer
     var constants: gpu.Buffer
     var materials: gpu.Buffer
+    var tables: gpu.Buffer
     var state_v: gpu.Buffer
     var state_u: gpu.Buffer
     var queues: gpu.Buffer
@@ -165,6 +166,8 @@ pub struct Renderer:
         try pack_material(settings.material, &records)
         var materials = try buffer_of(device, u8[]((u8*)records.items.data, records.count * 4))
         errdefer materials.destroy()
+        var tables = try make_tables(device)
+        errdefer tables.destroy()
         var state_v = try gpu.Buffer.allocate(device, state_v_fields * slots * 16)
         errdefer state_v.destroy()
         var state_u = try gpu.Buffer.allocate(device, state_u_fields * slots * 4)
@@ -176,7 +179,7 @@ pub struct Renderer:
         var output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
         errdefer output.destroy()
         let shown = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
-        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, none, 0, 0, 0)
+        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, none, 0, 0, 0)
 
     ## Start the next pass if the last has finished. True while there is work,
     ## running or to come; false once every sample is in the image.
@@ -283,13 +286,14 @@ pub struct Renderer:
         let values: u32[8] = [(u32)start, (u32)count, self.sample, 0, current, phase, (u32)self.pool, self.settings.seed]
         for at in 0..<(usize)8: memory.write[u32]((void*)&block[64 + at * 4], values[at])
 
-    func bindings(kernel: const Kernel*) -> gpu.Binding[13]:
-        var all: gpu.Binding[13] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
+    func bindings(kernel: const Kernel*) -> gpu.Binding[14]:
+        var all: gpu.Binding[14] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
                                     gpu.Binding(buffer = self.lights), gpu.Binding(buffer = self.state_v), gpu.Binding(buffer = self.state_u),
                                     gpu.Binding(buffer = self.queues), gpu.Binding(buffer = self.film), gpu.Binding(texture = self.output),
                                     gpu.Binding(buffer = self.constants), gpu.Binding(texture = self.shown),
-                                    gpu.Binding(buffer = self.scene.shading), gpu.Binding(buffer = self.materials)]
-        for at in 0..<(usize)13:
+                                    gpu.Binding(buffer = self.scene.shading), gpu.Binding(buffer = self.materials),
+                                    gpu.Binding(buffer = self.tables)]
+        for at in 0..<(usize)14:
             if at >= kernel.kinds.length or kernel.kinds[at] == 0: all[at] = gpu.Binding()
         return all
 
@@ -315,12 +319,33 @@ pub struct Renderer:
         self.lights.destroy()
         self.constants.destroy()
         self.materials.destroy()
+        self.tables.destroy()
         self.state_v.destroy()
         self.state_u.destroy()
         self.queues.destroy()
         self.film.destroy()
         self.output.destroy()
         self.shown.destroy()
+
+## The albedo tables energy compensation reads (shaders/microfacet.glsl),
+## computed on the device by the same GGX code the shading kernels run.
+let table_floats: usize = 32 * 32 + 32 + 32 * 32 * 16
+
+func make_tables(device: gpu.Device) -> gpu.Buffer!:
+    var tables = try gpu.Buffer.allocate(device, table_floats * 4)
+    errdefer tables.destroy()
+    var kernel = try gpu.Kernel.create(device, tables_comp_words, tables_comp_msl, tables_comp_group, tables_comp_bindings)
+    defer kernel.destroy()
+    var pass = try gpu.Compute.begin(device)
+    defer pass.close()
+    let bound: gpu.Binding[1] = [gpu.Binding(buffer = tables)]
+    var phase: u32[1] = [0]
+    try pass.dispatch(kernel, bound, u8[]((u8*)&phase[0], 4), (u32)((32 * 32 * 17 + 63) // 64))
+    phase[0] = 1
+    try pass.dispatch(kernel, bound, u8[]((u8*)&phase[0], 4), 1)
+    try pass.submit()
+    try pass.wait()
+    return tables
 
 ## The camera to render through: `index`, or the first camera when it is -1.
 func find_camera(scene: const CompiledScene*, index: i64) -> usize!:
