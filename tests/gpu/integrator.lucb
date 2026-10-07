@@ -31,6 +31,7 @@ pub func checks(device: gpu.Device) -> !:
     try emissive_quad(device, false)
     try cutout_shadow(device)
     try adaptive(device)
+    try guided_room(device)
     try spectral_agrees(device, 0.0)
     try spectral_agrees(device, 3000.0)
     try hardware_agrees(device)
@@ -69,6 +70,8 @@ func furnace(device: gpu.Device, spectral: bool, roughness: f64) -> !:
     settings.background = Vector3(1.0, 1.0, 1.0)
     settings.material.base_color = Vector3(1.0, 1.0, 1.0)
     settings.material.base_diffuse_roughness = roughness
+    # The rough run guides too: guided sampling must keep the furnace white.
+    settings.guiding = roughness == 1.0
     let pixels = try new f32[64 * 48 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try rendered(device, set.value(), settings, pixels)
@@ -322,6 +325,69 @@ func adaptive(device: gpu.Device) -> !:
         print(f"adaptive: image sums {sums[0]} against {sums[1]}, {stopped} of {64 * 48} pixels stopped")
         assert(false)
 
+## A closed 6 × 3 × 6 room lit only by a lamp in a narrow shade that throws a
+## small bright spot on the ceiling: everything the camera sees is lit by that
+## spot's bounce, which cosine sampling rarely finds and light sampling cannot.
+## Path guiding learns where it is; at equal samples (four seeds, each shared
+## by both ways) the image is closer to a long unguided reference.
+func guided_room(device: gpu.Device) -> !:
+    let floor = try MeshPrimitives.grid(6.0, 4)
+    defer floor.release()
+    let wall = try MeshPrimitives.grid(6.0, 4)
+    defer wall.release()
+    let shade = try MeshPrimitives.grid(1.0, 1)
+    defer shade.release()
+    var room = try GeometrySet.of_mesh(floor)
+    let placements: Vector3[10] = [Vector3(0.0, 3.0, 0.0), Vector3(0.0, 0.0, 0.0),
+                                   Vector3(3.0, 1.5, 0.0), Vector3(0.0, 0.0, 0.5 * math.pi),
+                                   Vector3(-3.0, 1.5, 0.0), Vector3(0.0, 0.0, 0.5 * math.pi),
+                                   Vector3(0.0, 1.5, 3.0), Vector3(0.5 * math.pi, 0.0, 0.0),
+                                   Vector3(0.0, 1.5, -3.0), Vector3(0.5 * math.pi, 0.0, 0.0)]
+    for at in 0..<(usize)5:
+        let placed = try (try GeometrySet.of_mesh(wall)).value().transformed(placements[at * 2], placements[at * 2 + 1], Vector3(1.0, 1.0, 1.0))
+        room = try room.value().merged(placed)
+    # The shade: four 0.3-wide, 1-tall panels around the lamp.
+    let sides: Vector3[8] = [Vector3(0.15, 0.7, 0.0), Vector3(0.0, 0.0, 0.5 * math.pi), Vector3(-0.15, 0.7, 0.0), Vector3(0.0, 0.0, 0.5 * math.pi),
+                             Vector3(0.0, 0.7, 0.15), Vector3(0.5 * math.pi, 0.0, 0.0), Vector3(0.0, 0.7, -0.15), Vector3(0.5 * math.pi, 0.0, 0.0)]
+    # The grid lies in XZ: the axis that turns vertical takes the height.
+    let scales: Vector3[4] = [Vector3(1.0, 1.0, 0.3), Vector3(1.0, 1.0, 0.3), Vector3(0.3, 1.0, 1.0), Vector3(0.3, 1.0, 1.0)]
+    for at in 0..<(usize)4:
+        let panel = try (try GeometrySet.of_mesh(shade)).value().transformed(sides[at * 2], sides[at * 2 + 1], scales[at])
+        room = try room.value().merged(panel)
+    let viewed = try room.value().with_camera("/camera", Vector3(2.5, 1.5, 2.5), Vector3(-0.15, 0.785, 0.0), 0, 24.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer viewed.release()
+    let set = try viewed.value().with_light("/lamp", Vector3(0.0, 0.25, 0.0), Vector3(0.5 * math.pi, 0.0, 0.0), 0, Vector3(1.0, 1.0, 1.0), 200.0, 0.0, 0.0, false, 0.2, 0.2, 0.5, 0.0, false)
+    defer set.release()
+    var scene = try render.compile_scene(set.value())
+    defer scene.close()
+    let size: usize = 256 * 192 * 4
+    let images = try new f32[size * 3] --- in memory.heap
+    defer free(images) in memory.heap
+    var errors: f64[2] = [0.0, 0.0]
+    for round in 0..<(usize)5:
+        for way in 0..<(usize)2:
+            if round == 0 and way == 1: continue
+            var settings = render.RenderSettings.of(256, 192, 4096 if round == 0 else 256)
+            settings.spectral = false
+            settings.max_bounces = 2
+            settings.material.base_color = Vector3(0.3, 0.3, 0.3)
+            settings.material.specular_weight = 0.0
+            settings.guiding = round > 0 and way == 1
+            settings.seed = (u32)(round + 1)
+            var renderer = try render.Renderer.create(device, &scene, settings)
+            defer renderer.destroy()
+            try renderer.finish()
+            let slot = 0 if round == 0 else 1 + way
+            try renderer.read(images[slot * size..<(slot + 1) * size])
+        if round == 0: continue
+        for p in 0..<(usize)(256 * 192):
+            let reference = (f64)images[p * 4 + 1]
+            for k in 0..<(usize)2:
+                let d = (f64)images[(k + 1) * size + p * 4 + 1] - reference
+                errors[k] += d * d
+    print(f"guiding: room MSE at 256 samples {errors[1]} guided against {errors[0]} unguided ({errors[0] / math.max(errors[1], 1e-30)}x better)")
+    assert(errors[1] < errors[0])
+
 func area_light(device: gpu.Device, spectral: bool) -> !:
     let floor = try MeshPrimitives.grid(20.0, 8)
     defer floor.release()
@@ -398,6 +464,9 @@ func hardware_agrees(device: gpu.Device) -> !:
     for build in 0..<(usize)2:
         var settings = render.RenderSettings.of(64, 48, 32)
         settings.software_bvh = build == 1
+        # Guiding's statistics gather by float atomics in any order, so it
+        # would make the two runs choose differently; this compares tracing.
+        settings.guiding = false
         try rendered(device, set.value(), settings, pixels[build * 64 * 48 * 4..<(build + 1) * 64 * 48 * 4])
     var hardware = Vector3()
     var software = Vector3()

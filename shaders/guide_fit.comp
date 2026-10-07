@@ -1,0 +1,35 @@
+#version 460
+// Fit each guiding cell's lobes to its statistics (shaders/guide.glsl): a
+// lobe's mean is its weighted mean direction, its kappa from the mean's length
+// by Banerjee et al.'s approximation, its weight its share of the cell's
+// weight. Statistics then decay, so the guide follows changes and old samples
+// fade (an exponential moving average over passes).
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+#include "common.glsl"
+#include "sampler.glsl"
+#include "guide.glsl"
+
+#define DECAY 0.9
+
+void main() {
+    uint cell = gl_GlobalInvocationID.x;
+    if (cell >= GUIDE_CELLS || guide_keys().keys[cell] == 0u) return;
+    GuideStats s = guide_stats();
+    GuideLobes l = guide_lobes();
+    vec4 weights = vec4(0.0);
+    for (uint k = 0u; k < GUIDE_LOBES; k++) {
+        uint at = (cell * GUIDE_LOBES + k) * 5u;
+        float w = s.stats[at];
+        vec3 sum = vec3(s.stats[at + 1u], s.stats[at + 2u], s.stats[at + 3u]);
+        if (w > 0.0 && dot(sum, sum) > 0.0) {
+            float r = clamp(length(sum) / w, 0.0, 0.999);
+            float kappa = clamp(r * (3.0 - r * r) / (1.0 - r * r), 0.1, 1000.0);
+            l.lobes[cell * (GUIDE_LOBES + 1u) + k] = vec4(normalize(sum), kappa);
+        }
+        weights[k] = w;
+        for (uint c = 0u; c < 5u; c++) s.stats[at + c] *= DECAY;
+    }
+    if (weights.x + weights.y + weights.z + weights.w > 0.0) l.lobes[cell * (GUIDE_LOBES + 1u) + GUIDE_LOBES] = weights;
+}

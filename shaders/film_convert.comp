@@ -4,6 +4,8 @@
 // show in `display`: exposed, in linear Rec.709 (sRGB's primaries), through the
 // view (0 standard: clipped; 1 Khronos PBR Neutral tone mapping).
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 8, local_size_y = 8) in;
 #include "common.glsl"
 layout(set = 0, binding = 8, rgba32f) writeonly uniform image2D image;

@@ -58,6 +58,20 @@ float blackbody(float lambda, float kelvin) {
     return r * r * r * r * r * (142.32492 / (exp(x) - 1.0));
 }
 
+// A Spec's luminance as the film sees it (Y), for path guiding.
+float spec_luminance(Spec s, vec4 lambda) {
+#if SPECTRAL
+    float sum = 0.0;
+    for (int i = 0; i < 4; i++) {
+        float pdf = wavelength_pdf(lambda[i]);
+        if (pdf > 0.0) sum += cmf(lambda[i]).y * (s[i] / pdf);
+    }
+    return sum * 0.25 / constants[K_CMF].y;
+#else
+    return dot(s.xyz, vec3(0.2722287168, 0.6740817658, 0.0536895174));
+#endif
+}
+
 // The largest lane: what Russian roulette weighs.
 float spec_max(Spec s) {
 #if SPECTRAL

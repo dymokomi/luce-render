@@ -54,12 +54,21 @@ pub struct RenderSettings:
     pub var adaptive_minimum: u32
     ## Time each kernel on the GPU (Renderer.kernel_times); a little slower.
     pub var profile: bool
+    ## Path guiding (shaders/guide.glsl): learn where light comes from and send
+    ## paths there. Off by default: in v1 it costs about 25% a sample and cuts
+    ## error about 1.2x in a room lit by bounced light, so it pays only where
+    ## indirect light is concentrated (docs/DESIGN.md).
+    pub var guiding: bool
 
     pub static func of(width: u32, height: u32, samples: u32) -> RenderSettings:
-        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false, 1024, 1024, 1024, 0.0, 0.0, 16, false)
+        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false, 1024, 1024, 1024, 0.0, 0.0, 16, false, false)
 
-let state_v_fields: usize = 10
-let state_u_fields: usize = 4
+let state_v_fields: usize = 13
+let state_u_fields: usize = 10
+## The guiding grid: 2^19 cells, each a key, 5 vec4s (4 lobes and their
+## weights) and 4 lobes' statistics of 5 floats (shaders/guide.glsl).
+let guide_cells: usize = 524288
+let guide_bytes: usize = guide_cells * (4 + 5 * 16 + 4 * 5 * 4)
 let queue_count: usize = 5
 let queue_base: usize = 32
 let constants_rows: usize = 16
@@ -98,6 +107,7 @@ struct Kernels:
     var finish: Kernel
     var film_convert: Kernel
     var adaptive: Kernel
+    var guide_fit: Kernel
 
     ## The build's kernels; intersection by hardware ray queries when `rays`.
     static func create(device: gpu.Device, spectral: bool, rays: bool) -> Kernels!:
@@ -118,8 +128,10 @@ struct Kernels:
             errdefer finish.kernel.destroy()
             var convert = try Kernel.create(device, film_convert_comp_words, film_convert_comp_msl, film_convert_comp_group, film_convert_comp_bindings)
             errdefer convert.kernel.destroy()
-            let adaptive = try Kernel.create(device, adaptive_comp_words, adaptive_comp_msl, adaptive_comp_group, adaptive_comp_bindings)
-            return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert, adaptive)
+            var adaptive = try Kernel.create(device, adaptive_comp_words, adaptive_comp_msl, adaptive_comp_group, adaptive_comp_bindings)
+            errdefer adaptive.kernel.destroy()
+            let fit = try Kernel.create(device, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
+            return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert, adaptive, fit)
         var camera = try Kernel.create(device, camera_rgb_comp_words, camera_rgb_comp_msl, camera_rgb_comp_group, camera_rgb_comp_bindings)
         errdefer camera.kernel.destroy()
         var schedule = try Kernel.create(device, schedule_rgb_comp_words, schedule_rgb_comp_msl, schedule_rgb_comp_group, schedule_rgb_comp_bindings)
@@ -136,8 +148,10 @@ struct Kernels:
         errdefer finish.kernel.destroy()
         var convert = try Kernel.create(device, film_convert_rgb_comp_words, film_convert_rgb_comp_msl, film_convert_rgb_comp_group, film_convert_rgb_comp_bindings)
         errdefer convert.kernel.destroy()
-        let adaptive = try Kernel.create(device, adaptive_rgb_comp_words, adaptive_rgb_comp_msl, adaptive_rgb_comp_group, adaptive_rgb_comp_bindings)
-        return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert, adaptive)
+        var adaptive = try Kernel.create(device, adaptive_rgb_comp_words, adaptive_rgb_comp_msl, adaptive_rgb_comp_group, adaptive_rgb_comp_bindings)
+        errdefer adaptive.kernel.destroy()
+        let fit = try Kernel.create(device, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
+        return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert, adaptive, fit)
 
     func destroy():
         self.camera.kernel.destroy()
@@ -149,6 +163,7 @@ struct Kernels:
         self.finish.kernel.destroy()
         self.film_convert.kernel.destroy()
         self.adaptive.kernel.destroy()
+        self.guide_fit.kernel.destroy()
 
 ## Intersection kernels serve both builds: they read no spectra.
 func intersect_kernel(device: gpu.Device, rays: bool) -> Kernel!:
@@ -169,6 +184,9 @@ pub struct Renderer:
     var materials: gpu.Buffer
     var tables: gpu.Buffer
     var emitters: gpu.Buffer
+    ## The path-guiding grid (guide.glsl), reached by its address.
+    var guide: gpu.Buffer
+    var guide_address: u64
     var state_v: gpu.Buffer
     var state_u: gpu.Buffer
     var queues: gpu.Buffer
@@ -231,7 +249,9 @@ pub struct Renderer:
         let total = distant_power + tree.energy
         let p_distant = (distant_power / total if total > 0.0 else 0.0) if tree.emitter_count > 0 else (1.0 if distant_power > 0.0 else 0.0)
         var rows: f32[64]
-        try fill_constants(rows, settings, light_count)
+        # A pixel's width at unit distance (perspective; orthographic cells
+        # grow with distance just the same, which is harmless).
+        try fill_constants(rows, settings, light_count, scene_radius(scene), frame.du.length())
         let tree_row: f64[4] = [(f64)tree.node_count(), (f64)node_offset, p_distant, (f64)tree.emitter_count]
         let offsets_row: f64[4] = [(f64)tree.links.count, (f64)(tree.links.count + tree.emitter_count * 4), 0.0, 0.0]
         for k in 0..<(usize)4:
@@ -250,6 +270,9 @@ pub struct Renderer:
         errdefer materials.destroy()
         var tables = try make_tables(device)
         errdefer tables.destroy()
+        var guide = try gpu.Buffer.allocate(device, guide_bytes)
+        errdefer guide.destroy()
+        let guide_address = try guide.address()
         var state_v = try gpu.Buffer.allocate(device, state_v_fields * slots * 16)
         errdefer state_v.destroy()
         var state_u = try gpu.Buffer.allocate(device, state_u_fields * slots * 4)
@@ -261,7 +284,7 @@ pub struct Renderer:
         var output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
         errdefer output.destroy()
         let shown = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
-        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, 8 if cutouts else 0, none, 0, 0, 0, Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, guide, guide_address, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, 8 if cutouts else 0, none, 0, 0, 0, Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     ## Start the next pass if the last has finished. True while there is work,
     ## running or to come; false once every sample is in the image.
@@ -283,7 +306,7 @@ pub struct Renderer:
             self.display_stale = false
             var convert = try gpu.Compute.begin(self.device)
             errdefer convert.close()
-            var block: u8[96]
+            var block: u8[104]
             var frame: f32[16]
             try self.frame.pack(frame)
             memory.copy(block[0..<64], u8[]((u8*)&frame[0], 64), 64)
@@ -367,7 +390,7 @@ pub struct Renderer:
         let start = self.band * self.pool
         let remaining = self.pixels() - start
         let count = self.pool if self.pool < remaining else remaining
-        var block: u8[96]
+        var block: u8[104]
         var frame: f32[16]
         try self.frame.pack(frame)
         memory.copy(block[0..<64], u8[]((u8*)&frame[0], 64), 64)
@@ -387,6 +410,8 @@ pub struct Renderer:
             try self.dispatch(pass, &self.kernels.schedule, block, start, count, current, 2, 1, 1)
             try self.indirect(pass, &self.kernels.intersect_shadow, block, start, count, current, 4)
         try self.dispatch(pass, &self.kernels.finish, block, start, count, 0, 0, groups, 1)
+        if self.settings.guiding:
+            try self.dispatch(pass, &self.kernels.guide_fit, block, start, count, 0, 0, (u32)(guide_cells // 64), 1)
         # After the last band of every 4th sample past the minimum, check which
         # pixels have converged.
         let bands = (self.pixels() + self.pool - 1) // self.pool
@@ -402,6 +427,7 @@ pub struct Renderer:
     func uniforms(block: u8[], start: usize, count: usize, current: u32, phase: u32):
         let values: u32[8] = [(u32)start, (u32)count, self.sample, 0, current, phase, (u32)self.pool, self.settings.seed]
         for at in 0..<(usize)8: memory.write[u32]((void*)&block[64 + at * 4], values[at])
+        memory.write[u64]((void*)&block[96], self.guide_address)
 
     func bindings(kernel: const Kernel*) -> gpu.Binding[16]:
         var all: gpu.Binding[16] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
@@ -464,6 +490,7 @@ pub struct Renderer:
         self.materials.destroy()
         self.tables.destroy()
         self.emitters.destroy()
+        self.guide.destroy()
         self.state_v.destroy()
         self.state_u.destroy()
         self.queues.destroy()
@@ -509,7 +536,7 @@ func scene_radius(scene: const CompiledScene*) -> f64:
     return math.max(1.0, 0.5 * d.length())
 
 ## Constants rows (shaders/common.glsl K_*), 16 vec4s.
-func fill_constants(rows: f32[], settings: RenderSettings, light_count: usize) -> !:
+func fill_constants(rows: f32[], settings: RenderSettings, light_count: usize, radius: f64, footprint: f64) -> !:
     for at in 0..<rows.length: rows[at] = 0.0
     let film = film_matrix()
     let integrals = cmf_integrals()
@@ -524,4 +551,9 @@ func fill_constants(rows: f32[], settings: RenderSettings, light_count: usize) -
                            (f64)settings.diffuse_bounces, (f64)settings.glossy_bounces, (f64)settings.transmission_bounces, 0.0]
     rows[44] = (f32)settings.noise_threshold
     rows[45] = (f32)settings.adaptive_minimum
+    # Guiding: on, the cell width per unit of distance from the camera (8
+    # pixels' footprint), the guide's share of samples where trained, the
+    # samples that train a cell; and the smallest cell.
+    let guide_row: f64[5] = [1.0 if settings.guiding else 0.0, 8.0 * footprint, 0.5, 16.0, radius * 1e-4]
+    for k in 0..<(usize)5: rows[48 + k] = (f32)guide_row[k]
     for at in 0..<(usize)32: rows[at] = (f32)values[at]

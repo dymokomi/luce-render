@@ -190,9 +190,31 @@ GPU tests check it against closed forms or self-consistency:
 
 **Speed:** about 9 ms a 1080p spectral sample at 12 bounces on an M4 Max.
 
+Since then:
+
+- **Adaptive sampling:** Cycles' half-buffer metric with a 3 × 3 widened
+  stop.
+- **Cut-out shadows.**
+- **Per-kernel GPU timings.**
+- **Path guiding v1** (shaders/guide.glsl), after REALTIME-STUDY §3.1:
+  - a world-space hash grid of 4-lobe vMF mixtures, with cells sized by the
+    camera footprint;
+  - trained on cosine-weighted incident luminance from each path's first
+    vertices, fitted once a pass;
+  - one-sample MIS with the BSDF, with Russian roulette on the unguided
+    throughput.
+
+  It is off by default. In a room lit by a ceiling spot it cuts error 1.22× at
+  equal samples, and costs about 25% a sample (2.5 ms at 1080p). Making it pay
+  everywhere comes next:
+  - cheaper training: subgroup-aggregated atomics, or a fraction of paths once
+    the fit is stable;
+  - soft EM, product with the BSDF, MI reweighting of training passes, and
+    illumination-aware cells.
+
 Next:
 
-- Adaptive sampling and a denoiser.
+- A denoiser.
 - Transparent shadows through glass and cut-outs.
 - Instancing as a BLAS per prototype.
 - Workgroup-aggregated queue appends and per-kernel timings.

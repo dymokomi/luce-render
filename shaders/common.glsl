@@ -31,6 +31,7 @@ layout(push_constant) uniform Params {
     uint phase;         // schedule's step
     uint pool;          // path slots: the stride of every state field
     uint seed;
+    uint64_t guide;     // the path-guiding grid's address (guide.glsl)
 } params;
 
 #include "scene.glsl"
@@ -74,13 +75,20 @@ layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[
 #define SV_SHADOW_DIRECTION 6u
 #define SV_SHADOW_RADIANCE 7u
 #define SV_HIT 8u           // t, -, barycentrics u, v
-#define SV_VERTEX 9u        // the last scattering point (origins move on through cut-outs; MIS pdfs are from here)
+#define SV_VERTEX 9u        // the last scattering point (origins move on through cut-outs; MIS pdfs are from here);
+                            // w: unguided over guided throughput, which Russian roulette weighs (guiding must not change survival)
+// Path guiding's ring of the first vertices (guide.glsl): pdf, throughput
+// luminance after the vertex, luminance found before it, |cos| of the sampled
+// direction; and cell, direction.
+#define SV_GUIDE(k) (10u + (k))
 #define SU_PIXEL 0u
 #define SU_BOUNCE 1u        // bounces so far: total, diffuse, glossy, transmission (a byte each)
 // What was hit: a triangle or LIGHT_HIT | light. Kept as an integer: bits stored
 // in a float can be denormals, which Metal flushes to zero.
 #define SU_HIT 2u
 #define SU_NORMAL 3u        // the previous vertex's shading normal (octahedral), for the light tree's MIS pdf
+#define SU_GUIDE_CELL(k) (4u + (k))
+#define SU_GUIDE_DIRECTION(k) (7u + (k))
 
 vec4 get_v(uint field, uint path) { return state_v[field * params.pool + path]; }
 void set_v(uint field, uint path, vec4 value) { state_v[field * params.pool + path] = value; }
@@ -124,6 +132,20 @@ float power_heuristic(float a, float b) {
 vec3 offset_origin(vec3 p, vec3 n) {
     float scale = max(1.0, max(abs(p.x), max(abs(p.y), abs(p.z))));
     return p + n * (1e-4 * scale);
+}
+
+// Unit vectors as two snorm16 octahedral coordinates.
+uint octahedral_encode(vec3 n) {
+    vec2 p = n.xy / (abs(n.x) + abs(n.y) + abs(n.z));
+    if (n.z < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return packSnorm2x16(p);
+}
+
+vec3 octahedral_decode(uint packed) {
+    vec2 p = unpackSnorm2x16(packed);
+    vec3 n = vec3(p, 1.0 - abs(p.x) - abs(p.y));
+    if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return normalize(n);
 }
 
 // An orthonormal basis around n (Duff et al. 2017).

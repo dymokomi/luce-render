@@ -7,6 +7,8 @@
 //
 // Materials are OpenPBR (shaders/openpbr.glsl).
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 64) in;
 #include "common.glsl"
 #include "sampler.glsl"
@@ -15,6 +17,7 @@ layout(local_size_x = 64) in;
 #include "microfacet.glsl"
 #include "openpbr.glsl"
 #include "lighttree.glsl"
+#include "guide.glsl"
 
 vec3 point_of(uint index) {
     return vec3(positions[index * 3u], positions[index * 3u + 1u], positions[index * 3u + 2u]);
@@ -49,7 +52,8 @@ void main() {
 
     // Lights and emitters are weighed from the last scattering point, which
     // passes through cut-outs leave in place.
-    vec3 vertex = get_v(SV_VERTEX, path).xyz;
+    vec4 vertex_row = get_v(SV_VERTEX, path);
+    vec3 vertex = vertex_row.xyz;
     if ((what & LIGHT_HIT) != 0u) {
         uint light = what & ~LIGHT_HIT;
         float weight = 1.0;
@@ -114,9 +118,23 @@ void main() {
     // light (by power), or an emitter of the light tree (by importance at this
     // point and normal).
     vec3 from = offset_origin(p, geometric);
+
+    // Path guiding: in a trained cell, BSDF sampling becomes a one-sample mix
+    // of the guide (share `guided`) and the BSDF; every pdf is the mixture's.
+    // Not at transmissive or mirror-like vertices: their lobes are too sharp
+    // for a guide to help.
+    uint cell = NONE;
+    float guided = 0.0;
+    if (guiding() && total < GUIDE_RING) {
+        cell = guide_cell(p, geometric);
+        bool suited = !surface.inside && surface.p_transmission <= 0.0 && (surface.p_diffuse > 0.05 || min(surface.alpha.x, surface.alpha.y) > 0.1);
+        if (cell != NONE && suited && guide_count(cell) >= constants[K_GUIDE].w) guided = constants[K_GUIDE].z;
+    }
+
     vec4 u_light = sample4(pixel, params.sample_index, GROUP_LIGHT(total));
     float p_distant = constants[K_TREE].z;
     LightSample s;
+    bool pushed_shadow = false;
     Spec emitted = Spec(0.0);
     float chance = 0.0;
     bool sampled = false;
@@ -148,6 +166,7 @@ void main() {
         if ((side > 0.0) == (wi.z > 0.0) && (side > 0.0 || surface.p_transmission > 0.0)) {
             float bsdf_pdf;
             Spec f = evaluate_surface(surface, wi, wo, bsdf_pdf);
+            if (guided > 0.0) bsdf_pdf = guided * guide_pdf(cell, s.direction) + (1.0 - guided) * bsdf_pdf;
             if (bsdf_pdf > 0.0) {
                 float light_pdf = s.pdf * chance;
                 float weight = s.delta ? 1.0 : power_heuristic(light_pdf, bsdf_pdf);
@@ -162,17 +181,38 @@ void main() {
                 set_v(SV_SHADOW_DIRECTION, path, vec4(s.direction, 0.0));
                 set_v(SV_SHADOW_RADIANCE, path, contribution);
                 queue_push(Q_SHADOW, path);
+                pushed_shadow = true;
             }
         }
     }
 
-    // One BSDF sample.
+    // One BSDF sample, or a guide sample.
     vec4 u = sample4(pixel, params.sample_index, GROUP_BSDF(total));
     vec3 wi;
     Spec weight;
     float pdf;
     uint lobe;
-    if (!sample_surface(surface, wo, u.xyw, wi, weight, pdf, lobe)) return;
+    // The unguided throughput's ratio to the guided one: f cos / p_bsdf against
+    // f cos / p_mixture.
+    float unguided = 1.0;
+    if (u_opacity.y < guided) {
+        wi = to_local(surface, guide_sample(cell, vec3(u_opacity.zw, u.w)));
+        float bsdf_pdf;
+        Spec f = evaluate_surface(surface, wi, wo, bsdf_pdf);
+        pdf = guided * guide_pdf(cell, to_world(surface, wi)) + (1.0 - guided) * bsdf_pdf;
+        if (pdf <= 0.0 || spec_max(f) <= 0.0) return;
+        unguided = pdf / max(bsdf_pdf, 1e-6 * pdf);
+        weight = f * (abs(wi.z) / pdf);
+        lobe = wi.z < 0.0 ? LOBE_TRANSMISSION : (surface.p_diffuse > 0.5 ? LOBE_DIFFUSE : LOBE_GLOSSY);
+    } else {
+        if (!sample_surface(surface, wo, u.xyw, wi, weight, pdf, lobe)) return;
+        if (guided > 0.0) {
+            float mixed = guided * guide_pdf(cell, to_world(surface, wi)) + (1.0 - guided) * pdf;
+            unguided = mixed / pdf;
+            weight *= pdf / mixed;
+            pdf = mixed;
+        }
+    }
     vec3 direction = to_world(surface, wi);
     // A shading normal can send a ray to the wrong side of the true surface.
     float side = dot(direction, geometric);
@@ -180,18 +220,28 @@ void main() {
     bounces = next_bounce(bounces, lobe);
     if (bounces == NONE) return;
     throughput *= weight;
+    float survival_scale = min(vertex_row.w * unguided, 1e6);
     if (total + 1u >= 3u) {
-        float survive = min(0.95, spec_max(throughput));
+        float survive = min(0.95, spec_max(throughput) * survival_scale);
         if (u.z >= survive) return;
         throughput /= survive;
     }
     set_u(SU_BOUNCE, path, bounces);
     set_u(SU_NORMAL, path, octahedral_encode(normal));
+    // Path guiding learns from this vertex what arrives along `direction`.
+    if (guiding() && total < GUIDE_RING) {
+        if (cell == NONE) cell = guide_cell(p, geometric);
+        set_u(SU_GUIDE_CELL(total), path, cell);
+        set_u(SU_GUIDE_DIRECTION(total), path, octahedral_encode(direction));
+        float found = spec_luminance(get_v(SV_RADIANCE, path), lambda) + spec_luminance(get_v(SV_SHADOW_RADIANCE, path), lambda) * (pushed_shadow ? 1.0 : 0.0);
+        set_v(SV_GUIDE(total), path, vec4(pdf, spec_luminance(throughput, lambda), found, abs(dot(direction, normal))));
+        if (total + 1u < GUIDE_RING) set_u(SU_GUIDE_CELL(total + 1u), path, NONE);
+    }
     // From `from` on the reflecting side: the point the light tree weighed, so
     // an emitter hit's MIS pdf matches the light sample's.
     vec3 next = side > 0.0 ? from : offset_origin(p, -geometric);
     set_v(SV_ORIGIN, path, vec4(next, 0.0));
-    set_v(SV_VERTEX, path, vec4(next, 0.0));
+    set_v(SV_VERTEX, path, vec4(next, survival_scale));
     set_v(SV_DIRECTION, path, vec4(direction, pdf));
     set_v(SV_THROUGHPUT, path, throughput);
     queue_push(Q_CLOSEST + 1u - params.current, path);

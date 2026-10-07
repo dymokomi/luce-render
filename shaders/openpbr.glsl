@@ -37,19 +37,6 @@ Spec material_color(uint material, uint row, vec4 lambda) {
     return spec_of(material_at(material, row), material_at(material, row + 1u).xyz, lambda);
 }
 
-uint octahedral_encode(vec3 n) {
-    vec2 p = n.xy / (abs(n.x) + abs(n.y) + abs(n.z));
-    if (n.z < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
-    return packSnorm2x16(p);
-}
-
-vec3 octahedral_decode(uint packed) {
-    vec2 p = unpackSnorm2x16(packed);
-    vec3 n = vec3(p, 1.0 - abs(p.x) - abs(p.y));
-    if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
-    return normalize(n);
-}
-
 vec3 previous_normal(uint path) { return octahedral_decode(get_u(SU_NORMAL, path)); }
 
 // -- EON diffuse.
@@ -195,6 +182,9 @@ void prepare_surface(inout Surface s, vec3 wo, vec4 lambda) {
     s.specular_tint = s.metal_tint * s.specular_weight;
     s.transmission = clamp(transmission_rgb.w, 0.0, 1.0);
     s.transmission_tint = material_color(m, 8u, lambda);
+    // Only a transmissive material has an inside; any other back face shades
+    // like its front (a closed room's walls, seen from within).
+    s.inside = s.inside && s.transmission > 0.0;
     // The coat (none from inside an object: its layers face the outside).
     s.coat = s.inside ? 0.0 : clamp(coat_rgb.w, 0.0, 1.0);
     float coat_roughness = clamp(indices.y, 0.0, 1.0);

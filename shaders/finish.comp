@@ -1,9 +1,14 @@
 #version 450
-// The band's paths into the film: one sample per pixel per pass, so no atomics.
+// The band's paths into the film: one sample per pixel per pass, so no atomics;
+// and the path guide's training samples.
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 64) in;
 #include "common.glsl"
 #include "spectrum.glsl"
+#include "sampler.glsl"
+#include "guide.glsl"
 
 void main() {
     uint path = gl_GlobalInvocationID.x;
@@ -16,4 +21,19 @@ void main() {
     film[pixel] += vec4(value, 1.0);
     // Adaptive sampling's second estimate: every other sample, twice.
     if ((params.sample_index & 1u) == 1u) film[film_pixels() + pixel] += vec4(2.0 * value, 0.0);
+    // Path guiding: each of the first vertices learns the luminance that
+    // arrived along its sampled direction: what the path found after it,
+    // divided by the throughput carrying it there.
+    if (guiding() && hash_u32(pixel * 9781u + params.sample_index) % GUIDE_TRAINING == 0u) {
+        float found = spec_luminance(get_v(SV_RADIANCE, path), get_v(SV_LAMBDA, path));
+        for (uint k = 0u; k < GUIDE_RING; k++) {
+            uint cell = get_u(SU_GUIDE_CELL(k), path);
+            if (cell == NONE) break;
+            vec4 v = get_v(SV_GUIDE(k), path);
+            if (v.y <= 0.0) continue;
+            vec3 direction = octahedral_decode(get_u(SU_GUIDE_DIRECTION(k), path));
+            // The product of incident radiance and the cosine at the vertex.
+            guide_train(cell, direction, max(0.0, found - v.z) / v.y * v.w, v.x);
+        }
+    }
 }

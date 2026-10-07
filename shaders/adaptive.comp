@@ -8,6 +8,8 @@
 //   phase 1: a pixel is converged when its whole 3 × 3 neighbourhood is, so
 //            noise at a converged pixel's edge keeps it sampling
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 8, local_size_y = 8) in;
 #include "common.glsl"
 
