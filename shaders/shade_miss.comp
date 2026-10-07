@@ -32,7 +32,13 @@ void work() {
         if (bounce == 0u) {
             if (!light_visible(light)) continue;
         } else if (ray.w > 0.0) {
-            weight = power_heuristic(ray.w, light_hit_pdf(light, vec3(0.0), ray.xyz, INFINITY) * light_select_pdf(light));  // a direction's pdf: no origin needed
+            // A direction's pdf: no origin needed. With light tracing, paths
+            // from this light's disk weigh in too (lights.glsl).
+            float traced = 0.0;
+            vec4 mis = get_v(SV_MIS, path);
+            if (light_tracing() && emits_from_afar(light) && mis.y > 0.0)
+                traced = mis.x * (afar_first_density(get_v(SV_VERTEX, path).xyz, ray.xyz, mis.z) / mis.y) * (afar_emission_pdf(light, ray.xyz) / ray.w);
+            weight = mis_weight(light_hit_pdf(light, vec3(0.0), ray.xyz, INFINITY) * light_select_pdf(light) / ray.w, traced);
         }
         radiance += (type == LIGHT_DOME ? dome_radiance(light, ray.xyz, lambda) : light_radiance(light, lambda)) * weight;
     }

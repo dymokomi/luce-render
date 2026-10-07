@@ -16,8 +16,10 @@
 // prepared for the direction the camera arrived from; a light vertex's from
 // light_lobes, whose lobe choice holds for every direction (light_sampler_pdf).
 //
-// Light paths ignore distant lights and the background (their s0/s1 paths have
-// no t1 to weigh against), orthographic cameras take no light paths, and light
+// Light paths also start from domes and distant lights with a size (lights.glsl:
+// a direction by the light's own distribution, a point on a disk facing it);
+// delta distant lights and the background start none (their s0/s1 paths have
+// no t1 to weigh against). Orthographic cameras take no light paths, and light
 // paths count only the total bounce limit's reach.
 // Needs common.glsl, lights.glsl, openpbr.glsl and lighttree.glsl before it.
 
@@ -55,14 +57,6 @@ float light_sampler_pdf(Surface s, vec3 from, vec3 to) {
     if (!same_side) read_material(v);
     light_lobes(v);
     return surface_pdf(v, wi, wo);
-}
-
-// The power heuristic's weight for a technique, from the other two's
-// densities over its own; safe for infinite ratios.
-float mis_weight(float a, float b) {
-    a = min(a, 1e18);
-    b = min(b, 1e18);
-    return 1.0 / (1.0 + a * a + b * b);
 }
 
 // Light emission: an emitter's chance of starting a light path (its power over
@@ -121,6 +115,8 @@ bool emitter_by_power(float u, out uint emitter, out float pdf) {
 // leaving it at |cos| `c` to its normal (cosine-weighted; both sides of an
 // emissive triangle).
 float emitter_area_pdf(uint emitter) {
+    // Emitters of the tree share light paths with lights from afar.
+    float finite = 1.0 - constants[K_EMIT].x;
     uint code = emitter_code(emitter);
     float area;
     if ((code & EMITTER_TRIANGLE) != 0u) {
@@ -133,7 +129,7 @@ float emitter_area_pdf(uint emitter) {
     } else {
         area = light_at(code, 3u).w;
     }
-    return area > 0.0 ? emitter_power_pdf(emitter) / area : 0.0;
+    return area > 0.0 ? finite * emitter_power_pdf(emitter) / area : 0.0;
 }
 
 float emission_direction_pdf(uint emitter, float c) {

@@ -169,6 +169,9 @@ void set_u(uint field, uint path, uint value) { state_u[field * params.pool + pa
 // their numbers as pixels past any image's.
 bool is_light_path(uint path) { return path >= params.band_count; }
 #define LIGHT_PATH_ID(path) (0x80000000u | (path))
+// A light path's emitter (SU_PIXEL) when it started at a dome or distant
+// light: the light's index with this flag.
+#define AFAR_EMITTER 0x40000000u
 
 uint queue_count(uint queue) { return queues[queue]; }
 
@@ -224,6 +227,14 @@ uint next_bounce(uint bounces, uint lobe) {
     uint kind = ((bounces >> shift) & 0xffu) + 1u;
     if (float(kind) > constants[K_LIMITS][lobe] || bounce_total(bounces) >= 255u) return NONE;
     return (bounces & ~(0xffu << shift)) + (kind << shift) + 1u;
+}
+
+// The power heuristic's weight for a technique, from the other two's
+// densities over its own; safe for infinite ratios.
+float mis_weight(float a, float b) {
+    a = min(a, 1e18);
+    b = min(b, 1e18);
+    return 1.0 / (1.0 + a * a + b * b);
 }
 
 float power_heuristic(float a, float b) {

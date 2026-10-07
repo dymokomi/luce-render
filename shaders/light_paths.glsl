@@ -9,11 +9,16 @@
 // and the total bounce limit end it. Needs what shade_surface includes.
 
 // The light sample a camera path at this point would take toward the light
-// path's first point x0 (emitter `emitter`), over its BSDF pdf `bsdf_pdf` toward
-// it; the surface `s` faces the camera path's side.
-float light_sample_ratio(uint emitter, Surface s, vec3 p, vec3 x0, float bsdf_pdf) {
+// path's first point x0 (emitter `emitter`; for a light from afar, along
+// `toward`), over its BSDF pdf `bsdf_pdf` toward it; the surface `s` faces the
+// camera path's side.
+float light_sample_ratio(uint emitter, Surface s, vec3 p, vec3 x0, vec3 toward, float bsdf_pdf) {
     if (!(bsdf_pdf > 0.0)) return 0.0;
     vec3 from = offset_origin(p, s.geometric);
+    if ((emitter & AFAR_EMITTER) != 0u) {
+        uint light = emitter & ~AFAR_EMITTER;
+        return light_select_pdf(light) * light_hit_pdf(light, from, toward, INFINITY) / bsdf_pdf;
+    }
     vec3 offset = x0 - from;
     float reach = length(offset);
     vec3 d = offset / reach;
@@ -71,6 +76,13 @@ void shade_light(uint path) {
     float cos_in = abs(dot(ray.xyz, geometric));
     float density = ray.w * cos_in / (reach * reach);
     float back_reach = mis.z / (reach * reach);
+    // The first surface of a path from afar: its density on the disk's
+    // shadow, and the light's "point" is a direction (no distance to convert).
+    if (total == 0u && (emitter & AFAR_EMITTER) != 0u) {
+        density = afar_first_density(p, -ray.xyz, cos_in);
+        back_reach = 1.0;
+        if (!(density > 0.0)) return;
+    }
     // Light arriving on a shading normal's far side cannot be shaded.
     float cos_shading_in = dot(toward_light, normal);
     if (cos_shading_in <= 0.0 || cos_in < 1e-6) return;
@@ -98,7 +110,7 @@ void shade_light(uint path) {
                 // The camera techniques' densities over this one's.
                 float last = mis.y > 0.0 ? camera_bsdf_pdf * back_reach / mis.y : 0.0;
                 float ratio = mis.x * last * camera_density / density;
-                float sample_ratio = total == 0u ? light_sample_ratio(emitter, seen, p, x_last, camera_bsdf_pdf) : max(mis.w, 0.0);
+                float sample_ratio = total == 0u ? light_sample_ratio(emitter, seen, p, x_last, toward_light, camera_bsdf_pdf) : max(mis.w, 0.0);
                 float weight = mis_weight(ratio / light_paths(), ratio * sample_ratio / light_paths());
                 float margin = 4e-4 * max(1.0, max(abs(p.x), max(abs(p.y), abs(p.z))));
                 set_v(SV_SHADOW_ORIGIN, path, vec4(offset_origin(p, seen.geometric), max(0.0, camera_distance - margin)));
@@ -145,7 +157,7 @@ void shade_light(uint path) {
     if (!(spec_max(throughput) > 0.0)) return;
     // Settle the last vertex's factor; the light sample's ratio at the first.
     float last = mis.y > 0.0 ? camera_bsdf_pdf * back_reach / mis.y : 0.0;
-    float sample_ratio = total == 0u ? light_sample_ratio(emitter, seen, p, x_last, camera_bsdf_pdf) : mis.w;
+    float sample_ratio = total == 0u ? light_sample_ratio(emitter, seen, p, x_last, toward_light, camera_bsdf_pdf) : mis.w;
     set_u(SU_BOUNCE, path, bounces);
     set_v(SV_ORIGIN, path, vec4(offset_origin(p, side > 0.0 ? geometric : -geometric), 0.0));
     set_v(SV_VERTEX, path, vec4(p, survival_scale));

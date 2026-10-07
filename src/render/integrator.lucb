@@ -314,8 +314,20 @@ pub struct Renderer:
         # The camera: light paths a sample (at most a band's; they take the
         # pool's slots after the band's camera paths), the image plane's pixel
         # area at unit distance, the lens, the camera's axis.
+        # Domes and distant lights with a size start light paths too, on a disk
+        # around what casts caustics (shaders/lights.glsl), sharing them with
+        # the tree's emitters by power.
+        let (focus, focus_radius, casters) = caster_bounds(scene, library.view())
+        var afar = false
+        for index in 0..<light_count:
+            let kind = packed.items[index * light_stride * 4 + 3]
+            if kind == 4.0 or (kind == 3.0 and packed.items[index * light_stride * 4 + 11] < 1.0 - 1e-7): afar = casters
+        let afar_power = distant_power * (focus_radius / scene_radius(scene)) * (focus_radius / scene_radius(scene)) if afar else 0.0
+        let afar_share = afar_power / (afar_power + tree.energy) if afar_power + tree.energy > 0.0 else 0.0
+        let emit_rows: f64[8] = [afar_share, focus_radius, 0.0, 0.0, focus.x, focus.y, focus.z, 0.0]
+        for k in 0..<(usize)8: rows[84 + k] = (f32)emit_rows[k]
         var light_paths: usize = 0
-        if settings.light_tracing > 0.0 and not frame.orthographic and tree.emitter_count > 0:
+        if settings.light_tracing > 0.0 and not frame.orthographic and (tree.emitter_count > 0 or afar):
             let wanted = (usize)math.max(1.0, math.round(settings.light_tracing * (f64)pixels))
             light_paths = wanted if wanted < band else band
         let slots = band + light_paths
@@ -635,6 +647,35 @@ func find_camera(scene: const CompiledScene*, index: i64) -> usize!:
     for at in 0..<scene.objects.count():
         if scene.objects.object(at).kind == SceneKind.camera: return at
     error(invalid, "the scene has no camera")
+
+## Whether a material casts caustics: it refracts, or reflects sharply
+## enough (metal, glossy specular or a clear coat) to focus light.
+func casts_caustics(material: const OpenPbr*) -> bool:
+    if material.transmission_weight > 0.0: return true
+    if material.base_metalness > 0.0 and material.specular_roughness < 0.3: return true
+    if material.coat_weight > 0.0 and material.coat_roughness < 0.3: return true
+    return material.specular_weight > 0.0 and material.specular_roughness < 0.1
+
+## The sphere around the triangles that cast caustics, where light paths
+## from afar start toward (shaders/lights.glsl): light from a dome or the sun
+## needs light paths for what glass and mirrors focus, and only there. False
+## when nothing casts.
+func caster_bounds(scene: const CompiledScene*, library: const OpenPbr[]) -> (Vector3, f64, bool):
+    var lo = Vector3(1e30, 1e30, 1e30)
+    var hi = Vector3(-1e30, -1e30, -1e30)
+    var any = false
+    let p = scene.positions.view()
+    for triangle in 0..<scene.triangle_count():
+        let material = (usize)scene.shading.items[triangle * 4 + 3]
+        if material >= library.length or not casts_caustics(&library[material]): continue
+        for corner in 0..<(usize)3:
+            let at = (usize)scene.indices.items[triangle * 3 + corner] * 3
+            let point = Vector3((f64)p[at], (f64)p[at + 1], (f64)p[at + 2])
+            lo = Vector3(math.min(lo.x, point.x), math.min(lo.y, point.y), math.min(lo.z, point.z))
+            hi = Vector3(math.max(hi.x, point.x), math.max(hi.y, point.y), math.max(hi.z, point.z))
+        any = true
+    if not any: return (Vector3(), 1.0, false)
+    return (lo.add(hi).multiply_scalar(0.5), math.max(1e-3, 0.5 * hi.subtract(lo).length()), true)
 
 ## Half the diagonal of the triangles' bounds (1 for an empty scene).
 func scene_radius(scene: const CompiledScene*) -> f64:

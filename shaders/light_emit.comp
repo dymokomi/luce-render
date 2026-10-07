@@ -1,6 +1,7 @@
 #version 450
 // Start the sample's light paths (connect.glsl), in the pool after the band's
-// camera paths, after the camera kernel: an emitter chosen by power, a
+// camera paths, after the camera kernel: from a dome or distant light (by
+// their share, K_EMIT) on a disk facing it, or from an emitter chosen by power, a
 // point on it uniformly by area, a cosine-weighted direction (either side of an
 // emissive triangle), four wavelengths; queued for the first closest hit.
 #extension GL_GOOGLE_include_directive : require
@@ -22,14 +23,48 @@ void work() {
     uint path = params.band_count + gl_GlobalInvocationID.x;
     vec4 u_point = sample4(LIGHT_PATH_ID(path), params.sample_index, GROUP_CAMERA);
     vec4 u_pick = sample4(LIGHT_PATH_ID(path), params.sample_index, GROUP_WAVELENGTH);
-    uint emitter;
-    float chance;
-    if (!emitter_by_power(u_pick.y, emitter, chance)) return;
 #if SPECTRAL
     vec4 lambda = sample_wavelengths(u_pick.x);
 #else
     vec4 lambda = vec4(0.0);
 #endif
+    // From afar: a direction by the light's distribution, a point on the disk
+    // facing it (radius R about K_EMIT_CENTER), toward the scene.
+    float afar = constants[K_EMIT].x;
+    if (u_pick.y < afar) {
+        float share;
+        uint light = pick_distant(u_pick.y / afar, share);
+        if (light == NONE || share <= 0.0 || !emits_from_afar(light)) return;
+        LightSample s;
+        if (!sample_light(light, vec3(0.0), u_point.xy, s)) return;
+        vec3 w = s.direction;
+        float radius = constants[K_EMIT].y;
+        vec3 t, b;
+        basis(w, t, b);
+        vec2 disk = concentric(u_point.zw) * radius;
+        vec3 start = constants[K_EMIT_CENTER].xyz + w * (2.0 * radius) + t * disk.x + b * disk.y;
+        float chance = afar * share * s.pdf;
+        Spec emitted = light_type(light) == LIGHT_DOME ? dome_radiance(light, w, lambda) : light_radiance(light, lambda);
+        Spec carried = emitted * (PI * radius * radius / chance);
+        float most = spec_max(carried);
+        if (!(most > 0.0)) return;
+        set_u(SU_PIXEL, path, AFAR_EMITTER | light);
+        set_u(SU_BOUNCE, path, 0u);
+        set_v(SV_ORIGIN, path, vec4(start, 0.0));
+        set_v(SV_DIRECTION, path, vec4(-w, 0.0));
+        set_v(SV_THROUGHPUT, path, carried);
+        set_v(SV_LAMBDA, path, lambda);
+        set_v(SV_VERTEX, path, vec4(start, 1.0 / most));
+        // The light "point" is a direction: its density is the chance, and the
+        // camera's density of it is its BSDF pdf alone (back_reach 1).
+        set_v(SV_MIS, path, vec4(1.0, chance, 1.0, -1.0));
+        queue_push(Q_CLOSEST, path);
+        return;
+    }
+    uint emitter;
+    float chance;
+    if (!emitter_by_power((u_pick.y - afar) / max(1e-7, 1.0 - afar), emitter, chance)) return;
+    chance *= 1.0 - afar;
     uint code = emitter_code(emitter);
     vec3 q;
     vec3 n;

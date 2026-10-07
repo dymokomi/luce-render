@@ -280,3 +280,29 @@ float light_hit_pdf(uint light, vec3 o, vec3 d, float t) {
     }
     return pdf;
 }
+
+// -- Light paths from afar (connect.glsl): domes and distant lights with a size
+// start light paths on a disk facing them, centred on what the camera sees.
+
+#define K_EMIT 21           // x the chance a light path starts at a distant or dome light, y the disk's radius
+#define K_EMIT_CENTER 22    // the disk's center
+
+bool emits_from_afar(uint light) {
+    uint type = light_type(light);
+    return type == LIGHT_DOME || (type == LIGHT_DISTANT && light_at(light, 2u).w < 1.0 - 1e-7);
+}
+
+// The chance a light path leaves light `light` along -w (w toward the light).
+float afar_emission_pdf(uint light, vec3 w) {
+    return constants[K_EMIT].x * light_at(light, 6u).y * light_hit_pdf(light, vec3(0.0), w, INFINITY);
+}
+
+// The area density of a light path's first surface p (|cos| `c` there to w)
+// past the disk the path started on: zero where p lies outside its shadow.
+float afar_first_density(vec3 p, vec3 w, float c) {
+    float radius = constants[K_EMIT].y;
+    vec3 offset = p - constants[K_EMIT_CENTER].xyz;
+    vec3 across = offset - w * dot(offset, w);
+    if (dot(across, across) > radius * radius) return 0.0;
+    return c / (PI * radius * radius);
+}
