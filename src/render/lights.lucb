@@ -88,7 +88,8 @@ pub func pack_lights(objects: const SceneObjects*, radius: f64, out: Growing[f32
         # A dome's power: what a sphere of its mean radiance pours into the
         # scene's disk (π × the mean, as irradiance, over π r²).
         var power = -1.0
-        if kind == 3.0: power = math.max(0.0, luminance(rgb)) * math.pi * radius * radius
+        # A distant light's radiance is its irradiance over its solid angle.
+        if kind == 3.0: power = math.max(0.0, luminance(rgb)) * (2.0 * math.pi * (1.0 - cos_half) if cos_half < 1.0 - 1e-7 else 1.0) * math.pi * radius * radius
         if kind == 4.0:
             var mean: f64 = 1.0
             if let image = environment:
