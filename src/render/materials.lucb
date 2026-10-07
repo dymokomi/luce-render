@@ -1,0 +1,66 @@
+#==============================================================================================
+#
+#   render/materials - OpenPBR Surface parameters in the kernels' records
+#
+#   DESCRIPTION:
+#       OpenPbr holds the parameters of OpenPBR Surface 1.1 that luce-render shades so
+#       far, with the specification's defaults (docs/research/RENDERER-STUDY.md §3).
+#       Colors are linear ACEScg. Each material packs into `material_stride` vec4s
+#       (shaders/openpbr.glsl has the layout). Every color is stored twice: as its
+#       spectrum fit (c0, c1, c2, scale) for the spectral build and as RGB for the RGB
+#       build. Emission is in nits: luminance × color.
+#
+#==============================================================================================
+
+pub let material_stride: usize = 16
+
+pub struct OpenPbr:
+    pub var base_weight: f64
+    pub var base_color: Vector3
+    pub var base_metalness: f64
+    pub var base_diffuse_roughness: f64
+    pub var specular_weight: f64
+    pub var specular_color: Vector3
+    pub var specular_roughness: f64
+    pub var specular_roughness_anisotropy: f64
+    pub var specular_ior: f64
+    pub var transmission_weight: f64
+    pub var transmission_color: Vector3
+    pub var coat_weight: f64
+    pub var coat_color: Vector3
+    pub var coat_roughness: f64
+    pub var coat_roughness_anisotropy: f64
+    pub var coat_ior: f64
+    pub var coat_darkening: f64
+    pub var emission_luminance: f64
+    pub var emission_color: Vector3
+    pub var geometry_opacity: f64
+    pub var geometry_thin_walled: bool
+
+    ## The specification's defaults: a grey dielectric with a slightly rough
+    ## specular layer.
+    pub static func standard() -> OpenPbr:
+        let white = Vector3(1.0, 1.0, 1.0)
+        return OpenPbr(1.0, Vector3(0.8, 0.8, 0.8), 0.0, 0.0,
+                       1.0, white, 0.3, 0.0, 1.5,
+                       0.0, white,
+                       0.0, white, 0.0, 0.0, 1.6, 1.0,
+                       0.0, white,
+                       1.0, false)
+
+## Append `material`'s record: material_stride vec4s.
+pub func pack_material(material: OpenPbr, out: Growing[f32]*) -> !:
+    let colors: Vector3[5] = [material.base_color, material.specular_color, material.coat_color,
+                              material.emission_color.multiply_scalar(material.emission_luminance), material.transmission_color]
+    let weights: f64[5] = [material.base_weight, material.specular_weight, material.coat_weight, material.emission_luminance, material.transmission_weight]
+    for at in 0..<(usize)5:
+        let color = colors[at]
+        let fit = fit_spectrum(Vector3(math.max(color.x, 0.0), math.max(color.y, 0.0), math.max(color.z, 0.0)))
+        for value in [fit.c0, fit.c1, fit.c2, fit.scale, color.x, color.y, color.z, weights[at]]: try out.push((f32)value)
+    let rest: f64[24] = [material.base_metalness, material.base_diffuse_roughness, material.specular_roughness, material.specular_roughness_anisotropy,
+                         material.specular_ior, material.coat_roughness, material.coat_ior, material.coat_darkening,
+                         material.geometry_opacity, 1.0 if material.geometry_thin_walled else 0.0, material.coat_roughness_anisotropy, 0.0,
+                         0.0, 0.0, 0.0, 0.0,
+                         0.0, 0.0, 0.0, 0.0,
+                         0.0, 0.0, 0.0, 0.0]
+    for value in rest: try out.push((f32)value)

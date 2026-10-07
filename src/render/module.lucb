@@ -17,6 +17,7 @@
 #       device.lucb    GpuScene, the scene's buffers, and the primary-ray probe
 #       spectrum.lucb  color matching, spectral fits of colors, blackbodies, film matrix
 #       lights.lucb    UsdLux lights packed for the kernels
+#       materials.lucb OpenPBR Surface parameters packed for the kernels
 #       integrator.lucb  Renderer: the wavefront path tracer's passes
 #       session.lucb   RenderSession: a progressive render a Luce application shows
 #       kernels.lucb   the GLSL kernels, embedded (tools/build_kernels.py; do not edit)

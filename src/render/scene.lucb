@@ -4,10 +4,14 @@
 #
 #   DESCRIPTION:
 #       Every polygon of a set and its visible instances as world-space triangles: f32
-#       positions (x, y, z per point), three point indices per triangle, and each
+#       positions (x, y, z per point), three point indices per triangle, each
 #       triangle's polygon (its face in its mesh, offset by the faces of the meshes
-#       before it). Cameras and lights come flattened to world space. Analytic CAD has
-#       no triangles until a Tessellate node; such components are counted in
+#       before it), and its shading attributes: the normals of its three corners
+#       (octahedral, snorm16 × 2) and its material, four u32s. Shading normals follow
+#       the viewport (luce-3d's mesh batches): an authored N on the first domain that
+#       has one (corner, point, face, detail), else the mesh's smooth normals.
+#       Cameras and lights come flattened to world space. Analytic CAD has no
+#       triangles until a Tessellate node; such components are counted in
 #       `skipped`, not drawn.
 #
 #       Instances are realized into one triangle list for now; a two-level hierarchy
@@ -21,6 +25,8 @@ pub struct CompiledScene:
     pub var indices: Growing[u32]
     ## Each triangle's polygon, reordered with it.
     pub var faces: Growing[u32]
+    ## Four u32s a triangle: its corners' normals (octahedral) and its material.
+    pub var shading: Growing[u32]
     pub var nodes: Growing[BvhNode]
     pub var objects: SceneObjects
     ## Components with no triangles to trace (CAD before Tessellate).
@@ -30,6 +36,7 @@ pub struct CompiledScene:
         self.positions = Growing[f32]()
         self.indices = Growing[u32]()
         self.faces = Growing[u32]()
+        self.shading = Growing[u32]()
         self.nodes = Growing[BvhNode]()
         self.objects = SceneObjects()
         self.skipped = 0
@@ -44,6 +51,7 @@ pub struct CompiledScene:
         self.positions.close()
         self.indices.close()
         self.faces.close()
+        self.shading.close()
         self.nodes.close()
         self.objects.close()
 
@@ -90,12 +98,71 @@ func add_mesh(scene: CompiledScene*, mesh: const Mesh*, matrix: Matrix4, face_ba
         scene.positions.items[scene.positions.count + 2] = (f32)placed.z
         scene.positions.count += 3
     let count = triangles.length // 3
+    var normals = try shading_normals(mesh)
+    defer normals.close()
     try scene.indices.reserve(scene.indices.count + count * 3)
     try scene.faces.reserve(scene.faces.count + count)
+    try scene.shading.reserve(scene.shading.count + count * 4)
     for at in 0..<count:
         for k in 0..<(usize)3:
-            scene.indices.items[scene.indices.count + k] = base + (u32)corners[(usize)triangles[at * 3 + k]]
+            let corner = (usize)triangles[at * 3 + k]
+            scene.indices.items[scene.indices.count + k] = base + (u32)corners[corner]
+            let element = normals.element(corner, (usize)corners[corner], (usize)corner_faces[corner])
+            # A singular placement leaves no normal to transform: any will do, as
+            # it flattens the triangle to nothing.
+            let normal = matrix.transform_normal(normals.values.items[element].vector()) catch failure:
+                _ = failure
+                recover Vector3(0.0, 1.0, 0.0)
+            scene.shading.items[scene.shading.count + k] = octahedral(normal)
+        scene.shading.items[scene.shading.count + 3] = 0
         scene.indices.count += 3
+        scene.shading.count += 4
         scene.faces.items[scene.faces.count] = *face_base + (u32)corner_faces[(usize)triangles[at * 3]]
         scene.faces.count += 1
     *face_base += (u32)mesh.face_count()
+
+## A mesh's shading normals and the domain they are indexed by.
+struct ShadingNormals:
+    var values: Growing[Float3]
+    ## 0 point, 1 corner, 2 face, 3 detail.
+    var domain: i64
+
+    func element(corner: usize, point: usize, face: usize) -> usize:
+        if self.domain == 1: return corner
+        if self.domain == 0: return point
+        if self.domain == 2: return face
+        return 0
+
+    func close():
+        self.values.close()
+
+func shading_normals(mesh: const Mesh*) -> ShadingNormals!:
+    var values = Growing[Float3]()
+    errdefer values.close()
+    let domains: i64[4] = [1, 0, 2, 3]
+    for domain in domains:
+        let index = mesh.find_attribute("N", domain)
+        if index < 0 or (try mesh.attribute_width(index)) < 3 or (try mesh.attribute_integer(index)): continue
+        let tuples = try mesh.attribute_tuples(index)
+        try values.fill(tuples, Float3(0.0, 1.0, 0.0))
+        try mesh.pack_attribute3(index, f32[]((f32*)values.items.data, tuples * 3))
+        return ShadingNormals(values, 3 if (try mesh.attribute_storage(index)) == 1 else domain)
+    let smooth = try mesh.smooth_normal_span()
+    try values.assign(smooth)
+    return ShadingNormals(values, 1 if (try mesh.smooth_normals_corner_domain()) else 0)
+
+## A unit vector as two snorm16 octahedral coordinates (x in the low half), as
+## GLSL's unpackSnorm2x16 reads them.
+pub func octahedral(n: Vector3) -> u32:
+    let length = math.abs(n.x) + math.abs(n.y) + math.abs(n.z)
+    if length <= 0.0: return octahedral(Vector3(0.0, 1.0, 0.0))
+    var x = n.x / length
+    var y = n.y / length
+    if n.z < 0.0:
+        let fx = (1.0 - math.abs(y)) * (1.0 if x >= 0.0 else -1.0)
+        let fy = (1.0 - math.abs(x)) * (1.0 if y >= 0.0 else -1.0)
+        x = fx
+        y = fy
+    let qx = (i64)math.round(math.clamp(x, -1.0, 1.0) * 32767.0)
+    let qy = (i64)math.round(math.clamp(y, -1.0, 1.0) * 32767.0)
+    return ((u32)(qx & 0xffff)) | ((u32)(qy & 0xffff) << 16)

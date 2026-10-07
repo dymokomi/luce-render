@@ -13,8 +13,11 @@ from luce_render import render
 from luce_geocore.geocore import Vector3, Mesh, MeshPrimitives, GeometrySet
 
 pub func checks(device: gpu.Device) -> !:
-    try furnace(device, true)
-    try furnace(device, false)
+    try furnace(device, true, 0.0)
+    try furnace(device, false, 0.0)
+    try furnace(device, true, 1.0)
+    try emission(device, false)
+    try emission(device, true)
     try area_light(device, true)
     try area_light(device, false)
     try spectral_agrees(device, 0.0)
@@ -39,25 +42,50 @@ func rendered(device: gpu.Device, set: const GeometrySet*, settings: render.Rend
     assert(renderer.samples_done() == settings.samples)
     try renderer.read(out)
 
-func furnace(device: gpu.Device, spectral: bool) -> !:
+## `roughness` is EON's: at 1 its multiple scattering must still make a white
+## surface reflect everything.
+func furnace(device: gpu.Device, spectral: bool, roughness: f64) -> !:
     let sphere = try MeshPrimitives.sphere(1.0, 32)
     defer sphere.release()
     let base = try GeometrySet.of_mesh(sphere)
     defer base.release()
-    let set = try base.value().with_camera("/camera", Vector3(0.0, 0.0, 4.0), Vector3(), 0, 50.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    let set = try base.value().with_camera("/camera", Vector3(0.0, 1.0, 4.0), Vector3(), 0, 50.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
     defer set.release()
     var settings = render.RenderSettings.of(64, 48, 64)
     settings.spectral = spectral
     settings.max_bounces = 64
     settings.background = Vector3(1.0, 1.0, 1.0)
-    settings.base_color = Vector3(1.0, 1.0, 1.0)
+    settings.material.base_color = Vector3(1.0, 1.0, 1.0)
+    settings.material.base_diffuse_roughness = roughness
     let pixels = try new f32[64 * 48 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try rendered(device, set.value(), settings, pixels)
     let mean = window_mean(pixels, 64, 0, 0, 48)
     let center = window_mean(pixels, 64, 24, 16, 16)
     if math.abs(mean.x - 1.0) > 0.01 or math.abs(mean.y - 1.0) > 0.01 or math.abs(mean.z - 1.0) > 0.01 or math.abs(center.y - 1.0) > 0.02:
-        print(f"furnace (spectral {spectral}): mean {mean.x} {mean.y} {mean.z}, on the sphere {center.x} {center.y} {center.z}")
+        print(f"furnace (spectral {spectral}, roughness {roughness}): mean {mean.x} {mean.y} {mean.z}, on the sphere {center.x} {center.y} {center.z}")
+        assert(false)
+
+## A sphere of emission luminance 3 and a reddish color in the dark shows its
+## emission exactly; the base reflects nothing, as nothing else lights it.
+func emission(device: gpu.Device, spectral: bool) -> !:
+    let sphere = try MeshPrimitives.sphere(1.0, 32)
+    defer sphere.release()
+    let base = try GeometrySet.of_mesh(sphere)
+    defer base.release()
+    # The primitive sphere's center is at y = 1.
+    let set = try base.value().with_camera("/camera", Vector3(0.0, 1.0, 4.0), Vector3(), 0, 100.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer set.release()
+    var settings = render.RenderSettings.of(32, 32, 16)
+    settings.spectral = spectral
+    settings.material.emission_luminance = 3.0
+    settings.material.emission_color = Vector3(1.0, 0.5, 0.25)
+    let pixels = try new f32[32 * 32 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    try rendered(device, set.value(), settings, pixels)
+    let center = window_mean(pixels, 32, 12, 12, 8)
+    if math.abs(center.x - 3.0) > 0.03 or math.abs(center.y - 1.5) > 0.02 or math.abs(center.z - 0.75) > 0.02:
+        print(f"emission (spectral {spectral}): {center.x} {center.y} {center.z}")
         assert(false)
 
 ## The irradiance at a point under the corner of an x × y rectangle of radiance
@@ -82,7 +110,7 @@ func area_light(device: gpu.Device, spectral: bool) -> !:
     var settings = render.RenderSettings.of(32, 32, 256)
     settings.spectral = spectral
     settings.max_bounces = 1
-    settings.base_color = Vector3(0.5, 0.5, 0.5)
+    settings.material.base_color = Vector3(0.5, 0.5, 0.5)
     let pixels = try new f32[32 * 32 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try rendered(device, set.value(), settings, pixels)
@@ -112,7 +140,7 @@ func spectral_agrees(device: gpu.Device, kelvin: f64) -> !:
         var settings = render.RenderSettings.of(48, 32, 64)
         settings.spectral = build == 0
         settings.max_bounces = 4
-        settings.base_color = Vector3(0.9, 0.9, 0.9)
+        settings.material.base_color = Vector3(0.9, 0.9, 0.9)
         try rendered(device, set.value(), settings, pixels)
         means[build] = window_mean(pixels, 48, 8, 0, 32)
     let s = means[0]

@@ -111,3 +111,33 @@ test "a blackbody near 5455 K (white E's color) is neutral; 3000 K is warm and 9
     let k = to_acescg.apply(cool.multiply_scalar(1.0 / cool.y))
     assert(k.z > k.y and k.y > k.x)
 
+
+## The kernels' octahedral decode (shaders/openpbr.glsl), for checks.
+func decode_octahedral(packed: u32) -> Vector3:
+    let x = math.max(-1.0, (f64)(i16)(u16)(packed & 0xffff) / 32767.0)
+    let y = math.max(-1.0, (f64)(i16)(u16)(packed >> 16) / 32767.0)
+    var n = Vector3(x, y, 1.0 - math.abs(x) - math.abs(y))
+    if n.z < 0.0:
+        n = Vector3((1.0 - math.abs(y)) * (1.0 if x >= 0.0 else -1.0), (1.0 - math.abs(x)) * (1.0 if y >= 0.0 else -1.0), n.z)
+    return n.normalized() catch failure: trap(failure.message)
+
+test "a sphere's shading normals point away from its center (MeshPrimitives centers it at y = radius)":
+    let sphere = MeshPrimitives.sphere(1.0, 16) catch failure: trap(failure.message)
+    defer sphere.release()
+    let set = GeometrySet.of_mesh(sphere) catch failure: trap(failure.message)
+    defer set.release()
+    var scene = compile_scene(set.value()) catch failure: trap(failure.message)
+    defer scene.close()
+    for direction in [Vector3(0.3, -0.5, 0.8), Vector3(-1.0, 0.0, 0.0), Vector3(0.0, 0.0, -1.0), Vector3(0.6, 0.6, -0.5)]:
+        let expected = direction.normalized() catch failure: trap(failure.message)
+        let back = decode_octahedral(octahedral(expected))
+        assert(back.subtract(expected).length() < 1e-3)
+    let p = scene.positions.view()
+    for triangle in 0..<scene.triangle_count():
+        for k in 0..<(usize)3:
+            let i = (usize)scene.indices.items[triangle * 3 + k] * 3
+            let position = Vector3((f64)p[i], (f64)p[i + 1] - 1.0, (f64)p[i + 2])
+            let normal = decode_octahedral(scene.shading.items[triangle * 4 + k])
+            if normal.dot(position) < 0.9:
+                print(f"triangle {triangle} corner {k}: position {position.x} {position.y} {position.z} normal {normal.x} {normal.y} {normal.z}")
+                assert(false)

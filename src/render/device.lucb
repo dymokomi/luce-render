@@ -3,8 +3,9 @@
 #   render/device - A compiled scene on the GPU, and the primary-ray probe
 #
 #   DESCRIPTION:
-#       GpuScene holds the scene buffers every tracing kernel binds at 0..3 (BVH nodes,
-#       positions, indices, faces). `probe` traces one ray per pixel through a camera's
+#       GpuScene holds the scene's buffers: BVH nodes, positions and indices (every
+#       tracing kernel's bindings 0..2), each triangle's polygon (the probe's), and
+#       each triangle's shading attributes (normals and material). `probe` traces one ray per pixel through a camera's
 #       frame and reads back each pixel's polygon and distance: the check that the GPU
 #       BVH agrees with the host, and what picking through a render camera uses.
 #       Device calls happen on the main thread (luce-gpu's rule).
@@ -16,6 +17,7 @@ pub struct GpuScene:
     pub var positions: gpu.Buffer
     pub var indices: gpu.Buffer
     pub var faces: gpu.Buffer
+    pub var shading: gpu.Buffer
 
     ## The scene's buffers on `device`; an empty array still gets a word.
     pub static func upload(device: gpu.Device, scene: const CompiledScene*) -> GpuScene!:
@@ -25,14 +27,17 @@ pub struct GpuScene:
         errdefer positions.destroy()
         var indices = try buffer_of(device, u8[]((u8*)scene.indices.items.data, scene.indices.count * 4))
         errdefer indices.destroy()
-        let faces = try buffer_of(device, u8[]((u8*)scene.faces.items.data, scene.faces.count * 4))
-        return GpuScene(nodes, positions, indices, faces)
+        var faces = try buffer_of(device, u8[]((u8*)scene.faces.items.data, scene.faces.count * 4))
+        errdefer faces.destroy()
+        let shading = try buffer_of(device, u8[]((u8*)scene.shading.items.data, scene.shading.count * 4))
+        return GpuScene(nodes, positions, indices, faces, shading)
 
     pub func destroy():
         self.nodes.destroy()
         self.positions.destroy()
         self.indices.destroy()
         self.faces.destroy()
+        self.shading.destroy()
 
 ## A buffer of `bytes`; an empty one still gets 64 zero bytes, since Metal wants
 ## room for at least one element of whatever the kernel declares (a vec4, a node).

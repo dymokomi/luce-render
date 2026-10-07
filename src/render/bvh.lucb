@@ -10,6 +10,9 @@
 #       first child. The kernels traverse it with a short stack; it is the software path,
 #       and the layout hardware ray tracing does not need.
 #
+#       The triangles' indices, polygons and shading attributes are reordered into
+#       leaf order together.
+#
 #       Node layout (32 bytes, std430 { vec3 lo; uint first; vec3 hi; uint count; }):
 #       an interior node has count 0 and children at `first` and `first + 1`; a leaf
 #       has `count` triangles from triangle `first` in the reordered index list.
@@ -188,9 +191,13 @@ func reorder(scene: CompiledScene*, order: const u32[]) -> !:
     defer free(indices) in memory.heap
     let faces = try new u32[count] --- in memory.heap
     defer free(faces) in memory.heap
+    let shading = try new u32[count * 4] --- in memory.heap
+    defer free(shading) in memory.heap
     for at in 0..<count:
         let source = (usize)order[at]
         for k in 0..<(usize)3: indices[at * 3 + k] = scene.indices.items[source * 3 + k]
+        for k in 0..<(usize)4: shading[at * 4 + k] = scene.shading.items[source * 4 + k]
         faces[at] = scene.faces.items[source]
     memory.copy(scene.indices.items, indices, count * 3)
     memory.copy(scene.faces.items, faces, count)
+    memory.copy(scene.shading.items, shading, count * 4)

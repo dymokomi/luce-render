@@ -49,8 +49,6 @@ layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[
 #define K_BACKGROUND_RGB 2
 #define K_FILM 3            // 3 rows: XYZ under E to ACEScg
 #define K_CMF 6             // xyz: the color matching integrals
-#define K_BASE_FIT 7        // the default material's base color
-#define K_BASE_RGB 8
 #define K_DISPLAY 9         // x exposure in stops, y view (0 standard, 1 neutral)
 
 // State fields.
@@ -62,9 +60,12 @@ layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[
 #define SV_SHADOW_ORIGIN 5u // w: the shadow ray's length
 #define SV_SHADOW_DIRECTION 6u
 #define SV_SHADOW_RADIANCE 7u
-#define SV_HIT 8u           // t, what was hit (bits), barycentrics u, v
+#define SV_HIT 8u           // t, -, barycentrics u, v
 #define SU_PIXEL 0u
 #define SU_BOUNCE 1u
+// What was hit: a triangle or LIGHT_HIT | light. Kept as an integer: bits stored
+// in a float can be denormals, which Metal flushes to zero.
+#define SU_HIT 2u
 
 vec4 get_v(uint field, uint path) { return state_v[field * params.pool + path]; }
 void set_v(uint field, uint path, vec4 value) { state_v[field * params.pool + path] = value; }

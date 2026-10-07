@@ -16,7 +16,8 @@
 #
 #       Buffers, as shaders/common.glsl binds them: 0 nodes, 1 positions, 2 indices,
 #       3 lights, 4 state (vec4 fields), 5 state (uint fields), 6 queues, 7 film,
-#       8 the image (ACEScg), 9 constants, 10 the display image (exposed, Rec.709).
+#       8 the image (ACEScg), 9 constants, 10 the display image (exposed, Rec.709),
+#       11 triangle shading attributes, 12 materials.
 #
 #==============================================================================================
 
@@ -32,17 +33,17 @@ pub struct RenderSettings:
     pub var camera: i64
     ## Radiance from every direction no surface covers (linear ACEScg).
     pub var background: Vector3
-    ## The default material's base color (until materials are assigned).
-    pub var base_color: Vector3
+    ## The material every surface has (until materials are assigned).
+    pub var material: OpenPbr
     ## Paths in flight at once; 0 is min(2^20, pixels).
     pub var pool: u32
     pub var seed: u32
 
     pub static func of(width: u32, height: u32, samples: u32) -> RenderSettings:
-        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), Vector3(0.8, 0.8, 0.8), 0, 1)
+        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1)
 
 let state_v_fields: usize = 9
-let state_u_fields: usize = 2
+let state_u_fields: usize = 3
 let queue_count: usize = 5
 let queue_base: usize = 32
 let constants_rows: usize = 16
@@ -118,6 +119,7 @@ pub struct Renderer:
     var scene: GpuScene
     var lights: gpu.Buffer
     var constants: gpu.Buffer
+    var materials: gpu.Buffer
     var state_v: gpu.Buffer
     var state_u: gpu.Buffer
     var queues: gpu.Buffer
@@ -158,6 +160,11 @@ pub struct Renderer:
         try fill_constants(rows, settings, light_count)
         var constants = try gpu.Buffer.create(device, u8[]((u8*)&rows[0], 256))
         errdefer constants.destroy()
+        var records = Growing[f32]()
+        defer records.close()
+        try pack_material(settings.material, &records)
+        var materials = try buffer_of(device, u8[]((u8*)records.items.data, records.count * 4))
+        errdefer materials.destroy()
         var state_v = try gpu.Buffer.allocate(device, state_v_fields * slots * 16)
         errdefer state_v.destroy()
         var state_u = try gpu.Buffer.allocate(device, state_u_fields * slots * 4)
@@ -169,7 +176,7 @@ pub struct Renderer:
         var output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
         errdefer output.destroy()
         let shown = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
-        return Renderer(device, settings, kernels, uploaded, lights, constants, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, none, 0, 0, 0)
+        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, none, 0, 0, 0)
 
     ## Start the next pass if the last has finished. True while there is work,
     ## running or to come; false once every sample is in the image.
@@ -276,12 +283,13 @@ pub struct Renderer:
         let values: u32[8] = [(u32)start, (u32)count, self.sample, 0, current, phase, (u32)self.pool, self.settings.seed]
         for at in 0..<(usize)8: memory.write[u32]((void*)&block[64 + at * 4], values[at])
 
-    func bindings(kernel: const Kernel*) -> gpu.Binding[11]:
-        var all: gpu.Binding[11] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
+    func bindings(kernel: const Kernel*) -> gpu.Binding[13]:
+        var all: gpu.Binding[13] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
                                     gpu.Binding(buffer = self.lights), gpu.Binding(buffer = self.state_v), gpu.Binding(buffer = self.state_u),
                                     gpu.Binding(buffer = self.queues), gpu.Binding(buffer = self.film), gpu.Binding(texture = self.output),
-                                    gpu.Binding(buffer = self.constants), gpu.Binding(texture = self.shown)]
-        for at in 0..<(usize)11:
+                                    gpu.Binding(buffer = self.constants), gpu.Binding(texture = self.shown),
+                                    gpu.Binding(buffer = self.scene.shading), gpu.Binding(buffer = self.materials)]
+        for at in 0..<(usize)13:
             if at >= kernel.kinds.length or kernel.kinds[at] == 0: all[at] = gpu.Binding()
         return all
 
@@ -306,6 +314,7 @@ pub struct Renderer:
         self.scene.destroy()
         self.lights.destroy()
         self.constants.destroy()
+        self.materials.destroy()
         self.state_v.destroy()
         self.state_u.destroy()
         self.queues.destroy()
@@ -335,14 +344,11 @@ func fill_constants(rows: f32[], settings: RenderSettings, light_count: usize) -
     let film = film_matrix()
     let integrals = cmf_integrals()
     let background = fit_spectrum(settings.background)
-    let base = fit_spectrum(settings.base_color)
-    let values: f64[36] = [(f64)light_count, (f64)settings.max_bounces, 0.0, 0.0,
+    let values: f64[28] = [(f64)light_count, (f64)settings.max_bounces, 0.0, 0.0,
                            background.c0, background.c1, background.c2, background.scale,
                            settings.background.x, settings.background.y, settings.background.z, 0.0,
                            film.m[0], film.m[1], film.m[2], 0.0,
                            film.m[3], film.m[4], film.m[5], 0.0,
                            film.m[6], film.m[7], film.m[8], 0.0,
-                           integrals.x, integrals.y, integrals.z, 0.0,
-                           base.c0, base.c1, base.c2, base.scale,
-                           settings.base_color.x, settings.base_color.y, settings.base_color.z, 0.0]
-    for at in 0..<(usize)36: rows[at] = (f32)values[at]
+                           integrals.x, integrals.y, integrals.z, 0.0]
+    for at in 0..<(usize)28: rows[at] = (f32)values[at]

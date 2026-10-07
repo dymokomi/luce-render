@@ -5,6 +5,7 @@ camera.lucb
 device.lucb
 spectrum.lucb
 lights.lucb
+materials.lucb
 integrator.lucb
 session.lucb
 kernels.lucb
