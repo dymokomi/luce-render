@@ -60,6 +60,13 @@ void shade_light(uint path) {
     }
     // Paths of more vertices than camera paths reach are not counted.
     if (total >= uint(constants[K_INFO].y)) return;
+    // Dispersion ends the secondary wavelengths, as on camera paths.
+    if (disperses(attributes.w)) {
+        Spec unused = Spec(0.0);
+        dispersive_hit(throughput, unused, lambda);
+        set_v(SV_LAMBDA, path, lambda);
+    }
+    hero_wavelength = lambda.y < 0.0 ? lambda.x : 0.0;
 
     vec3 normal = normalize((1.0 - hit.z - hit.w) * octahedral_decode(attributes.x) + hit.z * octahedral_decode(attributes.y) + hit.w * octahedral_decode(attributes.z));
     if (dot(normal, geometric) < 0.0) normal = -normal;

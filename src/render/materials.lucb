@@ -36,6 +36,10 @@ pub struct OpenPbr:
     pub var emission_color: Vector3
     pub var geometry_opacity: f64
     pub var geometry_thin_walled: bool
+    ## Dispersion: 0 none, 1 the Abbe number as it is; its index then varies
+    ## with wavelength (Cauchy's law through specular_ior at 587.6 nm).
+    pub var transmission_dispersion_scale: f64
+    pub var transmission_dispersion_abbe_number: f64
 
     ## The specification's defaults: a grey dielectric with a slightly rough
     ## specular layer.
@@ -46,7 +50,7 @@ pub struct OpenPbr:
                        0.0, white,
                        0.0, white, 0.0, 0.0, 1.6, 1.0,
                        0.0, white,
-                       1.0, false)
+                       1.0, false, 0.0, 20.0)
 
 ## Material `index` of a library as OpenPbr: its parameters by OpenPBR's names,
 ## the specification's defaults for the rest. A material for another shader is
@@ -80,7 +84,21 @@ pub func openpbr_of(materials: const Materials*, index: usize) -> OpenPbr:
         elif name == "emission_color": m.emission_color = color
         elif name == "geometry_opacity": m.geometry_opacity = v[0]
         elif name == "geometry_thin_walled": m.geometry_thin_walled = v[0] != 0.0
+        elif name == "transmission_dispersion_scale": m.transmission_dispersion_scale = v[0]
+        elif name == "transmission_dispersion_abbe_number": m.transmission_dispersion_abbe_number = v[0]
     return m
+
+## Cauchy's B (nm²) for the material's dispersion: n(λ) = n_d + B (1/λ² - 1/λ_d²),
+## where n_d is specular_ior at λ_d = 587.6 nm and the Abbe number
+## V = (n_d - 1) / (n_F - n_C) over the F (486.1 nm) and C (656.3 nm) lines,
+## divided by the dispersion scale. 0: none.
+func cauchy_b(material: OpenPbr) -> f64:
+    let scale = material.transmission_dispersion_scale
+    let abbe = material.transmission_dispersion_abbe_number
+    if scale <= 0.0 or abbe <= 0.0 or material.transmission_weight <= 0.0: return 0.0
+    let line_f = 486.1
+    let line_c = 656.3
+    return (material.specular_ior - 1.0) * scale / (abbe * (1.0 / (line_f * line_f) - 1.0 / (line_c * line_c)))
 
 ## Append `material`'s record: material_stride vec4s.
 pub func pack_material(material: OpenPbr, out: Growing[f32]*) -> !:
@@ -93,7 +111,7 @@ pub func pack_material(material: OpenPbr, out: Growing[f32]*) -> !:
         for value in [fit.c0, fit.c1, fit.c2, fit.scale, color.x, color.y, color.z, weights[at]]: try out.push((f32)value)
     let rest: f64[24] = [material.base_metalness, material.base_diffuse_roughness, material.specular_roughness, material.specular_roughness_anisotropy,
                          material.specular_ior, material.coat_roughness, material.coat_ior, material.coat_darkening,
-                         material.geometry_opacity, 1.0 if material.geometry_thin_walled else 0.0, material.coat_roughness_anisotropy, 0.0,
+                         material.geometry_opacity, 1.0 if material.geometry_thin_walled else 0.0, material.coat_roughness_anisotropy, cauchy_b(material),
                          0.0, 0.0, 0.0, 0.0,
                          0.0, 0.0, 0.0, 0.0,
                          0.0, 0.0, 0.0, 0.0]

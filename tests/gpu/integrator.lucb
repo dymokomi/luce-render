@@ -29,6 +29,7 @@ pub func checks(device: gpu.Device) -> !:
     try layer_furnace(device, true, 1)
     try layer_furnace(device, false, 2)
     try layer_furnace(device, true, 2)
+    try layer_furnace(device, true, 3)
     try cutout(device)
     try emission(device, false)
     try emission(device, true)
@@ -123,9 +124,10 @@ func metal_furnace(device: gpu.Device, spectral: bool, roughness: f64) -> !:
         assert(false)
 
 ## Under a white sky: a white base under a clear coat (`kind` 1), and a closed
-## sphere of smooth glass (2), are white: the coat's darkening vanishes over a
-## white base, and glass loses nothing between Fresnel, refraction and total
-## internal reflection.
+## sphere of smooth glass (2), and of dispersive glass (3: its wavelengths
+## split and the hero carries the sample), are white: the coat's darkening
+## vanishes over a white base, and glass loses nothing between Fresnel,
+## refraction and total internal reflection.
 func layer_furnace(device: gpu.Device, spectral: bool, kind: i64) -> !:
     let sphere = try MeshPrimitives.sphere(1.0, 48)
     defer sphere.release()
@@ -144,12 +146,16 @@ func layer_furnace(device: gpu.Device, spectral: bool, kind: i64) -> !:
     else:
         settings.material.transmission_weight = 1.0
         settings.material.specular_roughness = 0.0
+        if kind == 3:
+            settings.material.transmission_dispersion_scale = 1.0
+            settings.material.transmission_dispersion_abbe_number = 10.0
+            settings.samples = 1024
     let pixels = try new f32[64 * 48 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try rendered(device, set.value(), settings, pixels)
     let center = window_mean(pixels, 64, 24, 16, 16)
     if math.abs(center.y - 1.0) > 0.02:
-        print(f"{"coat" if kind == 1 else "glass"} furnace (spectral {spectral}): on the sphere {center.x} {center.y} {center.z}")
+        print(f"{"coat" if kind == 1 else ("glass" if kind == 2 else "dispersive glass")} furnace (spectral {spectral}): on the sphere {center.x} {center.y} {center.z}")
         assert(false)
 
 ## A sphere emitting 3 nits at opacity one half, in the dark: half the rays stop

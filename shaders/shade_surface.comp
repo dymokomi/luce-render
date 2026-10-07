@@ -99,6 +99,16 @@ void shade_camera(uint path) {
         return;
     }
 
+    // A dispersive material ends the secondary wavelengths (openpbr.glsl);
+    // from then on dispersive indices are the hero's.
+    if (disperses(attributes.w)) {
+        Spec radiance = get_v(SV_RADIANCE, path);
+        dispersive_hit(throughput, radiance, lambda);
+        set_v(SV_RADIANCE, path, radiance);
+        set_v(SV_LAMBDA, path, lambda);
+    }
+    hero_wavelength = lambda.y < 0.0 ? lambda.x : 0.0;
+
     // Emission, MIS-weighted against the light sample the previous vertex took
     // (emissive triangles are emitters of the light tree).
     if (HAS_EMISSION && material_at(attributes.w, 7u).w > 0.0) {

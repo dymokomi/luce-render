@@ -7,7 +7,7 @@
 //   8, 9   transmission color fit; RGB, transmission weight
 //   10     metalness, diffuse roughness, specular roughness, specular anisotropy
 //   11     specular IOR, coat roughness, coat IOR, coat darkening
-//   12     opacity, thin walled, coat anisotropy, -
+//   12     opacity, thin walled, coat anisotropy, dispersion (Cauchy's B in nm², 0 none)
 // OpenPBR v1, in a local frame with the normal along +z on the side the ray
 // came from (the layering after OpenPBR's specification and its reference):
 //   - coat: a GGX dielectric layer at coat_ior over everything below; the
@@ -127,6 +127,29 @@ float rgb_luminance(vec3 rgb) { return dot(rgb, vec3(0.2722287168, 0.6740817658,
 #define LOBE_GLOSSY 1u
 #define LOBE_TRANSMISSION 2u
 
+// The wavelength dispersive indices are taken at: the path's hero (its first
+// lane) once dispersive_hit has ended the others. Set per path by the kernels.
+float hero_wavelength = 0.0;
+
+// Cauchy's index at `lambda` nm through `ior` at 587.6 nm.
+float dispersed_ior(float ior, float b, float lambda) {
+    return ior + b * (1.0 / (lambda * lambda) - 1.0 / (587.6 * 587.6));
+}
+
+// Whether material `m` disperses (the spectral build only).
+bool disperses(uint m) { return SPECTRAL != 0 && HAS_TRANSMISSION && material_at(m, 12u).w != 0.0; }
+
+// A path meeting a dispersive material: its directions now depend on the
+// wavelength, so the three secondary wavelengths end (their lanes zero, their
+// wavelengths negative, which the film skips) and the hero carries the whole
+// sample (pbrt-v4's TerminateSecondary). Once per path.
+void dispersive_hit(inout Spec throughput, inout Spec radiance, inout vec4 lambda) {
+    if (lambda.y < 0.0) return;
+    throughput = Spec(throughput.x * 4.0, 0.0, 0.0, 0.0);
+    radiance = Spec(radiance.x * 4.0, 0.0, 0.0, 0.0);
+    lambda = vec4(lambda.x, -lambda.yzw);
+}
+
 struct Surface {
     vec3 normal;        // shading normal, facing the side the surface is seen from
     vec3 tangent;
@@ -225,6 +248,7 @@ void read_material(inout Surface s) {
     s.roughness = mix(roughness, min(1.0, pow(r4 + 2.0 * c4, 0.25)), s.coat);
     s.alpha = ggx_alpha(s.roughness, clamp(scalars.w, 0.0, 1.0));
     float eta = max(indices.x, 1.0001);
+    if (SPECTRAL != 0 && geometry.w != 0.0 && hero_wavelength > 0.0) eta = max(dispersed_ior(eta, geometry.w, hero_wavelength), 1.0001);
     float relative = eta / s.coat_eta;
     if (relative < 1.0) relative = 1.0 / relative;
     s.ior = max(mix(eta, relative, s.coat), 1.0001);

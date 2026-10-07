@@ -68,8 +68,12 @@ and `-DSPECTRAL=0`. The Render node's Color menu chooses between them. The rules
 - **RGB parameters become spectra** through Jakob–Hanika sigmoid coefficients
   (c0, c1, c2, scale). The tables are built offline for ACEScg and Rec.709, each
   64³. In the RGB build the same parameters are read as plain RGB.
-- **Dispersion:** a dispersive interface ends the three secondary wavelengths.
-  Their lanes go to zero and lane 0 is weighted ×4.
+- **Dispersion** (OpenPBR's `transmission_dispersion_scale` and Abbe number): the
+  index follows Cauchy's law through `specular_ior` at 587.6 nm. A path meeting a
+  dispersive material ends its three secondary wavelengths (their lanes zero,
+  their wavelengths negated so the film skips them) and lane 0 carries the
+  sample ×4; dispersive indices are then the hero's, on camera and light paths
+  alike, so MIS stays consistent. Light paths make the rainbow caustics.
 - **Lights:** emitter radiance is normalized so OpenPBR's `emission_luminance`
   (nits) lands on Y. Blackbody temperature is evaluated per wavelength.
 - **Film:** accumulates XYZ through the CIE 1931 2° curves at 1 nm, then converts
