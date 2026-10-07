@@ -24,8 +24,12 @@ pub struct RenderSession:
     var exposure_stops: f64
     var view: i64
     var problem_text: Growing[u8]
-    ## The material the next `start` renders every surface with.
+    ## The material the next `start` gives faces with none assigned, and its limits.
     var material: OpenPbr
+    var diffuse: u32
+    var glossy: u32
+    var transmission: u32
+    var clamp_indirect: f64
 
     pub func init():
         self.device = gpu.Device()
@@ -38,6 +42,10 @@ pub struct RenderSession:
         self.view = 1
         self.problem_text = Growing[u8]()
         self.material = OpenPbr.standard()
+        self.diffuse = 1024
+        self.glossy = 1024
+        self.transmission = 1024
+        self.clamp_indirect = 0.0
 
     pub static func make() -> interop.Reference[RenderSession]!:
         return try interop.Reference[RenderSession].adopt(try new RenderSession() in memory.heap, render_session_type, memory.heap)
@@ -64,27 +72,30 @@ pub struct RenderSession:
         settings.spectral = spectral
         settings.camera = index
         settings.material = self.material
+        settings.diffuse_bounces = self.diffuse
+        settings.glossy_bounces = self.glossy
+        settings.transmission_bounces = self.transmission
+        settings.clamp_indirect = self.clamp_indirect
         self.settings = settings
         self.waiting = scene
         self.started = clock.now()
         self.took = 0.0
 
-    ## The OpenPBR parameters every surface takes in the next `start` (until
-    ## materials are assigned per object). Colors are linear ACEScg.
-    pub func set_material(base_color: Vector3, metalness: f64, diffuse_roughness: f64, specular_weight: f64, specular_color: Vector3,
-                          specular_roughness: f64, specular_ior: f64, anisotropy: f64, emission_luminance: f64, emission_color: Vector3):
-        var material = OpenPbr.standard()
-        material.base_color = base_color
-        material.base_metalness = metalness
-        material.base_diffuse_roughness = diffuse_roughness
-        material.specular_weight = specular_weight
-        material.specular_color = specular_color
-        material.specular_roughness = specular_roughness
-        material.specular_ior = specular_ior
-        material.specular_roughness_anisotropy = anisotropy
-        material.emission_luminance = emission_luminance
-        material.emission_color = emission_color
-        self.material = material
+    ## The default material of the next `start` (faces with none assigned):
+    ## OpenPBR parameters by name, one per line, four numbers each, as a
+    ## Material node writes them.
+    pub func set_material(names: str, values: const f64[]) -> !:
+        var library = Materials()
+        defer library.close()
+        try library.add("default", "openpbr", names, values, none)
+        self.material = openpbr_of(&library, 0)
+
+    ## Bounce limits by kind and the indirect clamp (0 off) of the next `start`.
+    pub func set_limits(diffuse: i64, glossy: i64, transmission: i64, clamp_indirect: f64):
+        self.diffuse = (u32)math.max(0.0, (f64)diffuse)
+        self.glossy = (u32)math.max(0.0, (f64)glossy)
+        self.transmission = (u32)math.max(0.0, (f64)transmission)
+        self.clamp_indirect = math.max(0.0, clamp_indirect)
 
     ## Advance the render a pass and draw it fitted into (x, y, width, height) of
     ## `target`; whether passes are still coming.
