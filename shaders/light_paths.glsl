@@ -49,6 +49,7 @@ void shade_light(uint path) {
     if (back) geometric = -geometric;
     uvec4 attributes = shading[triangle];
     vec3 p = origin + hit.x * ray.xyz;
+    surface_uv = triangle_uv(triangle, hit.zw);
     vec4 u_opacity = sample4(LIGHT_PATH_ID(path), params.sample_index, GROUP_OPACITY(total));
 
     // Cut-out opacity, as camera paths take it.
@@ -70,6 +71,7 @@ void shade_light(uint path) {
 
     vec3 normal = normalize((1.0 - hit.z - hit.w) * octahedral_decode(attributes.x) + hit.z * octahedral_decode(attributes.y) + hit.w * octahedral_decode(attributes.z));
     if (dot(normal, geometric) < 0.0) normal = -normal;
+    normal = mapped_normal(attributes.w, triangle, normal);
     // The surface on the side light arrives from, read once: seen from the
     // camera or the next vertex on that side, it is only oriented.
     Surface lit = surface_at(normal, geometric, attributes.w, back);

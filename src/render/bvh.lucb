@@ -193,11 +193,15 @@ func reorder(scene: CompiledScene*, order: const u32[]) -> !:
     defer free(faces) in memory.heap
     let shading = try new u32[count * 4] --- in memory.heap
     defer free(shading) in memory.heap
+    let uvs = try new f32[count * 6] --- in memory.heap
+    defer free(uvs) in memory.heap
     for at in 0..<count:
         let source = (usize)order[at]
         for k in 0..<(usize)3: indices[at * 3 + k] = scene.indices.items[source * 3 + k]
         for k in 0..<(usize)4: shading[at * 4 + k] = scene.shading.items[source * 4 + k]
+        for k in 0..<(usize)6: uvs[at * 6 + k] = scene.uvs.items[source * 6 + k]
         faces[at] = scene.faces.items[source]
     memory.copy(scene.indices.items, indices, count * 3)
     memory.copy(scene.faces.items, faces, count)
     memory.copy(scene.shading.items, shading, count * 4)
+    memory.copy(scene.uvs.items, uvs, count * 6)

@@ -1,0 +1,159 @@
+#==============================================================================================
+#
+#   render/textures - Materials' image textures, in a texture table
+#
+#   DESCRIPTION:
+#       A material may name image files for some parameters (text-valued
+#       parameters, luce-geocore): base_color_texture, specular_roughness_texture,
+#       base_metalness_texture and geometry_normal_texture (a tangent-space normal
+#       map). Each file is read once per use: colors as sRGB-encoded 8-bit (PNG,
+#       JPEG) sampled as linear light, data (roughness, metalness, normals) as
+#       stored; OpenEXR files as half floats either way. The kernels sample them
+#       through a texture table (shaders/openpbr.glsl) at the hit's texture
+#       coordinates, slot -1 meaning none. Images are linear Rec.709 once
+#       sampled; colors become ACEScg in the kernels.
+#
+#==============================================================================================
+
+## The texture parameters, in the material record's order (row 13).
+pub let texture_parameters: str[4] = ["base_color_texture", "specular_roughness_texture", "base_metalness_texture", "geometry_normal_texture"]
+
+pub struct MaterialTextures:
+    ## Each material's slots (four a material, in texture_parameters' order;
+    ## -1 none), the default material's first.
+    pub var slots: Growing[f32]
+    pub var textures: Growing[gpu.Texture]
+    pub var table: gpu.TextureTable
+    ## The file and use of each texture, to read each once.
+    var keys: Growing[u8]
+
+    pub func destroy():
+        self.table.destroy()
+        for texture in self.textures.view():
+            var held = texture
+            held.destroy()
+        self.textures.close()
+        self.slots.close()
+        self.keys.close()
+
+## The textures `materials` name, read onto `device`: slots for the default
+## material (none) and then each of the library's materials, and a table that
+## always has at least one texture (kernels that sample need one bound).
+pub func load_textures(device: gpu.Device, materials: const Materials*) -> MaterialTextures!:
+    var keys = Growing[u8]()
+    errdefer keys.close()
+    var textures = Growing[gpu.Texture]()
+    errdefer:
+        for texture in textures.view():
+            var held = texture
+            held.destroy()
+        textures.close()
+    var slots = Growing[f32]()
+    errdefer slots.close()
+    for k in 0..<(usize)4: try slots.push(-1.0)
+    for index in 0..<materials.count():
+        for k in 0..<(usize)4:
+            let file = materials.find_text(index, texture_parameters[k])
+            if file.length == 0:
+                try slots.push(-1.0)
+                continue
+            # Colors are sRGB; the rest data.
+            let color = k == 0
+            let slot = try texture_slot(device, &keys, &textures, file, color)
+            try slots.push((f32)slot)
+    if textures.count == 0:
+        var white = try gpu.Texture.create(device, 1, 1, gpu.Format.rgba8_linear)
+        errdefer white.destroy()
+        let texel: u8[4] = [255, 255, 255, 255]
+        try white.upload(u8[]((u8*)&texel[0], 4))
+        try textures.push(white)
+    var table = try gpu.TextureTable.create(device, (u32)textures.count)
+    errdefer table.destroy()
+    for at in 0..<textures.count: try table.set((u32)at, textures.items[at])
+    return MaterialTextures(slots, textures, table, keys)
+
+## The slot of `file` read for its use (`color`: sRGB), read now if it is new.
+func texture_slot(device: gpu.Device, keys: Growing[u8]*, textures: Growing[gpu.Texture]*, file: str, color: bool) -> usize!:
+    # Keys are "c" or "d", the file, a newline: one per texture, in order.
+    var at: usize = 0
+    var slot: usize = 0
+    while at < keys.count:
+        var end = at
+        while end < keys.count and keys.items[end] != 10: end += 1
+        let key = (str)keys.items[at..<end]
+        if key.length == file.length + 1 and key.bytes[0] == ('c' if color else 'd') and (str)key.bytes[1..] == file: return slot
+        slot += 1
+        at = end + 1
+    let texture = try read_texture(device, file, color)
+    try textures.push(texture)
+    try keys.push('c' if color else 'd')
+    try append_text(keys, file)
+    try keys.push(10)
+    return textures.count - 1
+
+## Image file `file` as a texture: 8-bit RGBA from PNG or JPEG (sRGB for a
+## color), half-float RGBA from OpenEXR.
+func read_texture(device: gpu.Device, file: str, color: bool) -> gpu.Texture!:
+    var name: str
+    with memory.heap:
+        name = try strings.copy(file)
+    defer:
+        with memory.heap: strings.release(name)
+    let bytes = try files.read((c.str)name)
+    defer bytes.release()
+    let data = bytes.value
+    if data.length >= 2 and data[0] == 'v' and data[1] == '/': return try read_exr_texture(device, data)
+    var width: usize = 0
+    var height: usize = 0
+    let is_png = data.length >= 8 and data[0] == 137 and data[1] == 'P'
+    let is_jpeg = data.length >= 2 and data[0] == 255 and data[1] == 216
+    if is_png:
+        let info = try png.info(data)
+        width = info.width
+        height = info.height
+    elif is_jpeg:
+        let info = try jpeg.info(data)
+        width = info.width
+        height = info.height
+    else:
+        error(invalid, "a texture is a PNG, JPEG or OpenEXR file")
+    if width == 0 or height == 0 or width > 16384 or height > 16384: error(invalid, "a texture is 1 to 16384 texels on a side")
+    let pixels = try new u8[width * height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    if is_png: try png.decode_rgba8(data, pixels)
+    else: try jpeg.decode_rgba8(data, pixels)
+    var texture = try gpu.Texture.create(device, (u32)width, (u32)height, gpu.Format.rgba8 if color else gpu.Format.rgba8_linear)
+    errdefer texture.destroy()
+    try texture.upload(pixels)
+    return texture
+
+func read_exr_texture(device: gpu.Device, data: const u8[]) -> gpu.Texture!:
+    var raster = Raster(max_pixels = 67108864)
+    defer raster.close()
+    raster.encoded = try new u8[data.length] --- in memory.heap
+    memory.copy(raster.encoded, data, data.length)
+    try exr.probe(&raster)
+    try raster.allocate()
+    for chunk in 0..<raster.chunks.length: try exr.decode_chunk(&raster, chunk)
+    var channel: i64[4] = [-1, -1, -1, -1]
+    for at in 0..<raster.channels.length:
+        let n = raster.channels[at].name
+        if n == "R" or n == "Y": channel[0] = (i64)at
+        if n == "G" or n == "Y": channel[1] = (i64)at
+        if n == "B" or n == "Y": channel[2] = (i64)at
+        if n == "A": channel[3] = (i64)at
+    if channel[0] < 0 or channel[1] < 0 or channel[2] < 0: error(invalid, "a texture's OpenEXR needs R, G and B channels, or Y")
+    let width = raster.width
+    let height = raster.height
+    if width > 16384 or height > 16384: error(invalid, "a texture is 1 to 16384 texels on a side")
+    let stride = raster.channels.length
+    let halves = try new u16[width * height * 4] --- in memory.heap
+    defer free(halves) in memory.heap
+    for texel in 0..<width * height:
+        for k in 0..<(usize)4:
+            let value = raster.pixels[texel * stride + (usize)channel[k]] if channel[k] >= 0 else 1.0
+            halves[texel * 4 + k] = to_half(value)
+    var texture = try gpu.Texture.create(device, (u32)width, (u32)height, gpu.Format.rgba16_float)
+    errdefer texture.destroy()
+    try texture.upload(u8[]((u8*)halves.data, halves.length * 2))
+    return texture

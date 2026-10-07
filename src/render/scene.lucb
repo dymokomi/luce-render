@@ -12,7 +12,9 @@
 #       (flattened, `materials`): its index + 1, or 0 (the render's default
 #       material) when the face names none or a material the set lacks. Shading normals follow
 #       the viewport (luce-3d's mesh batches): an authored N on the first domain that
-#       has one (corner, point, face, detail), else the mesh's smooth normals.
+#       has one (corner, point, face, detail), else the mesh's smooth normals. Texture
+#       coordinates come the same way from `uv` (two f32 a corner, six a triangle;
+#       zero without one).
 #       Cameras and lights come flattened to world space. Analytic CAD has no
 #       triangles until a Tessellate node; such components are counted in
 #       `skipped`, not drawn.
@@ -30,6 +32,8 @@ pub struct CompiledScene:
     pub var faces: Growing[u32]
     ## Four u32s a triangle: its corners' normals (octahedral) and its material.
     pub var shading: Growing[u32]
+    ## Six f32s a triangle: its corners' texture coordinates.
+    pub var uvs: Growing[f32]
     pub var nodes: Growing[BvhNode]
     pub var objects: SceneObjects
     ## Every material definition of the set and its instances.
@@ -42,6 +46,7 @@ pub struct CompiledScene:
         self.indices = Growing[u32]()
         self.faces = Growing[u32]()
         self.shading = Growing[u32]()
+        self.uvs = Growing[f32]()
         self.nodes = Growing[BvhNode]()
         self.objects = SceneObjects()
         self.materials = Materials()
@@ -58,6 +63,7 @@ pub struct CompiledScene:
         self.indices.close()
         self.faces.close()
         self.shading.close()
+        self.uvs.close()
         self.nodes.close()
         self.objects.close()
         self.materials.close()
@@ -110,6 +116,8 @@ func add_mesh(scene: CompiledScene*, mesh: const Mesh*, matrix: Matrix4, face_ba
     defer normals.close()
     let face_materials = try material_indices(&scene.materials, mesh)
     defer free(face_materials) in memory.heap
+    let uv = texture_coordinates(mesh)
+    try scene.uvs.reserve(scene.uvs.count + count * 6)
     try scene.indices.reserve(scene.indices.count + count * 3)
     try scene.faces.reserve(scene.faces.count + count)
     try scene.shading.reserve(scene.shading.count + count * 4)
@@ -124,9 +132,22 @@ func add_mesh(scene: CompiledScene*, mesh: const Mesh*, matrix: Matrix4, face_ba
                 _ = failure
                 recover Vector3(0.0, 1.0, 0.0)
             scene.shading.items[scene.shading.count + k] = octahedral(normal)
+            var u: f64 = 0.0
+            var v: f64 = 0.0
+            if uv.0 >= 0:
+                let uv_at = (i64)uv_element(uv.1, corner, (usize)corners[corner], (usize)corner_faces[corner], uv.2)
+                u = mesh.attribute_value(uv.0, uv_at, 0) catch failure:
+                    _ = failure
+                    recover 0.0
+                v = mesh.attribute_value(uv.0, uv_at, 1) catch failure:
+                    _ = failure
+                    recover 0.0
+            scene.uvs.items[scene.uvs.count + k * 2] = (f32)u
+            scene.uvs.items[scene.uvs.count + k * 2 + 1] = (f32)v
         scene.shading.items[scene.shading.count + 3] = face_materials[(usize)corner_faces[(usize)triangles[at * 3]]]
         scene.indices.count += 3
         scene.shading.count += 4
+        scene.uvs.count += 6
         scene.faces.items[scene.faces.count] = *face_base + (u32)corner_faces[(usize)triangles[at * 3]]
         scene.faces.count += 1
     *face_base += (u32)mesh.face_count()
@@ -151,6 +172,32 @@ func material_indices(materials: const Materials*, mesh: const Mesh*) -> u32[]!:
                 out[face] = looked[at]
                 break
     return out
+
+## A mesh's `uv` attribute: its index (-1: none), its domain (0 point, 1
+## corner, 2 face) and whether it stores one value for all.
+func texture_coordinates(mesh: const Mesh*) -> (i64, i64, bool):
+    let domains: i64[3] = [1, 0, 2]
+    for domain in domains:
+        let index = mesh.find_attribute("uv", domain)
+        if index < 0: continue
+        let width = mesh.attribute_width(index) catch failure:
+            _ = failure
+            recover 0
+        let integer = mesh.attribute_integer(index) catch failure:
+            _ = failure
+            recover true
+        if width < 2 or integer: continue
+        let single = (mesh.attribute_storage(index) catch failure:
+            _ = failure
+            recover 0) == 1
+        return (index, domain, single)
+    return (-1, 0, false)
+
+func uv_element(domain: i64, corner: usize, point: usize, face: usize, single: bool) -> usize:
+    if single: return 0
+    if domain == 1: return corner
+    if domain == 0: return point
+    return face
 
 ## A mesh's shading normals and the domain they are indexed by.
 struct ShadingNormals:

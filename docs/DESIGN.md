@@ -150,6 +150,20 @@ for the viewport.
 | v2 | transmission depth, dispersion, fuzz, thin film |
 | v3 | subsurface random walk |
 
+**Textures** (textures.lucb): a material's text-valued parameters name images
+(`base_color_texture`, `specular_roughness_texture`, `base_metalness_texture`,
+`geometry_normal_texture`).
+- **Files:** PNG and JPEG load as 8-bit (sRGB for colors), OpenEXR as half floats.
+- **Lookup:** shade_surface samples them from a texture table at the hit's texture
+  coordinates, which are the meshes' `uv` per triangle corner, reached by
+  buffer address.
+- **Color:** a base color texel becomes ACEScg, then a reflectance spectrum
+  through the environment basis, clamped to [0, 1].
+- **Normal maps:** they bend the shading normal in the frame the triangle's UVs
+  give, on camera and light paths alike.
+- **Checked:** a textured grey floor lights as a grey material does, within
+  0.02%.
+
 Energy compensation uses precomputed albedo tables (study §3.5):
 
 - GGX E (32²) and its average;

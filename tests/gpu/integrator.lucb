@@ -10,7 +10,8 @@ from luce_std import math
 from luce_std import clock
 from luce_gpu import gpu
 from luce_render import render
-from luce_geocore.geocore import Vector3, Mesh, MeshPrimitives, GeometrySet, MaterialAssignment
+from luce_geocore.geocore import Vector3, Mesh, MeshPrimitives, GeometrySet, MaterialAssignment, AttributeKernels
+from luce_png import png
 import interop
 import c
 from luce_std import files
@@ -47,6 +48,8 @@ pub func checks(device: gpu.Device) -> !:
     try dome_furnace(device, false)
     try dome_sun(device, true)
     try dome_sun(device, false)
+    try textured_floor(device, true)
+    try textured_floor(device, false)
     try cutout_shadow(device)
     try adaptive(device)
     try guided_room(device)
@@ -570,6 +573,61 @@ func dome_sun(device: gpu.Device, spectral: bool) -> !:
     let expected = 0.5 / math.pi * irradiance
     print(f"dome sun (spectral {spectral}): {measured.x} {measured.y} {measured.z}, expected {expected}")
     assert(math.abs(measured.y / expected - 1.0) < 0.02)
+
+## The rect light over a floor whose grey comes from a texture: an sRGB PNG
+## of 188s (0.502 linear) mapped by the floor's texture coordinates lights as
+## a material of that grey does.
+func textured_floor(device: gpu.Device, spectral: bool) -> !:
+    var file = Growing[u8]()
+    defer file.close()
+    try file.assign(path.temp().bytes)
+    for byte in "/luce-render-grey.png".bytes: try file.push(byte)
+    try file.push(0)
+    let name = (str)file.items[..<file.count - 1]
+    var texels: u8[64]
+    for at in 0..<(usize)16:
+        texels[at * 4] = 188
+        texels[at * 4 + 1] = 188
+        texels[at * 4 + 2] = 188
+        texels[at * 4 + 3] = 255
+    var encoded = Buffer()
+    defer:
+        if encoded.data.length > 0: free(encoded.data) in memory.heap
+    try png.encode_rgba8(texels[0..<64], 4, 4, &encoded)
+    try files.write((c.str)name, encoded.data[..<encoded.used])
+    let grid = try MeshPrimitives.grid(20.0, 8)
+    defer grid.release()
+    let mapped = try AttributeKernels.uv_project(grid, 0.05)
+    defer mapped.release()
+    let bound = try MaterialAssignment.faces(mapped, "", "material", "materials/floor")
+    defer bound.release()
+    let base = try GeometrySet.of_mesh(bound)
+    defer base.release()
+    let albedo = math.pow((188.0 / 255.0 + 0.055) / 1.055, 2.4)
+    var means: f64[2] = [0.0, 0.0]
+    for way in 0..<(usize)2:
+        let library = try (try base.value().with_material("materials/floor", "openpbr", "base_color_texture\nspecular_weight", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], name) if way == 0
+                           else try base.value().with_material("materials/floor", "openpbr", "base_color\nspecular_weight", [albedo, albedo, albedo, 0.0, 0.0, 0.0, 0.0, 0.0]))
+        defer library.release()
+        means[way] = try floor_window(device, library, spectral)
+    print(f"textured floor (spectral {spectral}): {means[0]} against a grey material's {means[1]}")
+    assert(math.abs(means[0] / means[1] - 1.0) < 0.005)
+
+## The mean of the window below the rect light, lit by it, of `library` (a floor).
+func floor_window(device: gpu.Device, library: interop.Reference[GeometrySet], spectral: bool) -> f64!:
+    let pitch = -math.atan2(0.5, 3.0)
+    let viewed = try library.value().with_camera("/camera", Vector3(0.0, 0.5, 3.0), Vector3(pitch, 0.0, 0.0), 0, 200.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer viewed.release()
+    let set = try viewed.value().with_light("/key", Vector3(0.0, 1.0, 0.0), Vector3(-0.5 * math.pi, 0.0, 0.0), 0, Vector3(1.0, 1.0, 1.0), 4.0, 0.0, 0.0, false, 1.0, 1.0, 0.5, 0.0, false)
+    defer set.release()
+    var settings = render.RenderSettings.of(32, 32, 1024)
+    settings.spectral = spectral
+    settings.max_bounces = 1
+    settings.light_tracing = 0.0
+    let pixels = try new f32[32 * 32 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    try rendered(device, set.value(), settings, pixels)
+    return window_mean(pixels, 32, 14, 14, 4).y
 
 func area_light(device: gpu.Device, spectral: bool, light_tracing: f64) -> !:
     let floor = try MeshPrimitives.grid(20.0, 8)
