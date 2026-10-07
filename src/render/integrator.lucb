@@ -5,10 +5,11 @@
 #   DESCRIPTION:
 #       A Renderer owns a scene's buffers, the path state, the film and the output image,
 #       and records passes. A pass traces one sample for one band of pixels (at most
-#       `pool` paths): camera, then per bounce schedule → intersect_closest → schedule →
-#       shade_surface and shade_miss → schedule → intersect_shadow, then finish (paths
+#       `pool` paths): camera, then per bounce intersect_closest → shade_surface →
+#       shade_miss → intersect_shadow, then finish (paths
 #       into the film) and film_convert (the film's average into the image). Queue
-#       sizes never come back to the host: schedule writes indirect arguments.
+#       sizes never come back to the host: each kernel's last workgroup writes the
+#       next kernels' indirect arguments.
 #
 #       `advance` is meant to be called once per UI frame: it starts the next pass
 #       only when the last one has finished, so the UI never waits and the GPU stays
@@ -82,12 +83,12 @@ let kind_closest: u8 = 1
 let kind_surface: u8 = 2
 let kind_miss: u8 = 3
 let kind_shadow: u8 = 4
-let kind_schedule: u8 = 5
+let kind_unused: u8 = 5
 let kind_finish: u8 = 6
 let kind_convert: u8 = 7
 let kind_adaptive: u8 = 8
 let kind_rest: u8 = 9
-pub let kernel_names: str[10] = ["camera", "intersect closest", "shade surface", "shade miss", "intersect shadow", "schedule", "finish", "film convert", "adaptive", "later rounds"]
+pub let kernel_names: str[10] = ["camera", "intersect closest", "shade surface", "shade miss", "intersect shadow", "(unused)", "finish", "film convert", "adaptive", "later rounds"]
 
 ## The integrator's kernels in one build (spectral or RGB).
 struct Kernel:
@@ -105,7 +106,6 @@ struct Kernel:
 
 struct Kernels:
     var camera: Kernel
-    var schedule: Kernel
     var intersect_closest: Kernel
     var shade_surface: Kernel
     var shade_miss: Kernel
@@ -120,8 +120,6 @@ struct Kernels:
         if spectral:
             var camera = try Kernel.create(device, constants, camera_comp_words, camera_comp_msl, camera_comp_group, camera_comp_bindings)
             errdefer camera.kernel.destroy()
-            var schedule = try Kernel.create(device, constants, schedule_comp_words, schedule_comp_msl, schedule_comp_group, schedule_comp_bindings)
-            errdefer schedule.kernel.destroy()
             var closest = try intersect_kernel(device, rays, constants)
             errdefer closest.kernel.destroy()
             var surface = try Kernel.create(device, constants, shade_surface_comp_words, shade_surface_comp_msl, shade_surface_comp_group, shade_surface_comp_bindings)
@@ -137,11 +135,9 @@ struct Kernels:
             var adaptive = try Kernel.create(device, constants, adaptive_comp_words, adaptive_comp_msl, adaptive_comp_group, adaptive_comp_bindings, false)
             errdefer adaptive.kernel.destroy()
             let fit = try Kernel.create(device, constants, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
-            return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert, adaptive, fit)
+            return Kernels(camera, closest, surface, miss, shadow, finish, convert, adaptive, fit)
         var camera = try Kernel.create(device, constants, camera_rgb_comp_words, camera_rgb_comp_msl, camera_rgb_comp_group, camera_rgb_comp_bindings)
         errdefer camera.kernel.destroy()
-        var schedule = try Kernel.create(device, constants, schedule_rgb_comp_words, schedule_rgb_comp_msl, schedule_rgb_comp_group, schedule_rgb_comp_bindings)
-        errdefer schedule.kernel.destroy()
         var closest = try intersect_kernel(device, rays, constants)
         errdefer closest.kernel.destroy()
         var surface = try Kernel.create(device, constants, shade_surface_rgb_comp_words, shade_surface_rgb_comp_msl, shade_surface_rgb_comp_group, shade_surface_rgb_comp_bindings)
@@ -157,11 +153,10 @@ struct Kernels:
         var adaptive = try Kernel.create(device, constants, adaptive_rgb_comp_words, adaptive_rgb_comp_msl, adaptive_rgb_comp_group, adaptive_rgb_comp_bindings, false)
         errdefer adaptive.kernel.destroy()
         let fit = try Kernel.create(device, constants, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
-        return Kernels(camera, schedule, closest, surface, miss, shadow, finish, convert, adaptive, fit)
+        return Kernels(camera, closest, surface, miss, shadow, finish, convert, adaptive, fit)
 
     func destroy():
         self.camera.kernel.destroy()
-        self.schedule.kernel.destroy()
         self.intersect_closest.kernel.destroy()
         self.shade_surface.kernel.destroy()
         self.shade_miss.kernel.destroy()
@@ -425,19 +420,18 @@ pub struct Renderer:
         try self.frame.pack(frame)
         memory.copy(block[0..<64], u8[]((u8*)&frame[0], 64), 64)
         let groups = (u32)((count + 63) // 64)
-        # The camera queues only pixels still sampling, by atomics from zero.
-        try pass.fill(self.queues, 0, 4, 0)
+        # Every queue counter and the workgroups' done count start at zero; the
+        # camera queues only pixels still sampling.
+        try pass.fill(self.queues, 0, 64, 0)
         try self.dispatch(pass, &self.kernels.camera, block, start, count, 0, 0, groups, 1)
         # One more round than bounces: the last BSDF rays still find lights;
         # with cut-outs, rounds for rays passing through them at the same bounce.
         for bounce in 0..<(usize)self.settings.max_bounces + 1 + self.through:
             let current = (u32)(bounce % 2)
-            try self.dispatch(pass, &self.kernels.schedule, block, start, count, current, 0, 1, 1)
+            # Each kernel's last workgroup sizes the next (common.glsl: last_group).
             try self.indirect(pass, &self.kernels.intersect_closest, block, start, count, current, (usize)current)
-            try self.dispatch(pass, &self.kernels.schedule, block, start, count, current, 1, 1, 1)
             try self.indirect(pass, &self.kernels.shade_surface, block, start, count, current, 2)
             try self.indirect(pass, &self.kernels.shade_miss, block, start, count, current, 3)
-            try self.dispatch(pass, &self.kernels.schedule, block, start, count, current, 2, 1, 1)
             try self.indirect(pass, &self.kernels.intersect_shadow, block, start, count, current, 4)
         try self.dispatch(pass, &self.kernels.finish, block, start, count, 0, 0, groups, 1)
         if self.settings.guiding:
@@ -488,7 +482,6 @@ pub struct Renderer:
         if kernel == &self.kernels.shade_surface: return kind_surface
         if kernel == &self.kernels.shade_miss: return kind_miss
         if kernel == &self.kernels.intersect_shadow: return kind_shadow
-        if kernel == &self.kernels.schedule: return kind_schedule
         if kernel == &self.kernels.finish: return kind_finish
         if kernel == &self.kernels.film_convert: return kind_convert
         return kind_adaptive
@@ -500,7 +493,7 @@ pub struct Renderer:
         if out.length < 10: error(invalid, "kernel times need ten numbers")
         for at in 0..<(usize)10: out[at] = self.kernel_ns[at] * 1e-6
 
-    ## A kernel over queue `queue`, sized by the arguments schedule left for it.
+    ## A kernel over queue `queue`, sized by the arguments its producer left for it.
     func indirect(pass: gpu.Compute*, kernel: const Kernel*, block: u8[], start: usize, count: usize, current: u32, queue: usize) -> !:
         self.uniforms(block, start, count, current, 0)
         let bound = self.bindings(kernel)

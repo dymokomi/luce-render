@@ -117,6 +117,40 @@ void set_u(uint field, uint path, uint value) { state_u[field * params.pool + pa
 #define QUEUE_BASE 32u
 
 uint queue_count(uint queue) { return queues[queue]; }
+
+// Scheduling without a scheduling kernel: the last workgroup of each kernel to
+// finish (counted in queues[QUEUE_DONE]) writes the indirect arguments of the
+// kernels that consume what it produced, and empties the queue it consumed.
+// Every indirect dispatch launches at least one workgroup, so the chain never
+// stops at an empty queue.
+#define QUEUE_DONE 8u
+uint arguments_slot(uint queue) { return 16u + 3u * queue; }
+
+void arguments(uint queue) {
+    uint count = atomicAdd(queues[queue], 0u);
+    uint at = arguments_slot(queue);
+    queues[at] = max(1u, (count + 63u) / 64u);
+    queues[at + 1u] = 1u;
+    queues[at + 2u] = 1u;
+}
+
+// Whether this thread is the first of the last of `groups` workgroups to
+// finish; every thread of the kernel must call it. Each workgroup's writes
+// are visible to the last one.
+bool last_group(uint groups) {
+    memoryBarrierBuffer();
+    barrier();
+    bool last = false;
+    if (gl_LocalInvocationIndex == 0u) {
+        uint done = atomicAdd(queues[QUEUE_DONE], 1u);
+        if (done + 1u == groups) {
+            last = true;
+            queues[QUEUE_DONE] = 0u;
+            memoryBarrierBuffer();
+        }
+    }
+    return last;
+}
 uint queue_path(uint queue, uint at) { return queues[QUEUE_BASE + queue * params.pool + at]; }
 void queue_push(uint queue, uint path) {
     uint at = atomicAdd(queues[queue], 1u);

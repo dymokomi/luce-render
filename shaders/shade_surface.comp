@@ -36,7 +36,7 @@ void add_radiance(uint path, Spec contribution) {
     set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + contribution);
 }
 
-void main() {
+void work() {
     uint at = gl_GlobalInvocationID.x;
     if (at >= queue_count(Q_SURFACE)) return;
     uint path = queue_path(Q_SURFACE, at);
@@ -245,4 +245,11 @@ void main() {
     set_v(SV_DIRECTION, path, vec4(direction, pdf));
     set_v(SV_THROUGHPUT, path, throughput);
     queue_push(Q_CLOSEST + 1u - params.current, path);
+}
+
+void main() {
+    work();
+    if (last_group(queues[arguments_slot(Q_SURFACE)])) {
+        queues[Q_SURFACE] = 0u;
+    }
 }

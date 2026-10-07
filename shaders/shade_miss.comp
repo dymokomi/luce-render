@@ -9,7 +9,7 @@ layout(local_size_x = 64) in;
 #include "spectrum.glsl"
 #include "lights.glsl"
 
-void main() {
+void work() {
     uint at = gl_GlobalInvocationID.x;
     if (at >= queue_count(Q_MISS)) return;
     uint path = queue_path(Q_MISS, at);
@@ -37,4 +37,14 @@ void main() {
     float largest = spec_max(contribution);
     if (bounce > 0u && clamp_value > 0.0 && largest > clamp_value) contribution *= clamp_value / largest;
     set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + contribution);
+}
+
+void main() {
+    work();
+    if (last_group(queues[arguments_slot(Q_MISS)])) {
+        // Shading is done: shadow rays and the next round's rays are ready.
+        queues[Q_MISS] = 0u;
+        arguments(Q_SHADOW);
+        arguments(Q_CLOSEST + 1u - params.current);
+    }
 }

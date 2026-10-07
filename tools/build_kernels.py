@@ -20,7 +20,7 @@ OUTPUT = ROOT / 'src' / 'render' / 'kernels.lucb'
 # (source, stem, defines): kernels as the host creates them.
 KERNELS = [('probe.comp', 'probe', ''), ('tables.comp', 'tables', ''), ('guide_fit.comp', 'guide_fit', '')]
 # The integrator, spectral and RGB.
-for name in ['camera', 'schedule', 'shade_surface', 'shade_miss', 'finish', 'film_convert', 'adaptive']:
+for name in ['camera', 'shade_surface', 'shade_miss', 'finish', 'film_convert', 'adaptive']:
     KERNELS.append((f'{name}.comp', f'{name}', 'SPECTRAL=1'))
     KERNELS.append((f'{name}.comp', f'{name}_rgb', 'SPECTRAL=0'))
 # Intersection reads no spectra, so both builds share it: on the software

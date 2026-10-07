@@ -10,7 +10,7 @@ layout(local_size_x = 64) in;
 #include "sampler.glsl"
 #include "spectrum.glsl"
 
-void main() {
+void work() {
     uint path = gl_GlobalInvocationID.x;
     if (path >= params.band_count) return;
     uint pixel = params.band_start + path;
@@ -37,4 +37,11 @@ void main() {
     set_v(SV_LAMBDA, path, sample_wavelengths(sample4(pixel, params.sample_index, GROUP_WAVELENGTH).x));
 #endif
     queue_push(Q_CLOSEST, path);
+}
+
+void main() {
+    work();
+    if (last_group((params.band_count + 63u) / 64u)) {
+        arguments(Q_CLOSEST);
+    }
 }

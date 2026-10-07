@@ -1,6 +1,6 @@
 #version 460
 // The nearest triangle or light along each queued ray: hits go to the surface
-// queue, misses to the miss queue.
+// queue, misses to the miss queue. The last workgroup sizes the shading kernels.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -10,7 +10,7 @@ layout(local_size_x = 64) in;
 #include "lights.glsl"
 #include "trace.glsl"
 
-void main() {
+void work() {
     uint queue = Q_CLOSEST + params.current;
     uint at = gl_GlobalInvocationID.x;
     if (at >= queue_count(queue)) return;
@@ -37,4 +37,14 @@ void main() {
     set_v(SV_HIT, path, vec4(hit.t, 0.0, hit.uv));
     set_u(SU_HIT, path, what);
     queue_push(Q_SURFACE, path);
+}
+
+void main() {
+    work();
+    if (last_group(queues[arguments_slot(Q_CLOSEST + params.current)])) {
+        // Hits are shaded, misses taken by shade_miss; this round's rays are done.
+        arguments(Q_SURFACE);
+        arguments(Q_MISS);
+        queues[Q_CLOSEST + params.current] = 0u;
+    }
 }

@@ -1,5 +1,5 @@
 ## How long a dispatch costs in luce-gpu with no work in it: passes of N
-## dependent one-thread dispatches, timed on the GPU and on the CPU. Printed,
+## dependent one-workgroup dispatches of the camera kernel with no pixels, timed on the GPU and on the CPU. Printed,
 ## not checked.
 import memory
 from luce_std import clock
@@ -8,7 +8,7 @@ from luce_gpu import gpu
 from luce_render import render
 
 pub func measure(device: gpu.Device) -> !:
-    var kernel = try gpu.Kernel.create(device, render.schedule_comp_words, render.schedule_comp_msl, render.schedule_comp_group, render.schedule_comp_bindings)
+    var kernel = try gpu.Kernel.create(device, render.camera_comp_words, render.camera_comp_msl, render.camera_comp_group, render.camera_comp_bindings)
     defer kernel.destroy()
     var queues = try gpu.Buffer.allocate(device, 4096)
     defer queues.destroy()
@@ -17,7 +17,7 @@ pub func measure(device: gpu.Device) -> !:
     var bindings: gpu.Binding[16] = [gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(),
                                      gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding()]
     for at in 0..<(usize)16:
-        if render.schedule_comp_bindings[at] == 1: bindings[at] = gpu.Binding(buffer = queues if at == 6 else constants)
+        if render.camera_comp_bindings[at] == 1: bindings[at] = gpu.Binding(buffer = queues if at == 6 else constants)
     var block: u8[104]
     for at in 0..<(usize)104: block[at] = 0
     for count in [10, 100, 400]:

@@ -17,7 +17,7 @@ layout(set = 0, binding = 11, std430) readonly buffer Shading { uvec4 shading[];
 layout(set = 0, binding = 12, std430) readonly buffer Materials { vec4 materials[]; };
 #define MATERIAL_STRIDE 16u
 
-void main() {
+void work() {
     uint at = gl_GlobalInvocationID.x;
     if (at >= queue_count(Q_SHADOW)) return;
     uint path = queue_path(Q_SHADOW, at);
@@ -49,5 +49,12 @@ void main() {
             set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + get_v(SV_SHADOW_RADIANCE, path) * kept);
             return;
         }
+    }
+}
+
+void main() {
+    work();
+    if (last_group(queues[arguments_slot(Q_SHADOW)])) {
+        queues[Q_SHADOW] = 0u;
     }
 }
