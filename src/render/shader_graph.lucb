@@ -391,30 +391,31 @@ func number_of(text: str) -> f64!:
 pub func compile_graph(text: str, images: ImageSlots, words: Growing[u32]*) -> i64!:
     var compiler = Compiler(Growing[GraphNode](), Growing[GraphInput](), Growing[u32](), 0, images, -1, -1)
     defer compiler.close()
-    # Statements, by line.
-    var start: usize = 0
-    let bytes = text.bytes
-    for at in 0..<bytes.length + 1:
-        if at < bytes.length and bytes[at] != 10 and bytes[at] != ';': continue
-        let line = (str)bytes[start..<at]
-        start = at + 1
-        let verb = token(line, 0)
-        if verb == "node":
-            try compiler.nodes.push(GraphNode(token(line, 1), token(line, 2), line_from(line, 3), false, Growing[u32]()))
-        elif verb == "input" or verb == "link":
-            let node = compiler.find(token(line, 1))
-            if node < 0: error(invalid, "a node graph sets an input of a node it lacks")
-            var entry = GraphInput((usize)node, token(line, 2), [0.0, 0.0, 0.0], -1, "")
-            if verb == "input":
-                for k in 0..<(usize)3: entry.values[k] = try number_of(token(line, 3 + k))
-                if token(line, 4).length == 0:
-                    entry.values[1] = entry.values[0]
-                    entry.values[2] = entry.values[0]
-            else:
-                entry.source = compiler.find(token(line, 3))
-                if entry.source < 0: error(invalid, "a node graph links from a node it lacks")
-                entry.output = token(line, 4)
-            try compiler.inputs.push(entry)
+    # Statements, by line: nodes first, so links may name nodes defined later.
+    for pass in 0..<(usize)2:
+        var start: usize = 0
+        let bytes = text.bytes
+        for at in 0..<bytes.length + 1:
+            if at < bytes.length and bytes[at] != 10 and bytes[at] != ';': continue
+            let line = (str)bytes[start..<at]
+            start = at + 1
+            let verb = token(line, 0)
+            if verb == "node" and pass == 0:
+                try compiler.nodes.push(GraphNode(token(line, 1), token(line, 2), line_from(line, 3), false, Growing[u32]()))
+            elif (verb == "input" or verb == "link") and pass == 1:
+                let node = compiler.find(token(line, 1))
+                if node < 0: error(invalid, "a node graph sets an input of a node it lacks")
+                var entry = GraphInput((usize)node, token(line, 2), [0.0, 0.0, 0.0], -1, "")
+                if verb == "input":
+                    for k in 0..<(usize)3: entry.values[k] = try number_of(token(line, 3 + k))
+                    if token(line, 4).length == 0:
+                        entry.values[1] = entry.values[0]
+                        entry.values[2] = entry.values[0]
+                else:
+                    entry.source = compiler.find(token(line, 3))
+                    if entry.source < 0: error(invalid, "a node graph links from a node it lacks")
+                    entry.output = token(line, 4)
+                try compiler.inputs.push(entry)
     # The surface's linked inputs, each an output op.
     var surface: i64 = -1
     for at in 0..<compiler.nodes.count:
