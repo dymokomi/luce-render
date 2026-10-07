@@ -14,6 +14,11 @@
 #       Scale in the camera's placement does not change its view: its axes are
 #       normalized. Orthographic apertures are in tenths of a scene unit, as in USD.
 #
+#       A perspective camera with an f-stop is a thin lens: rays leave a point
+#       on a disk of radius focal length / (2 f-stop), the focal length taken
+#       from millimetres to metres (scene units are metres), toward where the
+#       pinhole ray meets the plane at the focus distance.
+#
 #==============================================================================================
 
 ## What the kernels need to make primary rays: 16 floats, as push constants
@@ -27,6 +32,10 @@ pub struct RayFrame:
     pub var orthographic: bool
     pub var width: u32
     pub var height: u32
+    ## The thin lens's radius (0: a pinhole) and the distance in focus, in
+    ## scene units.
+    pub var lens_radius: f64
+    pub var focus_distance: f64
 
     ## The 64-byte block the kernels read.
     pub func pack(out: f32[]) -> !:
@@ -63,4 +72,5 @@ pub func ray_frame(object: SceneObject, width: u32, height: u32) -> RayFrame!:
     let corner = right.multiply_scalar(-half_width).add(up.multiply_scalar(half_height)).add(Vector3() if orthographic else forward)
     let du = right.multiply_scalar(2.0 * half_width / (f64)width)
     let dv = up.multiply_scalar(-2.0 * half_height / (f64)height)
-    return RayFrame(m.translation, corner, du, dv, forward, orthographic, width, height)
+    let lens = 0.0005 * camera.focal_length / camera.f_stop if camera.f_stop > 0.0 and not orthographic else 0.0
+    return RayFrame(m.translation, corner, du, dv, forward, orthographic, width, height, lens, camera.focus_distance)

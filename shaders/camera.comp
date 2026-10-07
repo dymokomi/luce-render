@@ -1,5 +1,6 @@
 #version 450
-// Start one path per pixel of the band: a jittered primary ray, four wavelengths
+// Start one path per pixel of the band: a jittered primary ray (through a thin
+// lens when the camera has an aperture), four wavelengths
 // (spectral), unit throughput, no radiance, queued for the first closest hit.
 // Pixels adaptive sampling has found converged start none (pixel NONE).
 #extension GL_GOOGLE_include_directive : require
@@ -25,6 +26,13 @@ void work() {
     bool orthographic = params.position.w > 0.5;
     vec3 origin = orthographic ? params.position.xyz + film : params.position.xyz;
     vec3 direction = normalize(orthographic ? cross(params.du.xyz, params.dv.xyz) : film);
+    // A thin lens: from a point on the lens toward where the pinhole ray
+    // meets the focus plane.
+    if (!orthographic && constants[K_CAMERA].z > 0.0) {
+        vec3 focused = params.position.xyz + direction * (constants[K_CAMERA].w / dot(direction, constants[K_VIEW].xyz));
+        origin = lens_point(u.zw);
+        direction = normalize(focused - origin);
+    }
     set_u(SU_PIXEL, path, pixel);
     set_u(SU_BOUNCE, path, 0u);
     set_v(SV_ORIGIN, path, vec4(origin, 0.0));

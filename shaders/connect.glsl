@@ -21,16 +21,19 @@
 // paths count only the total bounce limit's reach.
 // Needs common.glsl, lights.glsl, openpbr.glsl and lighttree.glsl before it.
 
-// The pixel the camera sees point p through, and the unit direction and
-// distance from the camera to p; false when p is behind it or off the image.
-bool camera_pixel(vec3 p, out uint pixel, out vec3 d, out float distance_to) {
-    vec3 offset = p - params.position.xyz;
+// The pixel the camera sees point p through from the lens point `lens`, and
+// the unit direction and distance from there to p; false when p is behind the
+// camera or off the image. A thin lens images the point where the ray meets
+// the focus plane through the lens's center.
+bool camera_pixel(vec3 p, vec3 lens, out uint pixel, out vec3 d, out float distance_to) {
+    vec3 offset = p - lens;
     distance_to = length(offset);
     d = offset / max(distance_to, 1e-20);
     float c = dot(d, constants[K_VIEW].xyz);
     if (c <= 1e-6 || distance_to <= 0.0) return false;
     // On the image plane at unit distance, which the corner lies on.
-    vec3 film = d / c - params.corner.xyz;
+    float focus = constants[K_CAMERA].w;
+    vec3 film = (constants[K_CAMERA].z > 0.0 ? (lens + d * (focus / c) - params.position.xyz) / focus : d / c) - params.corner.xyz;
     float x = dot(film, params.du.xyz) / dot(params.du.xyz, params.du.xyz);
     float y = dot(film, params.dv.xyz) / dot(params.dv.xyz, params.dv.xyz);
     if (!(x >= 0.0 && y >= 0.0 && x < params.du.w && y < params.dv.w)) return false;

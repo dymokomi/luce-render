@@ -95,17 +95,39 @@ layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[
                             // w: unguided over guided throughput, which Russian roulette weighs (guiding must not change survival)
 uint light_count() { return LIGHTS != 0xffffffffu ? LIGHTS : uint(constants[K_INFO].x); }
 
+// A point on the unit disk, Shirley and Chiu's concentric map.
+vec2 concentric(vec2 u) {
+    vec2 o = 2.0 * u - 1.0;
+    if (o.x == 0.0 && o.y == 0.0) return vec2(0.0);
+    float r, theta;
+    if (abs(o.x) > abs(o.y)) { r = o.x; theta = (PI / 4.0) * (o.y / o.x); }
+    else { r = o.y; theta = (PI / 2.0) - (PI / 4.0) * (o.x / o.y); }
+    return r * vec2(cos(theta), sin(theta));
+}
+
 // Light tracing (connect.glsl).
-#define K_LIGHT_PATHS 14    // x light paths a sample (0: none), y 1 / a pixel's area on the image plane at unit distance
+#define K_CAMERA 14         // x light paths a sample (0: none), y 1 / a pixel's area on the image plane at unit
+                            // distance, z the lens radius (0: a pinhole), w the focus distance
 #define K_VIEW 15           // the camera's forward axis (unit)
-bool light_tracing() { return LIGHT_TRACING && constants[K_LIGHT_PATHS].x > 0.0; }
-float light_paths() { return constants[K_LIGHT_PATHS].x; }
+bool light_tracing() { return LIGHT_TRACING && constants[K_CAMERA].x > 0.0; }
+float light_paths() { return constants[K_CAMERA].x; }
 
 // The camera's density of a ray leaving it along `d` (unit), per unit of a
-// pixel's area on the image plane: 1 / (A cos³θ).
+// pixel's area on the image plane: 1 / (A cos³θ). With a thin lens, the same
+// for a ray from its point on the lens: the lens point's own density (one over
+// the lens's area) is the same for every technique and cancels.
+// A point on the lens from two uniform numbers (the camera's position for a
+// pinhole). The lens lies in the image plane's directions.
+vec3 lens_point(vec2 u) {
+    float radius = constants[K_CAMERA].z;
+    if (radius <= 0.0) return params.position.xyz;
+    vec2 disk = concentric(u) * radius;
+    return params.position.xyz + normalize(params.du.xyz) * disk.x + normalize(params.dv.xyz) * disk.y;
+}
+
 float camera_pdf(vec3 d) {
     float c = dot(d, constants[K_VIEW].xyz);
-    return c > 0.0 ? constants[K_LIGHT_PATHS].y / (c * c * c) : 0.0;
+    return c > 0.0 ? constants[K_CAMERA].y / (c * c * c) : 0.0;
 }
 
 // Light tracing's MIS (connect.glsl). A camera path: the product of the light

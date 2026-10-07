@@ -80,7 +80,8 @@ void shade_light(uint path) {
     uint pixel;
     vec3 to_point;
     float camera_distance;
-    if (camera_pixel(p, pixel, to_point, camera_distance)) {
+    vec3 lens = lens_point(sample4(LIGHT_PATH_ID(path), params.sample_index, GROUP_LIGHT(total)).xy);
+    if (camera_pixel(p, lens, pixel, to_point, camera_distance)) {
         vec3 to_camera = -to_point;
         float side = dot(to_camera, geometric);
         Surface seen = side > 0.0 ? lit : turned(lit);

@@ -59,16 +59,6 @@ struct LightSample {
     bool delta;
 };
 
-// A point on the unit disk, Shirley and Chiu's concentric map.
-vec2 concentric(vec2 u) {
-    vec2 o = 2.0 * u - 1.0;
-    if (o.x == 0.0 && o.y == 0.0) return vec2(0.0);
-    float r, theta;
-    if (abs(o.x) > abs(o.y)) { r = o.x; theta = (PI / 4.0) * (o.y / o.x); }
-    else { r = o.y; theta = (PI / 2.0) - (PI / 4.0) * (o.x / o.y); }
-    return r * vec2(cos(theta), sin(theta));
-}
-
 // A direction in the cone of `cos_max` around unit `axis`, uniformly.
 vec3 sample_cone(vec3 axis, float cos_max, vec2 u) {
     float c = 1.0 - u.x * (1.0 - cos_max);

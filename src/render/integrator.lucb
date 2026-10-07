@@ -291,16 +291,16 @@ pub struct Renderer:
             try pack_material(material, &records)
             cutouts = cutouts or material.geometry_opacity < 1.0
         rows[3] = 1.0 if cutouts else 0.0
-        # Light tracing: light paths a sample (at most a band's), the image
-        # plane's pixel area at unit distance, the camera's axis. They take
-        # the pool's slots after the band's camera paths.
+        # The camera: light paths a sample (at most a band's; they take the
+        # pool's slots after the band's camera paths), the image plane's pixel
+        # area at unit distance, the lens, the camera's axis.
         var light_paths: usize = 0
         if settings.light_tracing > 0.0 and not frame.orthographic and tree.emitter_count > 0:
             let wanted = (usize)math.max(1.0, math.round(settings.light_tracing * (f64)pixels))
             light_paths = wanted if wanted < band else band
         let slots = band + light_paths
         let pixel_area = frame.du.length() * frame.dv.length()
-        let view_rows: f64[8] = [(f64)light_paths, 1.0 / pixel_area if pixel_area > 0.0 else 0.0, 0.0, 0.0,
+        let view_rows: f64[8] = [(f64)light_paths, 1.0 / pixel_area if pixel_area > 0.0 else 0.0, frame.lens_radius, frame.focus_distance,
                                  frame.forward.x, frame.forward.y, frame.forward.z, 0.0]
         for k in 0..<(usize)8: rows[56 + k] = (f32)view_rows[k]
         var constants = try gpu.Buffer.create(device, u8[]((u8*)&rows[0], 256))

@@ -34,6 +34,7 @@ pub func checks(device: gpu.Device) -> !:
     try emissive_quad(device, false, 0.0)
     try emissive_quad(device, true, 1.0)
     try lit_room(device)
+    try thin_lens(device)
     try cutout_shadow(device)
     try adaptive(device)
     try guided_room(device)
@@ -436,6 +437,34 @@ func lit_room(device: gpu.Device) -> !:
     print(f"light tracing: room MSE at 256 samples {errors[1]} against {errors[0]} without ({errors[0] / math.max(errors[1], 1e-30)}x better); mean {means[2] / means[0]} of the reference's")
     assert(errors[1] < errors[0])
     assert(math.abs(means[2] / means[0] - 1.0) < 0.01)
+
+## Through a thin lens (f/0.5 on a 50 mm lens, focused 2 m away, past the
+## sphere), light paths that land on the lens and camera paths that leave it
+## agree on the image's mean.
+func thin_lens(device: gpu.Device) -> !:
+    let ball = try MeshPrimitives.sphere(0.5, 32)
+    defer ball.release()
+    let floor = try MeshPrimitives.grid(20.0, 8)
+    defer floor.release()
+    let both = try (try GeometrySet.of_mesh(ball)).value().merged(try GeometrySet.of_mesh(floor))
+    defer both.release()
+    let viewed = try both.value().with_camera("/camera", Vector3(0.0, 0.6, 3.0), Vector3(-0.1, 0.0, 0.0), 0, 50.0, 36.0, 24.0, 0.1, 100.0, 0.5, 2.0)
+    defer viewed.release()
+    let set = try viewed.value().with_light("/key", Vector3(0.0, 2.0, 0.0), Vector3(-0.5 * math.pi, 0.0, 0.0), 0, Vector3(1.0, 1.0, 1.0), 8.0, 0.0, 0.0, false, 1.0, 1.0, 0.5, 0.0, false)
+    defer set.release()
+    var means: f64[2] = [0.0, 0.0]
+    let pixels = try new f32[48 * 32 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    for way in 0..<(usize)2:
+        var settings = render.RenderSettings.of(48, 32, 2048)
+        settings.spectral = false
+        settings.max_bounces = 3
+        settings.light_tracing = 1.0 if way == 1 else 0.0
+        settings.seed = (u32)(way + 1)
+        try rendered(device, set.value(), settings, pixels)
+        for p in 0..<(usize)(48 * 32): means[way] += (f64)pixels[p * 4 + 1]
+    print(f"thin lens: light paths give {means[1] / means[0]} of the camera paths' mean")
+    assert(math.abs(means[1] / means[0] - 1.0) < 0.005)
 
 func area_light(device: gpu.Device, spectral: bool, light_tracing: f64) -> !:
     let floor = try MeshPrimitives.grid(20.0, 8)
