@@ -44,7 +44,7 @@ pub func main(arguments: str[]) -> i32!:
         try compare(device, &scene, &on_gpu, &frame, scene.objects.path(camera))
     print(f"PASS probe: BVH traversal on the GPU agrees with brute force over {scene.triangle_count()} triangles, perspective and orthographic")
     try integrator.checks(device)
-    print("PASS integrator: white furnace (diffuse under specular, rough EON, rough metal), emission, area light irradiance, spectral against RGB (both builds), hardware ray queries against the BVH")
+    print("PASS integrator: white furnace (diffuse under specular, rough EON, rough metal), emission, assigned materials, area light irradiance, spectral against RGB (both builds), hardware ray queries against the BVH")
     return 0
 
 ## Every pixel's GPU hit against the nearest of all triangles in f64. Pixels whose

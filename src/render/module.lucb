@@ -32,7 +32,7 @@ from luce_std import clock
 from luce_std import math
 from luce_std import math32
 from luce_geocore.geocore import Vector3, Matrix4, Mesh, MeshPrimitives, GeometrySet, SceneObject, SceneKind, Camera, Projection, LightShape
-from luce_geocore.kernel import Float3, append_text, Instances, Component, SceneObjects, mesh_component, instances_component, scene_flattened
+from luce_geocore.kernel import Float3, append_text, Instances, Component, SceneObjects, Materials, MaterialParameter, mesh_component, instances_component, scene_flattened, materials_flattened
 from luce_geocore.core.growing import Growing
 from luce_gpu import gpu
 

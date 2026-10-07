@@ -48,6 +48,40 @@ pub struct OpenPbr:
                        0.0, white,
                        1.0, false)
 
+## Material `index` of a library as OpenPbr: its parameters by OpenPBR's names,
+## the specification's defaults for the rest. A material for another shader is
+## the default.
+pub func openpbr_of(materials: const Materials*, index: usize) -> OpenPbr:
+    var m = OpenPbr.standard()
+    if materials.shader(index) != "openpbr": return m
+    for at in 0..<materials.parameter_count(index):
+        let name = materials.parameter_name(index, at)
+        let p = materials.parameter_value(index, at)
+        let v = p.value
+        let color = Vector3(v[0], v[1], v[2])
+        if name == "base_weight": m.base_weight = v[0]
+        elif name == "base_color": m.base_color = color
+        elif name == "base_metalness": m.base_metalness = v[0]
+        elif name == "base_diffuse_roughness": m.base_diffuse_roughness = v[0]
+        elif name == "specular_weight": m.specular_weight = v[0]
+        elif name == "specular_color": m.specular_color = color
+        elif name == "specular_roughness": m.specular_roughness = v[0]
+        elif name == "specular_roughness_anisotropy": m.specular_roughness_anisotropy = v[0]
+        elif name == "specular_ior": m.specular_ior = v[0]
+        elif name == "transmission_weight": m.transmission_weight = v[0]
+        elif name == "transmission_color": m.transmission_color = color
+        elif name == "coat_weight": m.coat_weight = v[0]
+        elif name == "coat_color": m.coat_color = color
+        elif name == "coat_roughness": m.coat_roughness = v[0]
+        elif name == "coat_roughness_anisotropy": m.coat_roughness_anisotropy = v[0]
+        elif name == "coat_ior": m.coat_ior = v[0]
+        elif name == "coat_darkening": m.coat_darkening = v[0]
+        elif name == "emission_luminance": m.emission_luminance = v[0]
+        elif name == "emission_color": m.emission_color = color
+        elif name == "geometry_opacity": m.geometry_opacity = v[0]
+        elif name == "geometry_thin_walled": m.geometry_thin_walled = v[0] != 0.0
+    return m
+
 ## Append `material`'s record: material_stride vec4s.
 pub func pack_material(material: OpenPbr, out: Growing[f32]*) -> !:
     let colors: Vector3[5] = [material.base_color, material.specular_color, material.coat_color,

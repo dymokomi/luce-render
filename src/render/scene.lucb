@@ -7,7 +7,10 @@
 #       positions (x, y, z per point), three point indices per triangle, each
 #       triangle's polygon (its face in its mesh, offset by the faces of the meshes
 #       before it), and its shading attributes: the normals of its three corners
-#       (octahedral, snorm16 × 2) and its material, four u32s. Shading normals follow
+#       (octahedral, snorm16 × 2) and its material, four u32s. A triangle's material
+#       is its face's `material` attribute looked up among the set's materials
+#       (flattened, `materials`): its index + 1, or 0 (the render's default
+#       material) when the face names none or a material the set lacks. Shading normals follow
 #       the viewport (luce-3d's mesh batches): an authored N on the first domain that
 #       has one (corner, point, face, detail), else the mesh's smooth normals.
 #       Cameras and lights come flattened to world space. Analytic CAD has no
@@ -29,6 +32,8 @@ pub struct CompiledScene:
     pub var shading: Growing[u32]
     pub var nodes: Growing[BvhNode]
     pub var objects: SceneObjects
+    ## Every material definition of the set and its instances.
+    pub var materials: Materials
     ## Components with no triangles to trace (CAD before Tessellate).
     pub var skipped: usize
 
@@ -39,6 +44,7 @@ pub struct CompiledScene:
         self.shading = Growing[u32]()
         self.nodes = Growing[BvhNode]()
         self.objects = SceneObjects()
+        self.materials = Materials()
         self.skipped = 0
 
     pub func triangle_count() -> usize:
@@ -54,6 +60,7 @@ pub struct CompiledScene:
         self.shading.close()
         self.nodes.close()
         self.objects.close()
+        self.materials.close()
 
 ## `set` compiled: its triangles in world space with their BVH, and its cameras
 ## and lights.
@@ -61,6 +68,7 @@ pub func compile_scene(set: const GeometrySet*) -> CompiledScene!:
     var scene = CompiledScene()
     errdefer scene.close()
     var face_base: u32 = 0
+    try materials_flattened(set, &scene.materials)
     try add_set(&scene, set, Matrix4(), &face_base, 0)
     if scene.point_count() > 4294967295: error(limit, "a scene holds at most 2^32 points")
     try scene_flattened(set, Matrix4(), &scene.objects)
@@ -100,6 +108,8 @@ func add_mesh(scene: CompiledScene*, mesh: const Mesh*, matrix: Matrix4, face_ba
     let count = triangles.length // 3
     var normals = try shading_normals(mesh)
     defer normals.close()
+    let face_materials = try material_indices(&scene.materials, mesh)
+    defer free(face_materials) in memory.heap
     try scene.indices.reserve(scene.indices.count + count * 3)
     try scene.faces.reserve(scene.faces.count + count)
     try scene.shading.reserve(scene.shading.count + count * 4)
@@ -114,12 +124,33 @@ func add_mesh(scene: CompiledScene*, mesh: const Mesh*, matrix: Matrix4, face_ba
                 _ = failure
                 recover Vector3(0.0, 1.0, 0.0)
             scene.shading.items[scene.shading.count + k] = octahedral(normal)
-        scene.shading.items[scene.shading.count + 3] = 0
+        scene.shading.items[scene.shading.count + 3] = face_materials[(usize)corner_faces[(usize)triangles[at * 3]]]
         scene.indices.count += 3
         scene.shading.count += 4
         scene.faces.items[scene.faces.count] = *face_base + (u32)corner_faces[(usize)triangles[at * 3]]
         scene.faces.count += 1
     *face_base += (u32)mesh.face_count()
+
+## Each face's material: index + 1 in `materials` of the path its `material`
+## attribute names, else 0. Each distinct path is looked up once.
+func material_indices(materials: const Materials*, mesh: const Mesh*) -> u32[]!:
+    let faces = (usize)mesh.face_count()
+    let out = try new u32[faces] in memory.heap
+    let attribute = mesh.find_attribute("material", 2)
+    if attribute < 0 or materials.count() == 0: return out
+    let strings = (usize)(try mesh.attribute_string_count(attribute))
+    let looked = try new u32[strings] in memory.heap
+    defer free(looked) in memory.heap
+    for at in 0..<strings:
+        let found = materials.index_of(try mesh.attribute_string(attribute, (i64)at))
+        looked[at] = (u32)(found + 1)
+    for face in 0..<faces:
+        let path = try mesh.attribute_text(attribute, (i64)face)
+        for at in 0..<strings:
+            if (try mesh.attribute_string(attribute, (i64)at)) == path:
+                out[face] = looked[at]
+                break
+    return out
 
 ## A mesh's shading normals and the domain they are indexed by.
 struct ShadingNormals:

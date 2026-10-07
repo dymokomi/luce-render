@@ -176,7 +176,9 @@ pub struct Renderer:
         errdefer constants.destroy()
         var records = Growing[f32]()
         defer records.close()
+        # The default first (material 0), then the scene's library.
         try pack_material(settings.material, &records)
+        for index in 0..<scene.materials.count(): try pack_material(openpbr_of(&scene.materials, index), &records)
         var materials = try buffer_of(device, u8[]((u8*)records.items.data, records.count * 4))
         errdefer materials.destroy()
         var tables = try make_tables(device)

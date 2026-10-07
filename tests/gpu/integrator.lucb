@@ -10,7 +10,7 @@ from luce_std import math
 from luce_std import clock
 from luce_gpu import gpu
 from luce_render import render
-from luce_geocore.geocore import Vector3, Mesh, MeshPrimitives, GeometrySet
+from luce_geocore.geocore import Vector3, Mesh, MeshPrimitives, GeometrySet, MaterialAssignment
 
 pub func checks(device: gpu.Device) -> !:
     try furnace(device, true, 0.0)
@@ -20,6 +20,7 @@ pub func checks(device: gpu.Device) -> !:
     try metal_furnace(device, false, 1.0)
     try emission(device, false)
     try emission(device, true)
+    try assigned_materials(device)
     try area_light(device, true)
     try area_light(device, false)
     try spectral_agrees(device, 0.0)
@@ -113,6 +114,39 @@ func emission(device: gpu.Device, spectral: bool) -> !:
     let center = window_mean(pixels, 32, 12, 12, 8)
     if math.abs(center.x - 3.0) > 0.03 or math.abs(center.y - 1.5) > 0.02 or math.abs(center.z - 0.75) > 0.02:
         print(f"emission (spectral {spectral}): {center.x} {center.y} {center.z}")
+        assert(false)
+
+## Two spheres in the dark: the left assigned an emissive red material by its
+## faces' `material` attribute, the right on the default material. Only the
+## left glows; an unknown path falls back to the default.
+func assigned_materials(device: gpu.Device) -> !:
+    let sphere = try MeshPrimitives.sphere(1.0, 24)
+    defer sphere.release()
+    let red_faces = try MaterialAssignment.faces(sphere, "", "material", "materials/red")
+    defer red_faces.release()
+    let unknown_faces = try MaterialAssignment.faces(sphere, "", "material", "materials/missing")
+    defer unknown_faces.release()
+    let left = try (try GeometrySet.of_mesh(red_faces)).value().transformed(Vector3(-1.2, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer left.release()
+    let right = try (try GeometrySet.of_mesh(unknown_faces)).value().transformed(Vector3(1.2, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer right.release()
+    let both = try left.value().merged(right)
+    defer both.release()
+    let library = try both.value().with_material("materials/red", "openpbr", "emission_luminance\nemission_color", [2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    defer library.release()
+    let set = try library.value().with_camera("/camera", Vector3(0.0, 1.0, 6.0), Vector3(), 0, 35.0, 36.0, 24.0, 0.1, 100.0, 0.0, 4.0)
+    defer set.release()
+    # RGB: pure ACEScg red has no smooth spectrum, so the spectral build is
+    # close but not exact.
+    var settings = render.RenderSettings.of(48, 32, 4)
+    settings.spectral = false
+    let pixels = try new f32[48 * 32 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    try rendered(device, set.value(), settings, pixels)
+    let glowing = window_mean(pixels, 48, 12, 14, 4)
+    let dark = window_mean(pixels, 48, 32, 14, 4)
+    if math.abs(glowing.x - 2.0) > 0.03 or glowing.y > 0.01 or dark.x > 0.001:
+        print(f"assigned materials: left {glowing.x} {glowing.y} {glowing.z}, right {dark.x} {dark.y} {dark.z}")
         assert(false)
 
 ## The irradiance at a point under the corner of an x × y rectangle of radiance
