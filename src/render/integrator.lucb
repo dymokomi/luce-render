@@ -204,8 +204,12 @@ pub struct Renderer:
     var light_count: usize
     ## Rounds of each pass beyond the bounces, for rays passing through cut-outs.
     var through: usize
-    ## The pass in flight, and what comes next: sample `sample`, band `band`.
-    var pending: gpu.Compute?
+    ## The passes in flight (older first) and the samples each completes; what
+    ## comes next: sample `sample`, band `band`.
+    var older: gpu.Compute?
+    var newer: gpu.Compute?
+    var older_completes: u32
+    var newer_completes: u32
     var sample: u32
     var band: usize
     var completed: u32
@@ -288,24 +292,33 @@ pub struct Renderer:
         var output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
         errdefer output.destroy()
         let shown = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
-        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, guide, guide_address, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, 8 if cutouts else 0, none, 0, 0, 0, Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, guide, guide_address, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, 8 if cutouts else 0, none, none, 0, 0, 0, 0, 0, Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     ## Start the next pass if the last has finished. True while there is work,
     ## running or to come; false once every sample is in the image.
     pub func advance() -> bool!:
-        if let running = self.pending:
-            if not (try running.done()): return true
-            var finished = running
-            try finished.wait()
-            if self.settings.profile and self.marks.count > 1:
-                var stamps: u64[64]
-                try finished.timestamps(stamps[..<self.marks.count])
-                for at in 1..<self.marks.count:
-                    self.kernel_ns[(usize)self.marks.items[at]] += (f64)(stamps[at] - stamps[at - 1])
-            finished.close()
-            self.pending = none
+        # Retire the older pass when it has finished.
+        if let running = self.older:
+            if try running.done():
+                var finished = running
+                try finished.wait()
+                if self.settings.profile and self.marks.count > 1:
+                    var stamps: u64[64]
+                    try finished.timestamps(stamps[..<self.marks.count])
+                    for at in 1..<self.marks.count:
+                        self.kernel_ns[(usize)self.marks.items[at]] += (f64)(stamps[at] - stamps[at - 1])
+                finished.close()
+                self.completed = self.older_completes
+                self.older = self.newer
+                self.older_completes = self.newer_completes
+                self.newer = none
+        # Keep two passes in flight (one when profiling, whose timestamps belong
+        # to one pass), so the GPU never waits for the CPU to notice a finish.
+        let in_flight = (0 if self.older == none else 1) + (0 if self.newer == none else 1)
+        let depth = 1 if self.settings.profile else 2
+        if in_flight >= depth: return true
         if self.sample >= self.settings.samples:
-            if not self.display_stale: return false
+            if not self.display_stale: return in_flight > 0
             # Only the display changed: convert the film again.
             self.display_stale = false
             var convert = try gpu.Compute.begin(self.device)
@@ -316,7 +329,7 @@ pub struct Renderer:
             memory.copy(block[0..<64], u8[]((u8*)&frame[0], 64), 64)
             try self.dispatch(&convert, &self.kernels.film_convert, block, 0, 0, 0, 0, (self.settings.width + 7) // 8, (self.settings.height + 7) // 8)
             try convert.submit()
-            self.pending = convert
+            self.queue_pass(convert, self.sample)
             return true
         self.display_stale = false
         var pass = try gpu.Compute.begin(self.device)
@@ -326,26 +339,34 @@ pub struct Renderer:
         try self.record(&pass)
         if self.settings.profile: try self.mark(&pass, kind_rest)
         try pass.submit()
-        self.pending = pass
         let bands = (self.pixels() + self.pool - 1) // self.pool
         self.band += 1
         if self.band == bands:
             self.band = 0
             self.sample += 1
+        self.queue_pass(pass, self.sample if self.band == 0 else self.sample)
         return true
+
+    ## Hold a submitted pass: the samples every pixel has once it finishes.
+    func queue_pass(pass: gpu.Compute, completes: u32):
+        if self.older == none:
+            self.older = pass
+            self.older_completes = completes
+        else:
+            self.newer = pass
+            self.newer_completes = completes
 
     ## Run every remaining pass to the end (offline renders and tests).
     pub func finish() -> !:
         while try self.advance():
-            if let running = self.pending:
-                var waiting = running
-                try waiting.wait()
+            if let running = self.older:
+                if not (try running.done()):
+                    var waiting = running
+                    try waiting.wait()
 
     ## Samples every pixel has, counting only passes that have finished.
     pub func samples_done() -> u32:
-        if self.pending == none: return self.sample
-        # The pass in flight finishes sample - 1 when it was that sample's last band.
-        return self.sample - 1 if self.band == 0 else self.sample
+        return self.completed
 
     ## The render as linear ACEScg, rgba32f: what is saved.
     pub func image() -> gpu.Texture:
@@ -482,11 +503,14 @@ pub struct Renderer:
         if self.settings.profile and self.marks.count < 62: try self.mark(pass, self.kind_of(kernel))
 
     pub func destroy():
-        if let running = self.pending:
-            var waiting = running
-            waiting.wait() catch failure: _ = failure
-            waiting.close()
-            self.pending = none
+        for slot in 0..<(usize)2:
+            let held = self.older if slot == 0 else self.newer
+            if let running = held:
+                var waiting = running
+                waiting.wait() catch failure: _ = failure
+                waiting.close()
+        self.older = none
+        self.newer = none
         self.kernels.destroy()
         self.scene.destroy()
         self.lights.destroy()

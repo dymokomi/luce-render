@@ -1,0 +1,39 @@
+## How long a dispatch costs in luce-gpu with no work in it: passes of N
+## dependent one-thread dispatches, timed on the GPU and on the CPU. Printed,
+## not checked.
+import memory
+from luce_std import clock
+from luce_std import math
+from luce_gpu import gpu
+from luce_render import render
+
+pub func measure(device: gpu.Device) -> !:
+    var kernel = try gpu.Kernel.create(device, render.schedule_comp_words, render.schedule_comp_msl, render.schedule_comp_group, render.schedule_comp_bindings)
+    defer kernel.destroy()
+    var queues = try gpu.Buffer.allocate(device, 4096)
+    defer queues.destroy()
+    var constants = try gpu.Buffer.allocate(device, 4096)
+    defer constants.destroy()
+    var bindings: gpu.Binding[16] = [gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(),
+                                     gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding(), gpu.Binding()]
+    for at in 0..<(usize)16:
+        if render.schedule_comp_bindings[at] == 1: bindings[at] = gpu.Binding(buffer = queues if at == 6 else constants)
+    var block: u8[104]
+    for at in 0..<(usize)104: block[at] = 0
+    for count in [10, 100, 400]:
+        var best: f64 = 1e9
+        for round in 0..<(usize)5:
+            _ = round
+            let start = clock.now()
+            var pass = try gpu.Compute.begin(device)
+            defer pass.close()
+            for at in 0..<count:
+                _ = at
+                try pass.dispatch(kernel, bindings, block, 1)
+            let recorded = start.elapsed().seconds()
+            try pass.submit()
+            try pass.wait()
+            let seconds = start.elapsed().seconds()
+            best = math.min(best, seconds)
+            if round == 4: print(f"overhead: {count} dispatches: {seconds * 1e6 / (f64)count} us each wall, recording {recorded * 1e6 / (f64)count} us each")
+        _ = best
