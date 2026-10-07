@@ -6,5 +6,6 @@ device.lucb
 spectrum.lucb
 lights.lucb
 integrator.lucb
+session.lucb
 kernels.lucb
 tests.lucb

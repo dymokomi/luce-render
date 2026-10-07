@@ -1,0 +1,171 @@
+#==============================================================================================
+#
+#   render/session - A progressive render an application shows
+#
+#   DESCRIPTION:
+#       RenderSession is what a Luce application holds: `start` compiles a GeometrySet
+#       on the CPU, and each `draw` into a view's target advances the render one pass
+#       (never waiting for the GPU) and draws the latest image fitted into a rectangle.
+#       The renderer is made on the first draw, on the device the view draws with.
+#       `draw` returns whether more passes are coming, so the view can ask for another
+#       frame.
+#
+#==============================================================================================
+
+pub struct RenderSession:
+    var device: gpu.Device
+    ## A compiled scene waiting for the first draw's device.
+    var waiting: CompiledScene?
+    var settings: RenderSettings
+    var renderer: Renderer?
+    var started: clock.Instant
+    ## Seconds the render took, once it has finished (0 while it runs).
+    var took: f64
+    var exposure_stops: f64
+    var view: i64
+    var problem_text: Growing[u8]
+
+    pub func init():
+        self.device = gpu.Device()
+        self.waiting = none
+        self.settings = RenderSettings.of(1, 1, 1)
+        self.renderer = none
+        self.started = clock.now()
+        self.took = 0.0
+        self.exposure_stops = 0.0
+        self.view = 1
+        self.problem_text = Growing[u8]()
+
+    pub static func make() -> interop.Reference[RenderSession]!:
+        return try interop.Reference[RenderSession].adopt(try new RenderSession() in memory.heap, render_session_type, memory.heap)
+
+    ## Render `set` through the camera at path `camera` ("" the first camera):
+    ## `width` × `height` pixels, `samples` a pixel, at most `bounces`, spectral or RGB.
+    ## Replaces any render in progress.
+    pub func start(set: interop.Reference[GeometrySet], camera: str, width: i64, height: i64, samples: i64, bounces: i64, spectral: bool) -> !:
+        self.stop()
+        self.problem_text.clear()
+        if width < 1 or height < 1 or width > 16384 or height > 16384: error(invalid, "an image is 1 to 16384 pixels on a side")
+        if samples < 1 or bounces < 1 or bounces > 1024: error(invalid, "a render needs samples and 1 to 1024 bounces")
+        var scene = try compile_scene(try set.get())
+        errdefer scene.close()
+        var index: i64 = -1
+        for at in 0..<scene.objects.count():
+            if scene.objects.object(at).kind != SceneKind.camera: continue
+            if camera == "" or scene.objects.path(at) == camera:
+                index = (i64)at
+                break
+        if index < 0: error(invalid, "the scene has no camera" if camera == "" else "no camera at that path")
+        var settings = RenderSettings.of((u32)width, (u32)height, (u32)samples)
+        settings.max_bounces = (u32)bounces
+        settings.spectral = spectral
+        settings.camera = index
+        self.settings = settings
+        self.waiting = scene
+        self.started = clock.now()
+        self.took = 0.0
+
+    ## Advance the render a pass and draw it fitted into (x, y, width, height) of
+    ## `target`; whether passes are still coming.
+    pub func draw(target: interop.View[gpu.RenderTarget], x: f64, y: f64, width: f64, height: f64) -> bool!:
+        let native = try target.get()
+        if let scene = self.waiting:
+            var held = scene
+            self.waiting = none
+            defer held.close()
+            if not self.device.is_open():
+                self.device = gpu.device_of(native) catch failure:
+                    if failure.code == gpu.unavailable: return false
+                    error(failure.code, failure.message)
+            var made = Renderer.create(self.device, &held, self.settings) catch failure:
+                try self.note(failure.message)
+                return false
+            made.set_display(self.exposure_stops, self.view) catch failure:
+                made.destroy()
+                error(failure.code, failure.message)
+            self.renderer = made
+            self.started = clock.now()
+        let running = self.renderer else return false
+        var renderer = running
+        let busy = renderer.advance() catch failure:
+            try self.note(failure.message)
+            self.stop()
+            return false
+        self.renderer = renderer
+        if not busy and self.took == 0.0: self.took = self.started.elapsed().seconds()
+        let image_width = (f64)self.settings.width
+        let image_height = (f64)self.settings.height
+        let scale = math.min(width / image_width, height / image_height)
+        let shown_width = image_width * scale
+        let shown_height = image_height * scale
+        let area = gpu.Rect(x + 0.5 * (width - shown_width), y + 0.5 * (height - shown_height), shown_width, shown_height)
+        try gpu.draw_image(native, renderer.display(), area, none, 1.0, gpu.Filter.linear)
+        return busy
+
+    func note(message: str) -> !:
+        self.problem_text.clear()
+        try append_text(&self.problem_text, message)
+
+    ## Whether a render is in progress or waiting for its first draw.
+    pub func running() -> bool:
+        if self.waiting != none: return true
+        let renderer = self.renderer else return false
+        return renderer.samples_done() < self.settings.samples
+
+    pub func has_image() -> bool:
+        return self.renderer != none
+
+    pub func samples_done() -> i64:
+        let renderer = self.renderer else return 0
+        return (i64)renderer.samples_done()
+
+    pub func samples() -> i64:
+        return (i64)self.settings.samples
+
+    pub func width() -> i64:
+        return (i64)self.settings.width
+
+    pub func height() -> i64:
+        return (i64)self.settings.height
+
+    pub func spectral() -> bool:
+        return self.settings.spectral
+
+    ## Seconds since the render started, or what it took once finished.
+    pub func seconds() -> f64:
+        if self.took > 0.0: return self.took
+        return self.started.elapsed().seconds()
+
+    ## Why the last render could not start or stopped ("" when nothing went wrong).
+    pub func problem() -> interop.Owned[str]!:
+        return try interop.copy_text((str)self.problem_text.view())
+
+    pub func exposure() -> f64:
+        return self.exposure_stops
+
+    ## Display exposure in stops and view (0 standard, 1 neutral tone mapping).
+    pub func set_display(exposure: f64, view: i64) -> !:
+        self.exposure_stops = exposure
+        self.view = view
+        if let running = self.renderer:
+            var renderer = running
+            try renderer.set_display(exposure, view)
+            self.renderer = renderer
+
+    ## End the render; its image goes too.
+    pub func stop():
+        if let scene = self.waiting:
+            var held = scene
+            held.close()
+            self.waiting = none
+        if let running = self.renderer:
+            var renderer = running
+            renderer.destroy()
+            self.renderer = none
+
+    pub func close():
+        self.stop()
+        if self.device.is_open(): self.device.destroy()
+        self.problem_text.close()
+
+pub let render_session_type: interop.Type[RenderSession] = interop.Type[RenderSession]("RenderSession", RenderSession.close)

@@ -16,7 +16,7 @@
 #
 #       Buffers, as shaders/common.glsl binds them: 0 nodes, 1 positions, 2 indices,
 #       3 lights, 4 state (vec4 fields), 5 state (uint fields), 6 queues, 7 film,
-#       8 the image, 9 constants.
+#       8 the image (ACEScg), 9 constants, 10 the display image (exposed, Rec.709).
 #
 #==============================================================================================
 
@@ -123,6 +123,9 @@ pub struct Renderer:
     var queues: gpu.Buffer
     var film: gpu.Buffer
     var output: gpu.Texture
+    var shown: gpu.Texture
+    ## Display settings changed since the display image was last made.
+    var display_stale: bool
     var frame: RayFrame
     var pool: usize
     var light_count: usize
@@ -163,8 +166,10 @@ pub struct Renderer:
         errdefer queues.destroy()
         var film = try gpu.Buffer.allocate(device, pixels * 16)
         errdefer film.destroy()
-        let output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
-        return Renderer(device, settings, kernels, uploaded, lights, constants, state_v, state_u, queues, film, output, frame, slots, light_count, none, 0, 0, 0)
+        var output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
+        errdefer output.destroy()
+        let shown = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
+        return Renderer(device, settings, kernels, uploaded, lights, constants, state_v, state_u, queues, film, output, shown, false, frame, slots, light_count, none, 0, 0, 0)
 
     ## Start the next pass if the last has finished. True while there is work,
     ## running or to come; false once every sample is in the image.
@@ -175,7 +180,21 @@ pub struct Renderer:
             try finished.wait()
             finished.close()
             self.pending = none
-        if self.sample >= self.settings.samples: return false
+        if self.sample >= self.settings.samples:
+            if not self.display_stale: return false
+            # Only the display changed: convert the film again.
+            self.display_stale = false
+            var convert = try gpu.Compute.begin(self.device)
+            errdefer convert.close()
+            var block: u8[96]
+            var frame: f32[16]
+            try self.frame.pack(frame)
+            memory.copy(block[0..<64], u8[]((u8*)&frame[0], 64), 64)
+            try self.dispatch(&convert, &self.kernels.film_convert, block, 0, 0, 0, 0, (self.settings.width + 7) // 8, (self.settings.height + 7) // 8)
+            try convert.submit()
+            self.pending = convert
+            return true
+        self.display_stale = false
         var pass = try gpu.Compute.begin(self.device)
         errdefer pass.close()
         try self.record(&pass)
@@ -201,8 +220,23 @@ pub struct Renderer:
         # The pass in flight finishes sample - 1 when it was that sample's last band.
         return self.sample - 1 if self.band == 0 else self.sample
 
+    ## The render as linear ACEScg, rgba32f: what is saved.
     pub func image() -> gpu.Texture:
         return self.output
+
+    ## The render ready to show: exposed, in linear Rec.709, through the view.
+    pub func display() -> gpu.Texture:
+        return self.shown
+
+    ## Show the image at `exposure` stops through `view` (0 standard, 1 neutral
+    ## tone mapping); the next pass, or a conversion of its own, applies it.
+    pub func set_display(exposure: f64, view: i64) -> !:
+        var row: f32[4] = [(f32)exposure, (f32)view, 0.0, 0.0]
+        try self.constants.upload(9 * 16, u8[]((u8*)&row[0], 16))
+        self.display_stale = true
+
+    pub func render_settings() -> RenderSettings:
+        return self.settings
 
     ## The image as rgba32f, row by row from the top (waits for work in flight).
     pub func read(out: f32[]) -> !:
@@ -242,12 +276,12 @@ pub struct Renderer:
         let values: u32[8] = [(u32)start, (u32)count, self.sample, 0, current, phase, (u32)self.pool, self.settings.seed]
         for at in 0..<(usize)8: memory.write[u32]((void*)&block[64 + at * 4], values[at])
 
-    func bindings(kernel: const Kernel*) -> gpu.Binding[10]:
-        var all: gpu.Binding[10] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
+    func bindings(kernel: const Kernel*) -> gpu.Binding[11]:
+        var all: gpu.Binding[11] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
                                     gpu.Binding(buffer = self.lights), gpu.Binding(buffer = self.state_v), gpu.Binding(buffer = self.state_u),
                                     gpu.Binding(buffer = self.queues), gpu.Binding(buffer = self.film), gpu.Binding(texture = self.output),
-                                    gpu.Binding(buffer = self.constants)]
-        for at in 0..<(usize)10:
+                                    gpu.Binding(buffer = self.constants), gpu.Binding(texture = self.shown)]
+        for at in 0..<(usize)11:
             if at >= kernel.kinds.length or kernel.kinds[at] == 0: all[at] = gpu.Binding()
         return all
 
@@ -277,6 +311,7 @@ pub struct Renderer:
         self.queues.destroy()
         self.film.destroy()
         self.output.destroy()
+        self.shown.destroy()
 
 ## The camera to render through: `index`, or the first camera when it is -1.
 func find_camera(scene: const CompiledScene*, index: i64) -> usize!:

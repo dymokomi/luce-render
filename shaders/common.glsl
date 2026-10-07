@@ -41,7 +41,7 @@ layout(set = 0, binding = 5, std430) buffer StateU { uint state_u[]; };
 layout(set = 0, binding = 6, std430) buffer Queues { uint queues[]; };
 // The film: xyz the sum of samples (XYZ under E, or ACEScg), w their count.
 layout(set = 0, binding = 7, std430) buffer Film { vec4 film[]; };
-// Scene-wide constants (src/render/integrator.lucb: constants).
+// Scene-wide constants (src/render/integrator.lucb: fill_constants).
 layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[]; };
 
 #define K_INFO 0            // x lights, y max bounces, z indirect clamp (0 off)
@@ -51,6 +51,7 @@ layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[
 #define K_CMF 6             // xyz: the color matching integrals
 #define K_BASE_FIT 7        // the default material's base color
 #define K_BASE_RGB 8
+#define K_DISPLAY 9         // x exposure in stops, y view (0 standard, 1 neutral)
 
 // State fields.
 #define SV_ORIGIN 0u

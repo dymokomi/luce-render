@@ -1,10 +1,34 @@
 #version 450
-// The film's average per pixel as ACEScg in an rgba32f image: XYZ under E through
-// the film matrix in the spectral build, as is in the RGB build.
+// The film's average per pixel, twice: as ACEScg in `image` (XYZ under E through
+// the film matrix in the spectral build, as is in the RGB build), and ready to
+// show in `display`: exposed, in linear Rec.709 (sRGB's primaries), through the
+// view (0 standard: clipped; 1 Khronos PBR Neutral tone mapping).
 #extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 8, local_size_y = 8) in;
 #include "common.glsl"
 layout(set = 0, binding = 8, rgba32f) writeonly uniform image2D image;
+layout(set = 0, binding = 10, rgba32f) writeonly uniform image2D display;
+
+// ACEScg to linear Rec.709, Bradford-adapted from the ACES white to D65.
+const mat3 acescg_to_rec709 = mat3(1.70505, -0.13026, -0.02400,
+                                   -0.62179, 1.14080, -0.12897,
+                                   -0.08326, -0.01055, 1.15297);
+
+// Khronos PBR Neutral: linear below 0.8 - 0.04 with hue-preserving compression above.
+vec3 neutral(vec3 color) {
+    const float start = 0.8 - 0.04;
+    const float desaturation = 0.15;
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= offset;
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < start) return color;
+    float d = 1.0 - start;
+    float new_peak = 1.0 - d * d / (peak + d - start);
+    color *= new_peak / peak;
+    float g = 1.0 - 1.0 / (desaturation * (peak - new_peak) + 1.0);
+    return mix(color, vec3(new_peak), g);
+}
 
 void main() {
     uint width = uint(params.du.w);
@@ -17,4 +41,7 @@ void main() {
     value = vec3(dot(constants[K_FILM].xyz, value), dot(constants[K_FILM + 1].xyz, value), dot(constants[K_FILM + 2].xyz, value));
 #endif
     imageStore(image, ivec2(at), vec4(value, 1.0));
+    vec3 shown = max(acescg_to_rec709 * (value * exp2(constants[K_DISPLAY].x)), vec3(0.0));
+    if (constants[K_DISPLAY].y > 0.5) shown = neutral(shown);
+    imageStore(display, ivec2(at), vec4(min(shown, vec3(1.0)), 1.0));
 }
