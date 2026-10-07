@@ -231,10 +231,32 @@ Performance, after BACKENDS-STUDY.md:
 - **Material sorting: waits** for multi-material benchmark scenes. Every test
   scene has one material, where sorting only costs.
 
-Next:
+## Benchmark: the Cornell box
 
-- A benchmark scene set (REALTIME-STUDY §4.3): interior, product,
-  many-material, glass. Optimizations are judged on it.
+`tests/cornell` is the scene optimizations are judged on: a Cornell box (red
+and green walls, white floor, ceiling and back, a warm ceiling area light) with
+a blue clear-coated box, a smooth glass ball, a rough gold ball, an orange rough
+plastic ball and a white cube. That's 11,938 triangles and seven materials,
+with colour bleeding, refraction, a caustic under the glass, glossy
+interreflection and coat.
+
+![The Cornell box, 512 × 512, 128 samples](cornell.png)
+
+`luc test` renders 512 × 512 at 128 samples into build/cornell.ppm and prints
+the time. `LUCE_BENCH=1 build/luc-test/cornell/cornell` adds 1024 × 1024 timings
+and the error after equal samples against a 4096-sample reference, with and
+without guiding.
+
+First numbers, on an M4 Max:
+
+| Measure | Value |
+| --- | --- |
+| 1024 × 1024, spectral | 8.1 ms a sample |
+| 1024 × 1024, RGB | 7.1 ms a sample |
+| 256 × 256, 256 samples, unguided | MSE 0.0078 at 1.39 ms a sample |
+| 256 × 256, 256 samples, guided | MSE 0.0076 at 2.08 ms a sample (worse at equal time) |
+
+Next:
 - A denoiser.
 - Transparent shadows through glass and cut-outs.
 - Instancing as a BLAS per prototype.

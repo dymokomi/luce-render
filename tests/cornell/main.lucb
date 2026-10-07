@@ -1,0 +1,147 @@
+## The benchmark scene: a Cornell box (red and green walls, white floor,
+## ceiling and back, a ceiling area light) holding a variety of materials: a
+## tall blue box under a clear coat, a smooth glass ball, a rough gold ball, a
+## small white cube and an orange rough plastic ball.
+##
+## By default it renders a 512 × 512 image at 128 samples into
+## build/cornell.ppm and prints the time a sample takes. With LUCE_BENCH=1 it
+## also times 1024 × 1024, and measures error against a 4096-sample reference
+## after equal time, with path guiding off and on. Without a GPU it prints
+## "skip: no GPU".
+import os
+import c
+import memory
+from luce_std import math
+from luce_std import clock
+from luce_std import files
+from luce_gpu import gpu
+from luce_render import render
+from luce_geocore.geocore import Vector3, Mesh, MeshPrimitives, GeometrySet, MaterialAssignment
+from luce_geocore.core.growing import Growing
+import interop
+
+## A mesh placed by translation, rotation (radians) and scale, its faces bound
+## to `material`.
+func piece(mesh: interop.Reference[Mesh], material: str, at: Vector3, turn: Vector3, scale: Vector3) -> interop.Reference[GeometrySet]!:
+    let bound = try MaterialAssignment.faces(mesh, "", "material", material)
+    defer bound.release()
+    let set = try GeometrySet.of_mesh(bound)
+    defer set.release()
+    return try set.value().transformed(at, turn, scale)
+
+## `scene` (released) with an OpenPBR material added.
+func with_material(scene: interop.Reference[GeometrySet], path: str, names: str, values: const f64[]) -> interop.Reference[GeometrySet]!:
+    defer scene.release()
+    return try scene.value().with_material(path, "openpbr", names, values)
+
+## The box spans x and z in [-1, 1] and y in [0, 2], open toward +z.
+pub func cornell() -> interop.Reference[GeometrySet]!:
+    let panel = try MeshPrimitives.grid(2.0, 1)
+    defer panel.release()
+    let ball = try MeshPrimitives.sphere(1.0, 64)
+    defer ball.release()
+    let cube = try Mesh.cube(1.0)
+    defer cube.release()
+    let half = 0.5 * math.pi
+    let parts: interop.Reference[GeometrySet][10] = [
+        try piece(panel, "materials/white", Vector3(0.0, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)),
+        try piece(panel, "materials/white", Vector3(0.0, 2.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)),
+        try piece(panel, "materials/white", Vector3(0.0, 1.0, -1.0), Vector3(half, 0.0, 0.0), Vector3(1.0, 1.0, 1.0)),
+        try piece(panel, "materials/red", Vector3(-1.0, 1.0, 0.0), Vector3(0.0, 0.0, half), Vector3(1.0, 1.0, 1.0)),
+        try piece(panel, "materials/green", Vector3(1.0, 1.0, 0.0), Vector3(0.0, 0.0, half), Vector3(1.0, 1.0, 1.0)),
+        try piece(cube, "materials/blue_coat", Vector3(-0.38, 0.0, -0.35), Vector3(0.0, 0.26, 0.0), Vector3(0.55, 1.2, 0.55)),
+        try piece(ball, "materials/glass", Vector3(0.3, 0.0, 0.05), Vector3(), Vector3(0.36, 0.36, 0.36)),
+        try piece(ball, "materials/gold", Vector3(-0.5, 0.0, 0.5), Vector3(), Vector3(0.26, 0.26, 0.26)),
+        try piece(cube, "materials/white", Vector3(0.7, 0.0, 0.72), Vector3(0.0, -0.3, 0.0), Vector3(0.35, 0.35, 0.35)),
+        try piece(ball, "materials/orange", Vector3(0.0, 0.0, 0.62), Vector3(), Vector3(0.16, 0.16, 0.16))]
+    var scene = try parts[0].value().merged(parts[1])
+    for at in 2..<(usize)10:
+        let next = try scene.value().merged(parts[at])
+        scene.release()
+        scene = next
+    for part in parts: part.release()
+    let white = Vector3(0.725, 0.71, 0.68)
+    scene = try with_material(scene, "materials/white", "base_color\nspecular_weight", [white.x, white.y, white.z, 0.0, 0.0, 0.0, 0.0, 0.0])
+    scene = try with_material(scene, "materials/red", "base_color\nspecular_weight", [0.63, 0.065, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0])
+    scene = try with_material(scene, "materials/green", "base_color\nspecular_weight", [0.14, 0.45, 0.091, 0.0, 0.0, 0.0, 0.0, 0.0])
+    scene = try with_material(scene, "materials/blue_coat", "base_color\ncoat_weight\ncoat_roughness\nspecular_roughness", [0.08, 0.16, 0.55, 0.0, 1.0, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0])
+    scene = try with_material(scene, "materials/glass", "transmission_weight\nspecular_roughness\nbase_color", [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0])
+    scene = try with_material(scene, "materials/gold", "base_color\nbase_metalness\nspecular_roughness", [1.0, 0.77, 0.34, 0.0, 1.0, 0.0, 0.0, 0.0, 0.35, 0.0, 0.0, 0.0])
+    scene = try with_material(scene, "materials/orange", "base_color\nspecular_roughness\nbase_diffuse_roughness", [0.9, 0.35, 0.05, 0.0, 0.45, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0])
+    let viewed = try scene.value().with_camera("/camera", Vector3(0.0, 1.0, 3.9), Vector3(), 0, 50.5, 36.0, 36.0, 0.1, 100.0, 0.0, 4.0)
+    scene.release()
+    defer viewed.release()
+    return try viewed.value().with_light("/ceiling", Vector3(0.0, 1.985, 0.0), Vector3(-half, 0.0, 0.0), 0, Vector3(1.0, 0.85, 0.6), 30.0, 0.0, 0.0, false, 0.5, 0.4, 0.5, 0.0, true)
+
+## Render `scene` and return the image (rgba32f) and the milliseconds a sample took.
+func render_image(device: gpu.Device, scene: const render.CompiledScene*, settings: render.RenderSettings, out: f32[]) -> f64!:
+    var renderer = try render.Renderer.create(device, scene, settings)
+    defer renderer.destroy()
+    let start = clock.now()
+    try renderer.finish()
+    let seconds = start.elapsed().seconds()
+    try renderer.read(out)
+    return seconds * 1000.0 / (f64)settings.samples
+
+## The image as a PPM: exposed by `exposure` stops, Reinhard-compressed, sRGB-ish.
+func save_ppm(path: c.str, header: str, pixels: const f32[], width: usize, height: usize, exposure: f64) -> !:
+    var bytes = Growing[u8]()
+    defer bytes.close()
+    for byte in header.bytes: try bytes.push(byte)
+    let scale = math.exp2(exposure)
+    for at in 0..<width * height:
+        for k in 0..<(usize)3:
+            let v = math.max(0.0, (f64)pixels[at * 4 + k] * scale)
+            try bytes.push((u8)math.min(255.0, 255.0 * math.pow(v / (1.0 + v), 1.0 / 2.2)))
+    try files.write(path, bytes.view())
+
+func squared_error(a: const f32[], b: const f32[]) -> f64:
+    var sum: f64 = 0.0
+    for at in 0..<a.length // 4:
+        for k in 0..<(usize)3:
+            let d = (f64)a[at * 4 + k] - (f64)b[at * 4 + k]
+            sum += d * d
+    return sum / (f64)(a.length // 4)
+
+pub func main(arguments: str[]) -> i32!:
+    _ = arguments
+    var device = gpu.Device.open() catch failure:
+        if failure.code == gpu.unavailable:
+            print("skip: no GPU")
+            return 0
+        error(failure.code, failure.message)
+    defer device.destroy()
+    let set = try cornell()
+    defer set.release()
+    var scene = try render.compile_scene(set.value())
+    defer scene.close()
+    let pixels = try new f32[512 * 512 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    var settings = render.RenderSettings.of(512, 512, 128)
+    let ms = try render_image(device, &scene, settings, pixels)
+    try files.ensure_directory("build")
+    try save_ppm("build/cornell.ppm", "P6 512 512 255\n", pixels, 512, 512, 0.0)
+    print(f"cornell: {scene.triangle_count()} triangles, 512 x 512, 128 samples: {ms} ms a sample (build/cornell.ppm)")
+    if os.env("LUCE_BENCH") == none: return 0
+    # The full benchmark.
+    let large = try new f32[1024 * 1024 * 4] --- in memory.heap
+    defer free(large) in memory.heap
+    for spectral in [true, false]:
+        var timing = render.RenderSettings.of(1024, 1024, 32)
+        timing.spectral = spectral
+        let each = try render_image(device, &scene, timing, large)
+        print(f"cornell: 1024 x 1024, {"spectral" if spectral else "RGB"}: {each} ms a sample")
+    let reference = try new f32[256 * 256 * 4] --- in memory.heap
+    defer free(reference) in memory.heap
+    var long = render.RenderSettings.of(256, 256, 4096)
+    _ = try render_image(device, &scene, long, reference)
+    let image = try new f32[256 * 256 * 4] --- in memory.heap
+    defer free(image) in memory.heap
+    for guided in [false, true]:
+        var quick = render.RenderSettings.of(256, 256, 256)
+        quick.guiding = guided
+        quick.seed = 7
+        let each = try render_image(device, &scene, quick, image)
+        let mse = squared_error(image, reference)
+        print(f"cornell: 256 x 256, 256 samples, guiding {guided}: {each} ms a sample, MSE {mse}, MSE x time {mse * each}")
+    return 0
