@@ -345,7 +345,37 @@ sample: manifold next-event estimation is the next step for those
 (REALTIME-STUDY §3.6). Path guiding trained from light paths too (Vorba 2014)
 was tried and did not pay: it doubled the error on the gold and the coat.
 
+### Light paths from domes and the sun
+
+Domes and distant lights with a size start light paths too (lights.glsl's
+"from afar"). Each path:
+- takes a direction by the light's own distribution;
+- starts at a point on a disk facing that direction, centered on the
+  triangles whose materials cast caustics (glass, metals, clear coats, sharp
+  specular);
+- reaches a first surface whose density is |cos| over the disk's area there.
+
+The light's "point" is a direction, so both sides weigh it by solid-angle
+pdfs. Under a studio dome (glass, gold, coat on a floor, 384 × 256), error at
+about equal time drops 1.9x (3.6x trimmed, 4.6x on the floor).
+
+## Since then
+
+- **Depth of field:** a thin lens from the camera's f-stop and focus distance;
+  light paths connect to a sampled lens point.
+- **Dome lights with OpenEXR environments**, importance-sampled (see Lights).
+- **Dispersion** (see Spectral): rainbow caustics come from light paths.
+- **Textures:** base color, roughness, metalness and normal maps (see OpenPBR).
+
+Timings move with the machine's load: another app was using the GPU while
+these were taken. The Cornell box at 1024 × 1024, spectral, 12 bounces:
+- about 10.5 ms a sample from camera paths alone;
+- about 17 ms with light paths at 0.5 a pixel. Shading a light vertex costs
+  about 1.7 times a camera vertex: it connects to the camera and evaluates the
+  material twice.
+
 Next:
 - Manifold sampling for caustics seen through glass.
 - A denoiser.
 - Instancing as a BLAS per prototype.
+- Per-scene light-path budgets (efficiency-aware MIS, Grittmann et al. 2022).
