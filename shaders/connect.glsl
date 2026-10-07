@@ -11,10 +11,10 @@
 // Their densities are products over the path's vertices (area measure); both
 // sides carry the ratio of the other side's density to their own along the
 // path (SV_MIS), and each vertex's factor is settled once the direction
-// beyond it is known. A density is always the sampler's own: a camera vertex's
-// BSDF pdf comes from the surface prepared for the direction the camera
-// arrived from, a light vertex's from the one light arrived from, so both
-// sides compute the same numbers (sampler_pdf).
+// beyond it is known. A density is always the sampler's own, so both sides
+// compute the same numbers: a camera vertex's BSDF pdf comes from the surface
+// prepared for the direction the camera arrived from; a light vertex's from
+// light_lobes, whose lobe choice holds for every direction (light_sampler_pdf).
 //
 // Light paths ignore distant lights and the background (their s0/s1 paths have
 // no t1 to weigh against), orthographic cameras take no light paths, and light
@@ -38,16 +38,19 @@ bool camera_pixel(vec3 p, out uint pixel, out vec3 d, out float distance_to) {
     return true;
 }
 
-// The pdf the sampler at this point gives `to` when the path it walks arrived
-// from `from` (world, unit, both leaving the point): the surface seen from
-// `from`'s side, its lobes prepared for `from`. Zero where the sampler would
-// reject `to` (a shading normal on the wrong side of the true surface).
-float sampler_pdf(Surface s, vec3 from, vec3 to) {
-    Surface v = dot(from, s.geometric) >= 0.0 ? s : turned(s);
+// The pdf the light sampler at this point gives `to` when the light path
+// arrived from `from` (world, unit, both leaving the point): the surface (`s`,
+// read) seen from `from`'s side, choosing lobes by light_lobes. Zero where the
+// sampler would reject `to` (a shading normal on the wrong side of the true
+// surface).
+float light_sampler_pdf(Surface s, vec3 from, vec3 to) {
+    bool same_side = dot(from, s.geometric) >= 0.0;
+    Surface v = same_side ? s : turned(s);
     vec3 wo = to_local(v, from);
     vec3 wi = to_local(v, to);
     if ((dot(to, v.geometric) > 0.0) != (wi.z > 0.0)) return 0.0;
-    prepare_lobes(v, wo);
+    if (!same_side) read_material(v);
+    light_lobes(v);
     return surface_pdf(v, wi, wo);
 }
 

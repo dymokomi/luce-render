@@ -135,31 +135,43 @@ struct Surface {
     uint material;
     bool back;          // seen from behind its triangle's front face
     bool inside;        // seen from within a transmissive object (back, transmissive)
-    Spec base;          // base color × base weight: diffuse albedo, metal F0
+    // The material, as read (read_material): no direction, no wavelengths.
     float diffuse_roughness;
     float metalness;
-    Spec metal_tint;    // specular color (F82 tint)
-    Spec specular_tint; // specular color × specular weight
     float specular_weight;
     float transmission;
-    Spec transmission_tint;
-    vec2 alpha;         // the base's (coat-roughened)
+    float roughness;    // the base's, coat-roughened
+    float coat_roughness;
+    float ior;          // the dielectric base's index (relative to the coat's where coated)
+    float darkening;
+    float lum_base;     // luminances of the RGB parameters the lobe choice weighs
+    float lum_specular;
+    float lum_transmission;
+    float lum_coat;
+    vec2 alpha;         // the base's
     float eta;          // the dielectric base's index: inside over outside
-    float dielectric_compensation;
-    float metal_missing;
-    float specular_albedo;
     float coat;
     vec2 coat_alpha;
     float coat_eta;
+    // For a view direction (orient_lobes).
+    float dielectric_compensation;
+    float metal_missing;
+    float specular_albedo;
     float coat_compensation;
     float coat_albedo;
     float coat_k;       // what the coat reflects back down (for its darkening)
-    Spec substrate;     // what reaches the layers under the coat
     float p_coat;       // lobe choice: wavelength-free, from the RGB parameters
     float p_metal;
     float p_specular;
     float p_transmission;
     float p_diffuse;
+    // At the path's wavelengths (read_colors, update_substrate).
+    Spec base;          // base color × base weight: diffuse albedo, metal F0
+    Spec metal_tint;    // specular color (F82 tint)
+    Spec specular_tint; // specular color × specular weight
+    Spec transmission_tint;
+    Spec coat_tint;
+    Spec substrate;     // what reaches the layers under the coat
 };
 
 vec3 to_local(Surface s, vec3 v) { return vec3(dot(v, s.tangent), dot(v, s.bitangent), dot(v, s.normal)); }
@@ -182,9 +194,8 @@ Surface turned(Surface s) {
     return surface_at(-s.normal, -s.geometric, s.material, !s.back);
 }
 
-// The surface's lobes for the view direction `wo` (local): everything a
-// direction's pdf needs, and the albedos f needs; no wavelengths.
-void prepare_lobes(inout Surface s, vec3 wo) {
+// The material's parameters, for the side the surface is seen from.
+void read_material(inout Surface s) {
     uint m = s.material;
     vec4 base_rgb = material_at(m, 1u);
     vec4 specular_rgb = material_at(m, 3u);
@@ -193,7 +204,6 @@ void prepare_lobes(inout Surface s, vec3 wo) {
     vec4 scalars = material_at(m, 10u);
     vec4 indices = material_at(m, 11u);
     vec4 geometry = material_at(m, 12u);
-    float mu = clamp(wo.z, 0.0, 1.0);
     s.diffuse_roughness = scalars.y;
     s.metalness = HAS_METAL ? clamp(scalars.x, 0.0, 1.0) : 0.0;
     s.specular_weight = max(specular_rgb.w, 0.0);
@@ -203,54 +213,64 @@ void prepare_lobes(inout Surface s, vec3 wo) {
     s.inside = s.back && s.transmission > 0.0;
     // The coat (none from inside an object: its layers face the outside).
     s.coat = (HAS_COAT && !s.inside) ? clamp(coat_rgb.w, 0.0, 1.0) : 0.0;
-    float coat_roughness = clamp(indices.y, 0.0, 1.0);
+    s.coat_roughness = clamp(indices.y, 0.0, 1.0);
     s.coat_eta = max(indices.z, 1.0001);
     s.coat_alpha = vec2(1.0);
-    s.coat_compensation = 1.0;
-    s.coat_albedo = 0.0;
-    if (HAS_COAT && s.coat > 0.0) {
-        s.coat_alpha = ggx_alpha(coat_roughness, clamp(geometry.z, 0.0, 1.0));
-        float e_coat_ggx = max(table_ggx(mu, coat_roughness), 1e-4);
-        s.coat_compensation = 1.0 + fresnel_dielectric_average(s.coat_eta) * (1.0 - e_coat_ggx) / e_coat_ggx;
-        s.coat_albedo = clamp(s.coat_compensation * table_dielectric(mu, coat_roughness, s.coat_eta), 0.0, 1.0);
-    }
+    if (HAS_COAT && s.coat > 0.0) s.coat_alpha = ggx_alpha(s.coat_roughness, clamp(geometry.z, 0.0, 1.0));
+    s.darkening = clamp(indices.w, 0.0, 1.0);
     // The base, roughened under the coat; its index relative to the coat's.
     float roughness = clamp(scalars.z, 0.0, 1.0);
     float r4 = roughness * roughness * roughness * roughness;
-    float c4 = coat_roughness * coat_roughness * coat_roughness * coat_roughness;
-    roughness = mix(roughness, min(1.0, pow(r4 + 2.0 * c4, 0.25)), s.coat);
-    s.alpha = ggx_alpha(roughness, clamp(scalars.w, 0.0, 1.0));
+    float c4 = s.coat_roughness * s.coat_roughness * s.coat_roughness * s.coat_roughness;
+    s.roughness = mix(roughness, min(1.0, pow(r4 + 2.0 * c4, 0.25)), s.coat);
+    s.alpha = ggx_alpha(s.roughness, clamp(scalars.w, 0.0, 1.0));
     float eta = max(indices.x, 1.0001);
     float relative = eta / s.coat_eta;
     if (relative < 1.0) relative = 1.0 / relative;
-    eta = max(mix(eta, relative, s.coat), 1.0001);
-    s.eta = s.inside ? 1.0 / eta : eta;
-    float e_ggx = max(table_ggx(mu, roughness), 1e-4);
+    s.ior = max(mix(eta, relative, s.coat), 1.0001);
+    s.eta = s.inside ? 1.0 / s.ior : s.ior;
+    s.lum_base = max(rgb_luminance(base_rgb.xyz * base_rgb.w), 0.0);
+    s.lum_specular = max(rgb_luminance(specular_rgb.xyz), 0.0);
+    s.lum_transmission = max(rgb_luminance(transmission_rgb.xyz), 0.05);
+    s.lum_coat = rgb_luminance(coat_rgb.xyz);
+}
+
+// The lobes for the view direction `wo` (local): the albedos f needs and the
+// lobe choice a direction's pdf needs. Reads nothing: a read surface can be
+// oriented again for another direction on the same side.
+void orient_lobes(inout Surface s, vec3 wo) {
+    float mu = clamp(wo.z, 0.0, 1.0);
+    s.coat_compensation = 1.0;
+    s.coat_albedo = 0.0;
+    if (HAS_COAT && s.coat > 0.0) {
+        float e_coat_ggx = max(table_ggx(mu, s.coat_roughness), 1e-4);
+        s.coat_compensation = 1.0 + fresnel_dielectric_average(s.coat_eta) * (1.0 - e_coat_ggx) / e_coat_ggx;
+        s.coat_albedo = clamp(s.coat_compensation * table_dielectric(mu, s.coat_roughness, s.coat_eta), 0.0, 1.0);
+    }
+    float e_ggx = max(table_ggx(mu, s.roughness), 1e-4);
     float missing = (1.0 - e_ggx) / e_ggx;
     s.metal_missing = missing;
-    s.dielectric_compensation = 1.0 + fresnel_dielectric_average(eta) * missing;
-    s.specular_albedo = clamp(s.specular_weight * s.dielectric_compensation * table_dielectric(mu, roughness, eta), 0.0, 1.0);
+    s.dielectric_compensation = 1.0 + fresnel_dielectric_average(s.ior) * missing;
+    s.specular_albedo = clamp(s.specular_weight * s.dielectric_compensation * table_dielectric(mu, s.roughness, s.ior), 0.0, 1.0);
     // Under the coat: what it lets through, darkened by the light it reflects
-    // back down (OpenPBR's Delta = (1 - K) / (1 - E_b K)); the colors follow
-    // in prepare_colors.
+    // back down (OpenPBR's Delta = (1 - K) / (1 - E_b K)).
     float substrate_rgb = 1.0;
     s.coat_k = 0.0;
     if (HAS_COAT && s.coat > 0.0) {
         float k_smooth = fresnel_dielectric(mu, s.coat_eta);
         float k_rough = 1.0 - (1.0 - fresnel_dielectric_average(s.coat_eta)) / (s.coat_eta * s.coat_eta);
-        float base_roughness = mix(1.0, roughness, s.metalness);
+        float base_roughness = mix(1.0, s.roughness, s.metalness);
         s.coat_k = mix(k_smooth, k_rough, base_roughness);
-        float darkening = clamp(indices.w, 0.0, 1.0);
-        float delta_rgb = (1.0 - s.coat_k) / max(1e-4, 1.0 - rgb_luminance(base_rgb.xyz * base_rgb.w) * s.coat_k);
-        substrate_rgb = mix(1.0, rgb_luminance(coat_rgb.xyz) * (1.0 - s.coat_albedo) * mix(1.0, delta_rgb, darkening), s.coat);
+        float delta_rgb = (1.0 - s.coat_k) / max(1e-4, 1.0 - s.lum_base * s.coat_k);
+        substrate_rgb = mix(1.0, s.lum_coat * (1.0 - s.coat_albedo) * mix(1.0, delta_rgb, s.darkening), s.coat);
     }
     // Lobe choice.
     float dielectric = 1.0 - s.metalness;
     float w_coat = s.coat * s.coat_albedo;
     float w_metal = substrate_rgb * s.metalness;
-    float w_specular = substrate_rgb * dielectric * s.specular_albedo * max(rgb_luminance(specular_rgb.xyz), 0.0);
-    float w_transmission = substrate_rgb * dielectric * s.transmission * (1.0 - s.specular_albedo) * max(rgb_luminance(transmission_rgb.xyz), 0.05);
-    float w_diffuse = substrate_rgb * dielectric * (1.0 - s.transmission) * (1.0 - s.specular_albedo) * max(rgb_luminance(base_rgb.xyz * base_rgb.w), 0.0);
+    float w_specular = substrate_rgb * dielectric * s.specular_albedo * s.lum_specular;
+    float w_transmission = substrate_rgb * dielectric * s.transmission * (1.0 - s.specular_albedo) * s.lum_transmission;
+    float w_diffuse = substrate_rgb * dielectric * (1.0 - s.transmission) * (1.0 - s.specular_albedo) * s.lum_base;
     if (s.inside) {
         // Leaving an object: only its interface.
         w_metal = 0.0;
@@ -267,26 +287,79 @@ void prepare_lobes(inout Surface s, vec3 wo) {
     s.p_diffuse = w_diffuse * scale;
 }
 
-// The surface's colors at the path's wavelengths (after prepare_lobes).
-void prepare_colors(inout Surface s, vec4 lambda) {
+// The surface's lobes for the view direction `wo` (local); no wavelengths.
+void prepare_lobes(inout Surface s, vec3 wo) {
+    read_material(s);
+    orient_lobes(s, wo);
+}
+
+// What reaches the layers under the coat, at the path's wavelengths (after
+// the colors and the lobes for a direction).
+void update_substrate(inout Surface s) {
+    s.substrate = Spec(1.0);
+    if (HAS_COAT && s.coat > 0.0) {
+        Spec delta = (1.0 - s.coat_k) / (Spec(1.0) - s.base * s.coat_k);
+        Spec under = s.coat_tint * (1.0 - s.coat_albedo) * mix(Spec(1.0), delta, s.darkening);
+        s.substrate = mix(Spec(1.0), under, s.coat);
+    }
+}
+
+// The surface's colors at the path's wavelengths (after read_material; the
+// substrate follows with the lobes, update_substrate).
+void read_colors(inout Surface s, vec4 lambda) {
     uint m = s.material;
     s.base = material_color(m, 0u, lambda) * material_at(m, 1u).w;
     s.metal_tint = material_color(m, 2u, lambda);
     s.specular_tint = s.metal_tint * s.specular_weight;
     s.transmission_tint = material_color(m, 8u, lambda);
-    s.substrate = Spec(1.0);
-    if (HAS_COAT && s.coat > 0.0) {
-        float darkening = clamp(material_at(m, 11u).w, 0.0, 1.0);
-        Spec delta = (1.0 - s.coat_k) / (Spec(1.0) - s.base * s.coat_k);
-        Spec under = material_color(m, 4u, lambda) * (1.0 - s.coat_albedo) * mix(Spec(1.0), delta, darkening);
-        s.substrate = mix(Spec(1.0), under, s.coat);
-    }
+    s.coat_tint = (HAS_COAT && s.coat > 0.0) ? material_color(m, 4u, lambda) : Spec(1.0);
 }
 
-// Read the material and prepare its lobes for the view direction `wo` (local).
+// Read the material and prepare its lobes and colors for the view direction
+// `wo` (local).
 void prepare_surface(inout Surface s, vec3 wo, vec4 lambda) {
     prepare_lobes(s, wo);
-    prepare_colors(s, lambda);
+    read_colors(s, lambda);
+    update_substrate(s);
+}
+
+// A prepared surface for another view direction `wo` on the same side.
+void orient_surface(inout Surface s, vec3 wo) {
+    orient_lobes(s, wo);
+    update_substrate(s);
+}
+
+// The lobe choice light paths sample with (after read_material): the camera's
+// weighing with Fresnel at normal incidence for the albedos, so it holds for
+// every direction and the other side can recompute its pdfs without tables.
+void light_lobes(inout Surface s) {
+    float f0 = (s.ior - 1.0) / (s.ior + 1.0);
+    float specular_albedo = clamp(s.specular_weight * f0 * f0, 0.0, 1.0);
+    float coat_albedo = 0.0;
+    if (HAS_COAT && s.coat > 0.0) {
+        float c0 = (s.coat_eta - 1.0) / (s.coat_eta + 1.0);
+        coat_albedo = c0 * c0;
+    }
+    float substrate_rgb = mix(1.0, s.lum_coat * (1.0 - coat_albedo), s.coat);
+    float dielectric = 1.0 - s.metalness;
+    float w_coat = s.coat * coat_albedo;
+    float w_metal = substrate_rgb * s.metalness;
+    float w_specular = substrate_rgb * dielectric * specular_albedo * s.lum_specular;
+    float w_transmission = substrate_rgb * dielectric * s.transmission * (1.0 - specular_albedo) * s.lum_transmission;
+    float w_diffuse = substrate_rgb * dielectric * (1.0 - s.transmission) * (1.0 - specular_albedo) * s.lum_base;
+    if (s.inside) {
+        w_metal = 0.0;
+        w_diffuse = 0.0;
+        w_specular = max(w_specular, 0.05);
+        w_transmission = max(w_transmission, s.transmission > 0.0 ? 0.05 : 0.0);
+    }
+    float total = w_coat + w_metal + w_specular + w_transmission + w_diffuse;
+    float scale = total > 0.0 ? 1.0 / total : 0.0;
+    s.p_coat = w_coat * scale;
+    s.p_metal = w_metal * scale;
+    s.p_specular = w_specular * scale;
+    s.p_transmission = w_transmission * scale;
+    s.p_diffuse = w_diffuse * scale;
 }
 
 // The refraction half-vector for wo and wi on opposite sides at index ratio eta

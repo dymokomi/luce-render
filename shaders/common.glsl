@@ -40,7 +40,7 @@ layout(push_constant) uniform Params {
     uint band_start;    // first pixel of this pass's band
     uint band_count;    // paths in the band
     uint sample_index;
-    uint mode;          // the paths in flight: 0 camera paths, 1 light paths
+    uint light_count;   // light paths in this pass, in the pool after the band's camera paths
     uint current;       // the closest-hit queue being read (0 or 1)
     uint phase;         // a kernel's step (adaptive), or film_convert's light-tracing samples
     uint pool;          // path slots: the stride of every state field
@@ -140,7 +140,13 @@ void set_u(uint field, uint path, uint value) { state_u[field * params.pool + pa
 #define Q_SURFACE 2u
 #define Q_MISS 3u
 #define Q_SHADOW 4u
-#define QUEUE_BASE 32u
+#define Q_LIGHT 5u          // light paths' hits (shade_light)
+#define QUEUE_BASE 48u
+
+// Light paths take the pool's slots after the band's camera paths, and draw
+// their numbers as pixels past any image's.
+bool is_light_path(uint path) { return path >= params.band_count; }
+#define LIGHT_PATH_ID(path) (0x80000000u | (path))
 
 uint queue_count(uint queue) { return queues[queue]; }
 
@@ -152,13 +158,14 @@ uint queue_count(uint queue) { return queues[queue]; }
 #define QUEUE_DONE 8u
 uint arguments_slot(uint queue) { return 16u + 3u * queue; }
 
-void arguments(uint queue) {
-    uint count = atomicAdd(queues[queue], 0u);
+void arguments_for(uint queue, uint count) {
     uint at = arguments_slot(queue);
     queues[at] = max(1u, (count + 63u) / 64u);
     queues[at + 1u] = 1u;
     queues[at + 2u] = 1u;
 }
+
+void arguments(uint queue) { arguments_for(queue, atomicAdd(queues[queue], 0u)); }
 
 // Whether this thread is the first of the last of `groups` workgroups to
 // finish; every thread of the kernel must call it. Each workgroup's writes

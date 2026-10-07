@@ -1,30 +1,12 @@
-#version 450
-// Shade each queued light-path hit (connect.glsl). A light path that reaches a
-// light ends. At a surface it may pass through (cut-out opacity); otherwise it
-// connects to the camera — a shadow ray carrying what the camera would see of
-// it, MIS-weighted, to the pixel it projects to — and scatters on: a direction
-// from the BSDF as seen from where the light came, weighed by the BSDF as the
-// camera would evaluate it (radiance transport), with the shading-normal
-// correction light paths need (Veach §5.3). Russian roulette and the total
-// bounce limit end it.
-#extension GL_GOOGLE_include_directive : require
-#extension GL_EXT_buffer_reference : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-layout(local_size_x = 64) in;
-#include "common.glsl"
-#include "sampler.glsl"
-#include "spectrum.glsl"
-#include "lights.glsl"
-#include "microfacet.glsl"
-#include "openpbr.glsl"
-#include "lighttree.glsl"
-#include "connect.glsl"
-
-#define LIGHT_PATH_ID(path) (0x80000000u | (path))
-
-vec3 point_of(uint index) {
-    return vec3(positions[index * 3u], positions[index * 3u + 1u], positions[index * 3u + 2u]);
-}
+// Light paths' hits (connect.glsl), shaded in shade_surface's dispatch after
+// the camera paths', so the two kinds' latencies overlap. A light path that
+// reaches a light ends. At a surface it may pass through (cut-out opacity);
+// otherwise it connects to the camera — a shadow ray carrying what the camera
+// would see of it, MIS-weighted, to the pixel it projects to — and scatters
+// on: a direction from the BSDF as seen from where the light came, weighed by
+// the BSDF as the camera would evaluate it (radiance transport), with the
+// shading-normal correction light paths need (Veach §5.3). Russian roulette
+// and the total bounce limit end it. Needs what shade_surface includes.
 
 // The light sample a camera path at this point would take toward the light
 // path's first point x0 (emitter `emitter`), over its BSDF pdf `bsdf_pdf` toward
@@ -41,10 +23,7 @@ float light_sample_ratio(uint emitter, Surface s, vec3 p, vec3 x0, float bsdf_pd
     return chance * pdf / bsdf_pdf;
 }
 
-void work() {
-    uint at = gl_GlobalInvocationID.x;
-    if (at >= queue_count(Q_SURFACE)) return;
-    uint path = queue_path(Q_SURFACE, at);
+void shade_light(uint path) {
     uint what = get_u(SU_HIT, path);
     if ((what & LIGHT_HIT) != 0u) return;
     uint emitter = get_u(SU_PIXEL, path);
@@ -79,8 +58,12 @@ void work() {
 
     vec3 normal = normalize((1.0 - hit.z - hit.w) * octahedral_decode(attributes.x) + hit.z * octahedral_decode(attributes.y) + hit.w * octahedral_decode(attributes.z));
     if (dot(normal, geometric) < 0.0) normal = -normal;
+    // The surface on the side light arrives from, read once: seen from the
+    // camera or the next vertex on that side, it is only oriented.
     Surface lit = surface_at(normal, geometric, attributes.w, back);
     vec3 toward_light = -ray.xyz;
+    read_material(lit);
+    read_colors(lit, lambda);
     // The light tracer's density of this vertex, and of the last one as the
     // camera's sampler here would make it (back_reach × its pdf).
     vec3 x_last = vertex_row.xyz;
@@ -104,7 +87,8 @@ void work() {
         vec3 wo = to_local(seen, to_camera);
         vec3 wi = to_local(seen, toward_light);
         if ((dot(toward_light, seen.geometric) > 0.0) == (wi.z > 0.0) && wo.z > 0.0) {
-            prepare_surface(seen, wo, lambda);
+            if (side > 0.0) orient_surface(seen, wo);
+            else prepare_surface(seen, wo, lambda);
             float camera_bsdf_pdf;
             Spec f = evaluate_surface(seen, wi, wo, camera_bsdf_pdf);
             float camera_density = camera_pdf(to_point) * abs(side) / (camera_distance * camera_distance);
@@ -128,13 +112,14 @@ void work() {
 
     // Scatter on, unless the next vertex would be past the bounce limit.
     if (total + 1u >= uint(constants[K_INFO].y)) return;
-    vec3 wo_light = to_local(lit, toward_light);
-    prepare_lobes(lit, wo_light);
     vec4 u = sample4(LIGHT_PATH_ID(path), params.sample_index, GROUP_BSDF(total));
+    Surface choosing = lit;
+    light_lobes(choosing);
+    vec3 wo_light = to_local(lit, toward_light);
     vec3 wi_light;
     float light_pdf;
     uint lobe;
-    if (!sample_direction(lit, wo_light, u.xyw, wi_light, light_pdf, lobe)) return;
+    if (!sample_direction(choosing, wo_light, u.xyw, wi_light, light_pdf, lobe)) return;
     vec3 direction = to_world(lit, wi_light);
     float side = dot(direction, geometric);
     if ((side > 0.0) != (wi_light.z > 0.0)) return;
@@ -143,7 +128,8 @@ void work() {
     vec3 wo = to_local(seen, direction);
     vec3 wi = to_local(seen, toward_light);
     if ((dot(toward_light, seen.geometric) > 0.0) != (wi.z > 0.0)) return;
-    prepare_surface(seen, wo, lambda);
+    if (side > 0.0) orient_surface(seen, wo);
+    else prepare_surface(seen, wo, lambda);
     float camera_bsdf_pdf;
     Spec f = evaluate_surface(seen, wi, wo, camera_bsdf_pdf);
     bounces = next_bounce(bounces, lobe);
@@ -166,11 +152,4 @@ void work() {
     set_v(SV_THROUGHPUT, path, throughput);
     set_v(SV_MIS, path, vec4(mis.x * last, density, abs(side), sample_ratio));
     queue_push(Q_CLOSEST + 1u - params.current, path);
-}
-
-void main() {
-    work();
-    if (last_group(queues[arguments_slot(Q_SURFACE)])) {
-        queues[Q_SURFACE] = 0u;
-    }
 }

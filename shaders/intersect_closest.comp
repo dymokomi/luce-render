@@ -1,6 +1,7 @@
 #version 460
 // The nearest triangle or light along each queued ray: hits go to the surface
-// queue, misses to the miss queue. The last workgroup sizes the shading kernels.
+// queue (camera paths) or the light queue (light paths), misses to the miss
+// queue. The last workgroup sizes the shading kernels.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -24,7 +25,7 @@ void work() {
     bool camera_ray = bounce_total(get_u(SU_BOUNCE, path)) == 0u;
     for (uint light = 0u; light < lights_count; light++) {
         if (camera_ray && !light_visible(light)) continue;
-        float t = intersect_light(light, origin, direction, hit.t, params.mode != 0u);
+        float t = intersect_light(light, origin, direction, hit.t, is_light_path(path));
         if (t < hit.t) {
             hit.t = t;
             what = LIGHT_HIT | light;
@@ -36,14 +37,15 @@ void work() {
     }
     set_v(SV_HIT, path, vec4(hit.t, 0.0, hit.uv));
     set_u(SU_HIT, path, what);
-    queue_push(Q_SURFACE, path);
+    queue_push(is_light_path(path) ? Q_LIGHT : Q_SURFACE, path);
 }
 
 void main() {
     work();
     if (last_group(queues[arguments_slot(Q_CLOSEST + params.current)])) {
         // Hits are shaded, misses taken by shade_miss; this round's rays are done.
-        arguments(Q_SURFACE);
+        // shade_surface takes both kinds of hits.
+        arguments_for(Q_SURFACE, atomicAdd(queues[Q_SURFACE], 0u) + atomicAdd(queues[Q_LIGHT], 0u));
         arguments(Q_MISS);
         queues[Q_CLOSEST + params.current] = 0u;
     }

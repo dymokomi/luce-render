@@ -5,7 +5,8 @@
 // (a shadow ray in the path's own slot) and one BSDF sample, then continues or
 // ends by Russian roulette and the bounce limits. Indirect light is clamped.
 // With light tracing, both techniques weigh against light paths too, and the
-// path carries the light tracer's density of it (connect.glsl).
+// path carries the light tracer's density of it (connect.glsl); the same
+// dispatch shades the light paths' hits after the camera paths'.
 //
 // Materials are OpenPBR (shaders/openpbr.glsl).
 #extension GL_GOOGLE_include_directive : require
@@ -39,10 +40,9 @@ void add_radiance(uint path, Spec contribution) {
     set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + contribution);
 }
 
-void work() {
-    uint at = gl_GlobalInvocationID.x;
-    if (at >= queue_count(Q_SURFACE)) return;
-    uint path = queue_path(Q_SURFACE, at);
+#include "light_paths.glsl"
+
+void shade_camera(uint path) {
     uint pixel = get_u(SU_PIXEL, path);
     uint bounces = get_u(SU_BOUNCE, path);
     uint total = bounce_total(bounces);
@@ -184,7 +184,7 @@ void work() {
                 float traced = 0.0;
                 if (light_tracing() && !s.delta && emitter != NONE && density > 0.0) {
                     float d2 = s.distance * s.distance;
-                    float at_last = total == 0u ? 1.0 : sampler_pdf(surface, s.direction, -ray.xyz) * back_reach / mis.y;
+                    float at_last = total == 0u ? 1.0 : light_sampler_pdf(surface, s.direction, -ray.xyz) * back_reach / mis.y;
                     float at_vertex = emission_direction_pdf(emitter, s.cos_light) * abs(side) / d2 / density;
                     float at_light = emitter_area_pdf(emitter) / (bsdf_pdf * s.cos_light / d2);
                     traced = mis.x * at_last * at_vertex * at_light;
@@ -269,7 +269,7 @@ void work() {
     // alone, and this vertex's factor of the light tracer's density, settled
     // now that the light sampler's direction here is known.
     if (light_tracing()) {
-        float at_last = total == 0u ? 1.0 : sampler_pdf(surface, direction, -ray.xyz) * back_reach / mis.y;
+        float at_last = total == 0u ? 1.0 : light_sampler_pdf(surface, direction, -ray.xyz) * back_reach / mis.y;
         set_v(SV_MIS, path, vec4(mis.x * at_last, density, abs(side), 0.0));
         pdf = bsdf_only;
     }
@@ -279,8 +279,13 @@ void work() {
 }
 
 void main() {
-    work();
+    // The camera paths' hits, then the light paths' (light_paths.glsl).
+    uint at = gl_GlobalInvocationID.x;
+    uint cameras = queue_count(Q_SURFACE);
+    if (at < cameras) shade_camera(queue_path(Q_SURFACE, at));
+    else if (LIGHT_TRACING && at - cameras < queue_count(Q_LIGHT)) shade_light(queue_path(Q_LIGHT, at - cameras));
     if (last_group(queues[arguments_slot(Q_SURFACE)])) {
         queues[Q_SURFACE] = 0u;
+        queues[Q_LIGHT] = 0u;
     }
 }

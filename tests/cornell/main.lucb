@@ -81,6 +81,11 @@ func render_image(device: gpu.Device, scene: const render.CompiledScene*, settin
     try renderer.finish()
     let seconds = start.elapsed().seconds()
     try renderer.read(out)
+    if settings.profile:
+        var times: f64[10]
+        try renderer.kernel_times(times)
+        for at in 0..<(usize)10:
+            if times[at] > 0.0: print(f"  {render.kernel_names[at]}: {times[at] / (f64)settings.samples} ms a sample")
     return seconds * 1000.0 / (f64)settings.samples
 
 ## The image as a PPM: exposed by `exposure` stops, Reinhard-compressed, sRGB-ish.
@@ -126,14 +131,16 @@ pub func main(arguments: str[]) -> i32!:
     defer scene.close()
     let pixels = try new f32[512 * 512 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
-    # LUCE_CORNELL_SAMPLES, LUCE_CORNELL_CLAMP, LUCE_CORNELL_LIGHT and
-    # LUCE_CORNELL_SEED change the image's samples, indirect clamp (none by
-    # default: the unbiased image), light paths (percent of a path a pixel)
-    # and seed.
+    # LUCE_CORNELL_SAMPLES, LUCE_CORNELL_CLAMP, LUCE_CORNELL_LIGHT,
+    # LUCE_CORNELL_SEED and LUCE_CORNELL_BOUNCES change the image's samples,
+    # indirect clamp (none by default: the unbiased image), light paths
+    # (percent of a path a pixel), seed and bounce limit.
     var settings = render.RenderSettings.of(512, 512, (u32)number_of("LUCE_CORNELL_SAMPLES", 128.0))
     settings.clamp_indirect = number_of("LUCE_CORNELL_CLAMP", 0.0)
     settings.light_tracing = number_of("LUCE_CORNELL_LIGHT", 0.0) / 100.0
     settings.seed = (u32)number_of("LUCE_CORNELL_SEED", 0.0)
+    settings.max_bounces = (u32)number_of("LUCE_CORNELL_BOUNCES", 12.0)
+    settings.profile = os.env("LUCE_CORNELL_PROFILE") != none
     let ms = try render_image(device, &scene, settings, pixels)
     try files.ensure_directory("build")
     try save_ppm("build/cornell.ppm", "P6 512 512 255\n", pixels, 512, 512, 0.0)

@@ -1,5 +1,6 @@
 #version 450
-// Start the sample's light paths (connect.glsl): an emitter chosen by power, a
+// Start the sample's light paths (connect.glsl), in the pool after the band's
+// camera paths, after the camera kernel: an emitter chosen by power, a
 // point on it uniformly by area, a cosine-weighted direction (either side of an
 // emissive triangle), four wavelengths; queued for the first closest hit.
 #extension GL_GOOGLE_include_directive : require
@@ -15,12 +16,10 @@ layout(local_size_x = 64) in;
 #include "lighttree.glsl"
 #include "connect.glsl"
 
-// Light paths draw their numbers as pixels past any image's.
-#define LIGHT_PATH_ID(path) (0x80000000u | (path))
 
 void work() {
-    uint path = gl_GlobalInvocationID.x;
-    if (path >= params.band_count) return;
+    if (gl_GlobalInvocationID.x >= params.light_count) return;
+    uint path = params.band_count + gl_GlobalInvocationID.x;
     vec4 u_point = sample4(LIGHT_PATH_ID(path), params.sample_index, GROUP_CAMERA);
     vec4 u_pick = sample4(LIGHT_PATH_ID(path), params.sample_index, GROUP_WAVELENGTH);
     uint emitter;
@@ -97,7 +96,7 @@ void work() {
 
 void main() {
     work();
-    if (last_group((params.band_count + 63u) / 64u)) {
+    if (last_group((params.light_count + 63u) / 64u)) {
         arguments(Q_CLOSEST);
     }
 }
