@@ -1,8 +1,9 @@
 #version 450
 // Shade each queued hit. A light adds its radiance (MIS-weighted against the
-// light sample the previous vertex took) and ends the path. A surface takes one
-// light sample (a shadow ray in the path's own slot) and one BSDF sample, then
-// continues or ends by Russian roulette and the bounce limit.
+// light sample the previous vertex took) and ends the path. A surface may let
+// the ray through (cut-out opacity), adds its emission, takes one light sample
+// (a shadow ray in the path's own slot) and one BSDF sample, then continues or
+// ends by Russian roulette and the bounce limits. Indirect light is clamped.
 //
 // Materials are OpenPBR (shaders/openpbr.glsl).
 #extension GL_GOOGLE_include_directive : require
@@ -18,12 +19,26 @@ vec3 point_of(uint index) {
     return vec3(positions[index * 3u], positions[index * 3u + 1u], positions[index * 3u + 2u]);
 }
 
+// Clip an indirect contribution to the clamp (Cycles' sample clamp): its
+// largest lane at most `clamp`, keeping its color.
+Spec clamped(Spec contribution, uint total) {
+    float clamp_value = constants[K_INFO].z;
+    if (total == 0u || clamp_value <= 0.0) return contribution;
+    float largest = spec_max(contribution);
+    return largest > clamp_value ? contribution * (clamp_value / largest) : contribution;
+}
+
+void add_radiance(uint path, Spec contribution) {
+    set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + contribution);
+}
+
 void main() {
     uint at = gl_GlobalInvocationID.x;
     if (at >= queue_count(Q_SURFACE)) return;
     uint path = queue_path(Q_SURFACE, at);
     uint pixel = get_u(SU_PIXEL, path);
-    uint bounce = get_u(SU_BOUNCE, path);
+    uint bounces = get_u(SU_BOUNCE, path);
+    uint total = bounce_total(bounces);
     vec4 hit = get_v(SV_HIT, path);
     vec3 origin = get_v(SV_ORIGIN, path).xyz;
     vec4 ray = get_v(SV_DIRECTION, path);
@@ -34,83 +49,102 @@ void main() {
     if ((what & LIGHT_HIT) != 0u) {
         uint light = what & ~LIGHT_HIT;
         float weight = 1.0;
-        if (bounce == 0u) {
+        if (total == 0u) {
             if (!light_visible(light)) return;
         } else if (ray.w > 0.0) {
             weight = power_heuristic(ray.w, light_hit_pdf(light, origin, ray.xyz, hit.x));
         }
-        set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + throughput * light_radiance(light, lambda) * weight);
+        add_radiance(path, clamped(throughput * light_radiance(light, lambda) * weight, total));
         return;
     }
-
-    // A surface reached past the bounce limit ends the path. The ray that got
-    // here was still traced, so its light hits (and their MIS weights) count.
-    if (bounce >= uint(constants[K_INFO].y)) return;
 
     uint triangle = what;
     vec3 p0 = point_of(indices[triangle * 3u]);
     vec3 geometric = normalize(cross(point_of(indices[triangle * 3u + 1u]) - p0, point_of(indices[triangle * 3u + 2u]) - p0));
-    if (dot(geometric, ray.xyz) > 0.0) geometric = -geometric;
+    // Faces wind counter-clockwise seen from outside: a ray along the normal
+    // is leaving the object.
+    bool inside = dot(geometric, ray.xyz) > 0.0;
+    if (inside) geometric = -geometric;
     uvec4 attributes = shading[triangle];
+    vec3 p = origin + hit.x * ray.xyz;
+    vec4 u_opacity = sample4(pixel, params.sample_index, GROUP_OPACITY(total));
+
+    // Cut-out opacity: pass straight through with probability 1 - opacity, at
+    // the same bounce. The hit distance decorrelates stacked layers.
+    float opacity = clamp(material_at(attributes.w, 12u).x, 0.0, 1.0);
+    if (opacity < 1.0 && fract(u_opacity.x + float(hash_u32(floatBitsToUint(hit.x))) * (1.0 / 4294967296.0)) >= opacity) {
+        set_v(SV_ORIGIN, path, vec4(offset_origin(p, -geometric), 0.0));
+        queue_push(Q_CLOSEST + 1u - params.current, path);
+        return;
+    }
+
+    // Emission: surfaces are not light-sampled yet, so it takes no MIS weight.
+    if (material_at(attributes.w, 7u).w > 0.0)
+        add_radiance(path, clamped(throughput * material_color(attributes.w, 6u, lambda), total));
+
+    // A surface reached past the bounce limit ends the path. The ray that got
+    // here was still traced, so its light hits (and their MIS weights) count.
+    if (total >= uint(constants[K_INFO].y)) return;
+
     vec3 normal = normalize((1.0 - hit.z - hit.w) * octahedral_decode(attributes.x) + hit.z * octahedral_decode(attributes.y) + hit.w * octahedral_decode(attributes.z));
     if (dot(normal, geometric) < 0.0) normal = -normal;
-    vec3 p = origin + hit.x * ray.xyz;
-    vec3 from = offset_origin(p, geometric);
     Surface surface;
     surface.normal = normal;
     basis(normal, surface.tangent, surface.bitangent);
     surface.geometric = geometric;
     surface.material = attributes.w;
+    surface.inside = inside;
     vec3 wo = to_local(surface, -ray.xyz);
     prepare_surface(surface, wo, lambda);
 
-    // Emission: surfaces are not light-sampled yet, so it takes no MIS weight.
-    if (material_at(attributes.w, 7u).w > 0.0) {
-        set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + throughput * material_color(attributes.w, 6u, lambda));
-    }
-
-    // One light sample.
+    // One light sample, on either side when the surface transmits.
     uint lights_count = uint(constants[K_INFO].x);
     if (lights_count > 0u) {
-        vec4 u = sample4(pixel, params.sample_index, GROUP_LIGHT(bounce));
+        vec4 u = sample4(pixel, params.sample_index, GROUP_LIGHT(total));
         float select_pdf;
         uint light = pick_light(u.x, select_pdf);
         LightSample s;
-        if (select_pdf > 0.0 && sample_light(light, p, u.yz, s) && dot(s.direction, geometric) > 0.0) {
+        if (select_pdf > 0.0 && sample_light(light, p, u.yz, s)) {
+            float side = dot(s.direction, geometric);
             vec3 wi = to_local(surface, s.direction);
-            float bsdf_pdf;
-            Spec f = evaluate_surface(surface, wi, wo, bsdf_pdf);
-            if (bsdf_pdf > 0.0) {
-                float light_pdf = s.pdf * select_pdf;
-                float weight = s.delta ? 1.0 : power_heuristic(light_pdf, bsdf_pdf);
-                Spec contribution = throughput * f * wi.z * light_radiance(light, lambda) * (weight / light_pdf);
-                float reach = s.distance >= INFINITY ? INFINITY : s.distance * (1.0 - 1e-4);
-                set_v(SV_SHADOW_ORIGIN, path, vec4(from, reach));
-                set_v(SV_SHADOW_DIRECTION, path, vec4(s.direction, 0.0));
-                set_v(SV_SHADOW_RADIANCE, path, contribution);
-                queue_push(Q_SHADOW, path);
+            if ((side > 0.0) == (wi.z > 0.0) && (side > 0.0 || surface.p_transmission > 0.0)) {
+                float bsdf_pdf;
+                Spec f = evaluate_surface(surface, wi, wo, bsdf_pdf);
+                if (bsdf_pdf > 0.0) {
+                    float light_pdf = s.pdf * select_pdf;
+                    float weight = s.delta ? 1.0 : power_heuristic(light_pdf, bsdf_pdf);
+                    Spec contribution = clamped(throughput * f * abs(wi.z) * light_radiance(light, lambda) * (weight / light_pdf), total);
+                    float reach = s.distance >= INFINITY ? INFINITY : s.distance * (1.0 - 1e-4);
+                    set_v(SV_SHADOW_ORIGIN, path, vec4(offset_origin(p, side > 0.0 ? geometric : -geometric), reach));
+                    set_v(SV_SHADOW_DIRECTION, path, vec4(s.direction, 0.0));
+                    set_v(SV_SHADOW_RADIANCE, path, contribution);
+                    queue_push(Q_SHADOW, path);
+                }
             }
         }
     }
 
     // One BSDF sample.
-    vec4 u = sample4(pixel, params.sample_index, GROUP_BSDF(bounce));
+    vec4 u = sample4(pixel, params.sample_index, GROUP_BSDF(total));
     vec3 wi;
     Spec weight;
     float pdf;
-    if (!sample_surface(surface, wo, u.xyw, wi, weight, pdf)) return;
+    uint lobe;
+    if (!sample_surface(surface, wo, u.xyw, wi, weight, pdf, lobe)) return;
     vec3 direction = to_world(surface, wi);
-    // A shading normal can send a reflection under the true surface.
-    if (dot(direction, geometric) <= 0.0) return;
+    // A shading normal can send a ray to the wrong side of the true surface.
+    float side = dot(direction, geometric);
+    if ((side > 0.0) != (wi.z > 0.0)) return;
+    bounces = next_bounce(bounces, lobe);
+    if (bounces == NONE) return;
     throughput *= weight;
-    bounce += 1u;
-    if (bounce >= 3u) {
+    if (total + 1u >= 3u) {
         float survive = min(0.95, spec_max(throughput));
         if (u.z >= survive) return;
         throughput /= survive;
     }
-    set_u(SU_BOUNCE, path, bounce);
-    set_v(SV_ORIGIN, path, vec4(from, 0.0));
+    set_u(SU_BOUNCE, path, bounces);
+    set_v(SV_ORIGIN, path, vec4(offset_origin(p, side > 0.0 ? geometric : -geometric), 0.0));
     set_v(SV_DIRECTION, path, vec4(direction, pdf));
     set_v(SV_THROUGHPUT, path, throughput);
     queue_push(Q_CLOSEST + 1u - params.current, path);

@@ -11,7 +11,7 @@ void main() {
     uint at = gl_GlobalInvocationID.x;
     if (at >= queue_count(Q_MISS)) return;
     uint path = queue_path(Q_MISS, at);
-    uint bounce = get_u(SU_BOUNCE, path);
+    uint bounce = bounce_total(get_u(SU_BOUNCE, path));
     vec4 ray = get_v(SV_DIRECTION, path);
     Spec throughput = get_v(SV_THROUGHPUT, path);
     vec4 lambda = get_v(SV_LAMBDA, path);
@@ -29,5 +29,10 @@ void main() {
         }
         radiance += light_radiance(light, lambda) * weight;
     }
-    set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + throughput * radiance);
+    Spec contribution = throughput * radiance;
+    // Indirect light is clamped like the surfaces' (shade_surface's `clamped`).
+    float clamp_value = constants[K_INFO].z;
+    float largest = spec_max(contribution);
+    if (bounce > 0u && clamp_value > 0.0 && largest > clamp_value) contribution *= clamp_value / largest;
+    set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + contribution);
 }

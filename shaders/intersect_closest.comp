@@ -19,7 +19,7 @@ void main() {
     uint what = hit.triangle;
     uint lights_count = uint(constants[K_INFO].x);
     // Camera rays pass through lights that are not visible to the camera.
-    bool camera_ray = get_u(SU_BOUNCE, path) == 0u;
+    bool camera_ray = bounce_total(get_u(SU_BOUNCE, path)) == 0u;
     for (uint light = 0u; light < lights_count; light++) {
         if (camera_ray && !light_visible(light)) continue;
         float t = intersect_light(light, origin, direction, hit.t);

@@ -41,6 +41,7 @@ uint sobol(uint index, uint dimension) {
 #define GROUP_WAVELENGTH 1u
 #define GROUP_LIGHT(bounce) (2u + 3u * (bounce))
 #define GROUP_BSDF(bounce) (3u + 3u * (bounce))
+#define GROUP_OPACITY(bounce) (4u + 3u * (bounce))
 
 // The 4-D point of `group` for this pixel's sample `index`.
 vec4 sample4(uint pixel, uint index, uint group) {

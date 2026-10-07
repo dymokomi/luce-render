@@ -129,7 +129,7 @@ for the viewport.
 
 | Stage | Lobes |
 | --- | --- |
-| v1 | EON diffuse (energy-preserving Oren–Nayar), F82-tint metal, GGX specular with anisotropy over albedo-scaled diffuse, coat with darkening, absorption and base roughening, emission, opacity cutout, thin transmission |
+| v1 (done) | EON diffuse (energy-preserving Oren–Nayar), F82-tint metal, GGX specular with anisotropy over albedo-scaled diffuse, coat with darkening, absorption and base roughening, emission, opacity cutout, rough dielectric transmission (no interior medium; shadow rays treat glass and cut-outs as opaque) |
 | v2 | transmission depth, dispersion, fuzz, thin film |
 | v3 | subsurface random walk |
 

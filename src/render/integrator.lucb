@@ -41,9 +41,15 @@ pub struct RenderSettings:
     pub var seed: u32
     ## Trace with the software BVH even where the device has ray queries.
     pub var software_bvh: bool
+    ## The most bounces of each kind a path may take (Cycles' limits).
+    pub var diffuse_bounces: u32
+    pub var glossy_bounces: u32
+    pub var transmission_bounces: u32
+    ## Indirect samples are clipped to this brightness against fireflies; 0 is off.
+    pub var clamp_indirect: f64
 
     pub static func of(width: u32, height: u32, samples: u32) -> RenderSettings:
-        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false)
+        return RenderSettings(width, height, samples, 12, true, -1, Vector3(), OpenPbr.standard(), 0, 1, false, 1024, 1024, 1024, 0.0)
 
 let state_v_fields: usize = 9
 let state_u_fields: usize = 3
@@ -389,11 +395,12 @@ func fill_constants(rows: f32[], settings: RenderSettings, light_count: usize) -
     let film = film_matrix()
     let integrals = cmf_integrals()
     let background = fit_spectrum(settings.background)
-    let values: f64[28] = [(f64)light_count, (f64)settings.max_bounces, 0.0, 0.0,
+    let values: f64[32] = [(f64)light_count, (f64)settings.max_bounces, settings.clamp_indirect, 0.0,
                            background.c0, background.c1, background.c2, background.scale,
                            settings.background.x, settings.background.y, settings.background.z, 0.0,
                            film.m[0], film.m[1], film.m[2], 0.0,
                            film.m[3], film.m[4], film.m[5], 0.0,
                            film.m[6], film.m[7], film.m[8], 0.0,
-                           integrals.x, integrals.y, integrals.z, 0.0]
-    for at in 0..<(usize)28: rows[at] = (f32)values[at]
+                           integrals.x, integrals.y, integrals.z, 0.0,
+                           (f64)settings.diffuse_bounces, (f64)settings.glossy_bounces, (f64)settings.transmission_bounces, 0.0]
+    for at in 0..<(usize)32: rows[at] = (f32)values[at]

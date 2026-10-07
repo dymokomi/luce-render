@@ -48,6 +48,7 @@ layout(set = 0, binding = 7, std430) buffer Film { vec4 film[]; };
 layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[]; };
 
 #define K_INFO 0            // x lights, y max bounces, z indirect clamp (0 off)
+#define K_LIMITS 7          // the most diffuse, glossy and transmission bounces
 #define K_BACKGROUND_FIT 1
 #define K_BACKGROUND_RGB 2
 #define K_FILM 3            // 3 rows: XYZ under E to ACEScg
@@ -65,7 +66,7 @@ layout(set = 0, binding = 9, std430) readonly buffer Constants { vec4 constants[
 #define SV_SHADOW_RADIANCE 7u
 #define SV_HIT 8u           // t, -, barycentrics u, v
 #define SU_PIXEL 0u
-#define SU_BOUNCE 1u
+#define SU_BOUNCE 1u        // bounces so far: total, diffuse, glossy, transmission (a byte each)
 // What was hit: a triangle or LIGHT_HIT | light. Kept as an integer: bits stored
 // in a float can be denormals, which Metal flushes to zero.
 #define SU_HIT 2u
@@ -91,6 +92,17 @@ void queue_push(uint queue, uint path) {
 
 // What a closest hit found: a triangle, a light (LIGHT_HIT | index) or nothing.
 #define LIGHT_HIT 0x80000000u
+
+uint bounce_total(uint bounces) { return bounces & 0xffu; }
+
+// The bounces after one more of `lobe` (0 diffuse, 1 glossy, 2 transmission),
+// or NONE past that kind's limit.
+uint next_bounce(uint bounces, uint lobe) {
+    uint shift = 8u * (lobe + 1u);
+    uint kind = ((bounces >> shift) & 0xffu) + 1u;
+    if (float(kind) > constants[K_LIMITS][lobe] || bounce_total(bounces) >= 255u) return NONE;
+    return (bounces & ~(0xffu << shift)) + (kind << shift) + 1u;
+}
 
 float power_heuristic(float a, float b) {
     float a2 = a * a;
