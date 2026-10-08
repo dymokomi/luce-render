@@ -163,7 +163,12 @@ SVM):
   paths alike, before the surface is read.
   - Driven parameters replace the record's in read_material and read_colors;
     driven colors go through the environment basis.
-  - Programs read nothing direction-dependent, so MIS stays consistent.
+  - Programs see the surface's outward shading normal, so a bumped surface
+    is the same seen from either side.
+  - Only Fresnel and Layer Weight read the view (toward the camera's side of
+    the path). Light paths run such a program toward the lens, connect, and
+    stop. Camera paths give the light tracer zero density through such
+    vertices past the first, so MIS stays consistent.
   - A scene without graphs drops the interpreter (HAS_PROGRAMS).
 - **Nodes:**
   - inputs: uv, position, value, color;
@@ -171,9 +176,14 @@ SVM):
     table), checker, Perlin fractal noise;
   - math and color: math, mix, map range, clamp, separate, combine, a
     two-stop ramp;
-  - normals: normal map (tangent frame from the triangle's UVs).
-- **Checked:** an image-driven floor lights as a grey material (0.02%), and a
-  graph of every node kind wired to grey matches exactly.
+  - normals: normal map (tangent frame from the triangle's UVs); bump (the
+    height subgraph compiled three times, a camera-pixel footprint apart);
+  - facing: Fresnel, Layer Weight.
+- **Checked:**
+  - an image-driven floor lights as a grey material (0.02%);
+  - a graph of every node kind wired to grey matches exactly;
+  - linear height ramps, by position and by UV, bump to the tilted normal;
+  - a view-reading material's image mean agrees with light paths on and off.
 
 Energy compensation uses precomputed albedo tables (study §3.5):
 
