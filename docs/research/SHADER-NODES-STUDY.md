@@ -237,6 +237,13 @@ without re-running the shader with a moved `sd->P`:
 The cost is three evaluations of the height subgraph, all in the same straight-line program. The approach needs ray
 differentials, because the offset is one pixel footprint (`dPdx`, `dPdy`) times the filter width.
 
+**What luce-render does.** The compiler's offset copies are emitted afresh for each axis (`offset_slot`), and the uv and
+position ops carry the axis and filter-width operand. The footprint is not the ray's differential. It is the camera
+pixel's width at the point, along two tangents of the shading normal. That is a function of the point alone, so camera
+paths, light paths and their connections all see one bumped surface, and MIS stays consistent. Cycles' footprint
+follows each ray, so a surface seen in a reflection bumps more smoothly there. With `filter_width` folded into `dP`, the
+gradient formula is the same as Cycles'.
+
 ---
 
 ## 4. Where shaders are evaluated

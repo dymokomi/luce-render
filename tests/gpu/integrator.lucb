@@ -53,6 +53,7 @@ pub func checks(device: gpu.Device) -> !:
     try textured_floor(device, false)
     try graph_nodes(device, true)
     try graph_nodes(device, false)
+    try bump_slope(device)
     try cutout_shadow(device)
     try adaptive(device)
     try guided_room(device)
@@ -645,6 +646,33 @@ func graph_nodes(device: gpu.Device, spectral: bool) -> !:
         means[way] = try floor_window(device, library, spectral)
     print(f"graph nodes (spectral {spectral}): {means[0]} against a grey material's {means[1]}")
     assert(math.abs(means[0] / means[1] - 1.0) < 0.005)
+
+## A bump of a height rising 0.5 a unit along x, by position and by texture
+## coordinates (u is 0.05 x), must tilt the floor's normal to (-0.5, 1, 0)
+## normalized: it must light as that normal given outright does.
+func bump_slope(device: gpu.Device) -> !:
+    let grid = try MeshPrimitives.grid(20.0, 8)
+    defer grid.release()
+    let mapped = try AttributeKernels.uv_project(grid, 0.05)
+    defer mapped.release()
+    let bound = try MaterialAssignment.faces(mapped, "", "material", "materials/floor")
+    defer bound.release()
+    let base = try GeometrySet.of_mesh(bound)
+    defer base.release()
+    let tilted = "\nnode c color; input c color -0.4472136 0.8944272 0; node surface openpbr_surface; link surface geometry_normal c color"
+    let by_position = "\nnode p position; node s separate; link s color p position; node h math multiply; link h a s r; input h b 0.5; node b bump; link b height h value; node surface openpbr_surface; link surface geometry_normal b normal"
+    let by_uv = "\nnode u uv; node s separate; link s color u uv; node h math multiply; link h a s r; input h b 10; node b bump; link b height h value; node surface openpbr_surface; link surface geometry_normal b normal"
+    let flat = "\nnode b bump; input b height 0.3; node surface openpbr_surface; link surface geometry_normal b normal"
+    var means: f64[4] = [0.0, 0.0, 0.0, 0.0]
+    let graphs: str[4] = [tilted, by_position, by_uv, flat]
+    for way in 0..<(usize)4:
+        let library = try base.value().with_material("materials/floor", "openpbr", "specular_weight\nshader_graph", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], graphs[way])
+        defer library.release()
+        means[way] = try floor_window(device, library, false)
+    print(f"bump slope: tilted {means[0]}, by position {means[1]}, by uv {means[2]}, flat {means[3]}")
+    assert(math.abs(means[1] / means[0] - 1.0) < 0.005 and math.abs(means[2] / means[0] - 1.0) < 0.005)
+    # A constant height leaves the normal alone, which lights differently.
+    assert(math.abs(means[3] / means[0] - 1.0) > 0.02)
 
 ## The mean of the window below the rect light, lit by it, of `library` (a floor).
 func floor_window(device: gpu.Device, library: interop.Reference[GeometrySet], spectral: bool) -> f64!:

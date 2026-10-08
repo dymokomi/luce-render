@@ -26,6 +26,13 @@
 #           separate, combine               a color's r, g, b
 #           ramp                            two colors at two positions, by `fac`
 #           normal_map                      a tangent-space normal map's color as a normal
+#           bump                            a normal from `height`'s slope (Cycles' bump)
+#
+#       A bump compiles its height's nodes three times: at the point and with the point
+#       moved a footprint along each of two tangents (the uv and position ops carry the
+#       move), and takes the slope from the three heights. The footprint is the camera
+#       pixel's width at the point times `filter_width`: a function of the point alone,
+#       so every technique sees one surface.
 #
 #       The program (shaders/shader_program.glsl) is a flat u32 array, one opcode then
 #       its operands and output slots. An operand is a constant's bits, or a stack slot
@@ -54,6 +61,7 @@ let op_combine: u32 = 13
 let op_ramp: u32 = 14
 let op_normal_map: u32 = 15
 let op_output: u32 = 16
+let op_bump: u32 = 17
 
 ## A socket: its name, how many floats it is (1 or 3) and its default.
 struct Socket:
@@ -171,6 +179,15 @@ func kind_of(name: str) -> (Kind, bool)!:
         try i.push(three("color", 0.5, 0.5, 1.0))
         try i.push(one("strength", 1.0))
         try o.push(three("normal", 0.0, 0.0, 0.0))
+    elif name == "bump":
+        kind.opcode = op_bump
+        try i.push(one("strength", 1.0))
+        try i.push(one("distance", 1.0))
+        try i.push(one("filter_width", 0.1))
+        try i.push(one("height", 1.0))
+        # Unlinked: zero, which the kernel reads as the shading normal.
+        try i.push(three("normal", 0.0, 0.0, 0.0))
+        try o.push(three("normal", 0.0, 0.0, 0.0))
     else:
         kind.close()
         return (Kind(0, Growing[Socket](), Growing[Socket]()), false)
@@ -224,6 +241,10 @@ struct Compiler:
     ## The implicit uv and position nodes' slots, once made.
     var uv_slot: i64
     var position_slot: i64
+    ## While a bump's offset copy is emitted: the tangent (1 or 2; 0 none) and
+    ## the operand word of its filter width.
+    var axis: u32
+    var pixels: u32
 
     func close():
         for node in self.nodes.view():
@@ -258,6 +279,8 @@ struct Compiler:
         if held >= 0: return (u32)held
         let slot = try self.allocate(3)
         try self.words.push(op_position if position else op_uv)
+        try self.words.push(self.axis)
+        try self.words.push(self.pixels)
         for k in 0..<(u32)3: try self.words.push(slot + k)
         if position: self.position_slot = (i64)slot
         else: self.uv_slot = (i64)slot
@@ -307,6 +330,55 @@ struct Compiler:
             return spread
         error(invalid, "a node graph links an output its node does not have")
 
+    ## Output `name` of node `source` in a bump's offset copy along tangent
+    ## `axis`: every node emitted afresh, then the point's copy restored.
+    func offset_slot(source: usize, name: str, axis: u32, pixels: u32) -> u32!:
+        var emitted = Growing[bool]()
+        defer emitted.close()
+        var slots = Growing[Growing[u32]]()
+        defer slots.close()
+        for at in 0..<self.nodes.count:
+            try emitted.push(self.nodes.items[at].emitted)
+            try slots.push(self.nodes.items[at].slots)
+            self.nodes.items[at].emitted = false
+            self.nodes.items[at].slots = Growing[u32]()
+        let (uv, position) = (self.uv_slot, self.position_slot)
+        self.uv_slot = -1
+        self.position_slot = -1
+        self.axis = axis
+        self.pixels = pixels
+        errdefer self.restore(&emitted, &slots, uv, position)
+        let slot = try self.output_slot(source, name, 1)
+        self.restore(&emitted, &slots, uv, position)
+        return slot
+
+    func restore(emitted: Growing[bool]*, slots: Growing[Growing[u32]]*, uv: i64, position: i64):
+        for at in 0..<self.nodes.count:
+            self.nodes.items[at].slots.close()
+            self.nodes.items[at].emitted = emitted.items[at]
+            self.nodes.items[at].slots = slots.items[at]
+        self.uv_slot = uv
+        self.position_slot = position
+        self.axis = 0
+        self.pixels = 0
+
+    ## A bump's three heights onto `out`: at the point, then a footprint
+    ## along each tangent (a constant height is flat).
+    func heights(node: usize, socket: Socket, out: Growing[u32]*) -> !:
+        if self.axis != 0: error(invalid, "a Bump's height cannot come from another Bump")
+        try self.operands(node, "bump", socket, out)
+        let at = self.input_of(node, socket.name)
+        let center = out.items[out.count - 1]
+        if at < 0 or self.inputs.items[(usize)at].source < 0:
+            try out.push(center)
+            try out.push(center)
+            return
+        let entry = self.inputs.items[(usize)at]
+        # The filter width's operand: the word after the opcode, strength and distance.
+        let pixels = out.items[3]
+        for axis in 1..<(u32)3:
+            try out.push(slot_tag | try self.offset_slot((usize)entry.source, entry.output, axis, pixels))
+
     ## Emit node `index` (once), after the nodes it reads.
     func emit(index: usize, depth: usize) -> !:
         if depth > 256: error(invalid, "a material's node graph loops")
@@ -335,7 +407,12 @@ struct Compiler:
             try head.push((u32)slot)
             try head.push(1 if color else 0)
         if kind.opcode == op_math: try head.push(math_operation(self.nodes.items[index].setting))
-        for socket in kind.inputs.view(): try self.operands(index, kind_name, socket, &head)
+        if kind.opcode == op_uv or kind.opcode == op_position:
+            try head.push(self.axis)
+            try head.push(self.pixels)
+        for socket in kind.inputs.view():
+            if kind.opcode == op_bump and socket.name == "height": try self.heights(index, socket, &head)
+            else: try self.operands(index, kind_name, socket, &head)
         for word in head.view(): try self.words.push(word)
         for socket in kind.outputs.view():
             let slot = try self.allocate(socket.width)
@@ -389,7 +466,7 @@ func number_of(text: str) -> f64!:
 ## Graph `text` compiled onto the end of `words`: its entry (the first word's
 ## index), or -1 when the graph drives no parameter.
 pub func compile_graph(text: str, images: ImageSlots, words: Growing[u32]*) -> i64!:
-    var compiler = Compiler(Growing[GraphNode](), Growing[GraphInput](), Growing[u32](), 0, images, -1, -1)
+    var compiler = Compiler(Growing[GraphNode](), Growing[GraphInput](), Growing[u32](), 0, images, -1, -1, 0, 0)
     defer compiler.close()
     # Statements, by line: nodes first, so links may name nodes defined later.
     for pass in 0..<(usize)2:

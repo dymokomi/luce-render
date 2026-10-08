@@ -110,6 +110,67 @@ vec3 normal_from_map(uint triangle, vec3 n, vec3 color, float strength) {
     return normalize(mix(n, normalize(bent), clamp(strength, 0.0, 1.0)));
 }
 
+// -- Bump: heights at the point and a footprint away along two tangents.
+
+// The footprint: the camera pixel's width at p (`pixels` of them). It depends
+// on the point alone, so camera and light paths see one bumped surface; a
+// floor keeps the offsets above f32's resolution of p.
+float bump_width(vec3 p, float pixels) {
+    float pixel = length(params.du.xyz) * (params.position.w > 0.5 ? 1.0 : distance(p, params.position.xyz));
+    vec3 a = abs(p);
+    return max(pixel * max(pixels, 0.0), 4e-6 * (1.0 + max(a.x, max(a.y, a.z))));
+}
+
+// Two unit tangents about n (Duff et al.'s branchless frame).
+void bump_tangents(vec3 n, out vec3 t, out vec3 b) {
+    float s = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float c = n.x * n.y * a;
+    t = vec3(1.0 + s * n.x * n.x * a, s * c, -s * n.x);
+    b = vec3(c, s + n.y * n.y * a, -n.y);
+}
+
+// Where offset `axis` (0 none, 1 and 2 the tangents) moves the point.
+vec3 bump_step(uint axis, float pixels, vec3 p, vec3 n) {
+    if (axis == 0u) return vec3(0.0);
+    vec3 t, b;
+    bump_tangents(n, t, b);
+    return (axis == 1u ? t : b) * bump_width(p, pixels);
+}
+
+// How the texture coordinates change along a step in the triangle's plane
+// (zero for a degenerate triangle).
+vec2 uv_step(uint triangle, vec3 step) {
+    uint i0 = indices[triangle * 3u], i1 = indices[triangle * 3u + 1u], i2 = indices[triangle * 3u + 2u];
+    vec3 p0 = vec3(positions[i0 * 3u], positions[i0 * 3u + 1u], positions[i0 * 3u + 2u]);
+    vec3 e1 = vec3(positions[i1 * 3u], positions[i1 * 3u + 1u], positions[i1 * 3u + 2u]) - p0;
+    vec3 e2 = vec3(positions[i2 * 3u], positions[i2 * 3u + 1u], positions[i2 * 3u + 2u]) - p0;
+    float g11 = dot(e1, e1), g12 = dot(e1, e2), g22 = dot(e2, e2);
+    float det = g11 * g22 - g12 * g12;
+    if (abs(det) < 1e-24) return vec2(0.0);
+    // The step's barycentric coordinates by the dual basis, then the uvs'.
+    float a = (g22 * dot(e1, step) - g12 * dot(e2, step)) / det;
+    float b = (g11 * dot(e2, step) - g12 * dot(e1, step)) / det;
+    vec2 uv0 = triangle_uv(triangle, vec2(0.0));
+    return (triangle_uv(triangle, vec2(1.0, 0.0)) - uv0) * a + (triangle_uv(triangle, vec2(0.0, 1.0)) - uv0) * b;
+}
+
+// Cycles' bump (svm_node_set_bump): the surface gradient of the heights
+// about `normal` (zero: n), `distance` long, blended in by `strength`.
+vec3 bumped(vec3 p, vec3 n, vec3 normal, float strength, float distance_scale, float pixels, float hc, float hx, float hy) {
+    vec3 base = dot(normal, normal) > 1e-12 ? normalize(normal) : n;
+    vec3 t, b;
+    bump_tangents(n, t, b);
+    float w = bump_width(p, pixels);
+    vec3 dx = t * w, dy = b * w;
+    vec3 rx = cross(dy, base), ry = cross(base, dx);
+    float det = dot(dx, rx);
+    vec3 gradient = (hx - hc) * rx + (hy - hc) * ry;
+    vec3 out_normal = abs(det) * base - distance_scale * sign(det) * gradient;
+    if (dot(out_normal, out_normal) < 1e-30) return base;
+    return normalize(mix(base, normalize(out_normal), clamp(strength, 0.0, 1.0)));
+}
+
 // Run material `m`'s program at the hit on `triangle`: point p, shading
 // normal n, texture coordinates surface_uv. Sets program_mask and values.
 void run_program(uint m, uint triangle, vec3 p, vec3 n) {
@@ -123,7 +184,10 @@ void run_program(uint m, uint triangle, vec3 p, vec3 n) {
         uint op = code.words[pc++];
         if (op == 0u) return;
         if (op == 1u || op == 2u) {
-            vec3 v = op == 1u ? vec3(surface_uv, 0.0) : p;
+            // A bump's offset copies read the point a step away.
+            uint axis = code.words[pc++];
+            vec3 step = bump_step(axis, program_operand(code.words[pc++]), p, n);
+            vec3 v = op == 1u ? vec3(surface_uv + (axis != 0u ? uv_step(triangle, step) : vec2(0.0)), 0.0) : p + step;
             uint out0 = code.words[pc++]; uint out1 = code.words[pc++]; uint out2 = code.words[pc++];
             program_stack[out0] = v.x; program_stack[out1] = v.y; program_stack[out2] = v.z;
         } else if (op == 3u) {
@@ -215,6 +279,17 @@ void run_program(uint m, uint triangle, vec3 p, vec3 n) {
             float strength = program_operand(code.words[pc + 3u]);
             pc += 4u;
             vec3 bent = normal_from_map(triangle, n, color, strength);
+            for (uint k = 0u; k < 3u; k++) program_stack[code.words[pc++]] = bent[k];
+        } else if (op == 17u) {
+            float strength = program_operand(code.words[pc]);
+            float distance_scale = program_operand(code.words[pc + 1u]);
+            float pixels = program_operand(code.words[pc + 2u]);
+            float hc = program_operand(code.words[pc + 3u]);
+            float hx = program_operand(code.words[pc + 4u]);
+            float hy = program_operand(code.words[pc + 5u]);
+            vec3 normal = vec3(program_operand(code.words[pc + 6u]), program_operand(code.words[pc + 7u]), program_operand(code.words[pc + 8u]));
+            pc += 9u;
+            vec3 bent = bumped(p, n, normal, strength, distance_scale, pixels, hc, hx, hy);
             for (uint k = 0u; k < 3u; k++) program_stack[code.words[pc++]] = bent[k];
         } else if (op == 16u) {
             uint first = code.words[pc++];
