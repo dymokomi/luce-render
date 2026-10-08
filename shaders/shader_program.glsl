@@ -2,8 +2,12 @@
 // opcodes): a program runs once a hit, before the surface is read, and leaves
 // the OpenPBR parameters it drives in openpbr.glsl's program_values. Operands
 // are constants or stack slots (NaN-tagged); colors and vectors take three.
-// Programs read nothing that depends on direction, so camera and light paths
-// see one surface. Needs openpbr.glsl, scene.glsl and texture tables.
+// A program sees the surface's outward shading normal, so both sides see one
+// surface. Fresnel and Layer Weight also read the view (toward the camera's
+// side of the path) and mark the program `program_viewed`: light paths then
+// connect there but scatter no further, and camera paths count no light
+// tracer's density through such vertices (connect.glsl). Needs openpbr.glsl,
+// scene.glsl and texture tables.
 
 #define K_PROGRAMS 24       // xy the programs' address
 #define PROGRAM_STACK 64u
@@ -12,6 +16,7 @@
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ProgramWords { uint words[]; };
 
 float program_stack[PROGRAM_STACK];
+bool program_viewed;
 
 float program_operand(uint word) {
     return (word & 0xFFFF0000u) == SLOT_TAG ? program_stack[word & 0xFFFFu] : uintBitsToFloat(word);
@@ -171,10 +176,38 @@ vec3 bumped(vec3 p, vec3 n, vec3 normal, float strength, float distance_scale, f
     return normalize(mix(base, normalize(out_normal), clamp(strength, 0.0, 1.0)));
 }
 
-// Run material `m`'s program at the hit on `triangle`: point p, shading
-// normal n, texture coordinates surface_uv. Sets program_mask and values.
-void run_program(uint m, uint triangle, vec3 p, vec3 n) {
+// -- Facing: Cycles' Fresnel and Layer Weight about `normal` (zero: n), the
+// view on the far side meaning the surface is seen from behind
+// (fresnel_dielectric is microfacet.glsl's).
+
+float facing_cos(vec3 n, vec3 normal, vec3 view) {
+    return dot(view, dot(normal, normal) > 1e-12 ? normalize(normal) : n);
+}
+
+float fresnel_node(vec3 n, vec3 normal, vec3 view, float ior) {
+    float c = facing_cos(n, normal, view);
+    float eta = max(ior, 1e-5);
+    return fresnel_dielectric(c, c < 0.0 ? 1.0 / eta : eta);
+}
+
+vec2 layer_weight_node(vec3 n, vec3 normal, vec3 view, float blend) {
+    float c = facing_cos(n, normal, view);
+    float eta = max(1.0 - blend, 1e-5);
+    float fresnel = fresnel_dielectric(c, c < 0.0 ? eta : 1.0 / eta);
+    float facing = abs(c);
+    if (blend != 0.5) {
+        float b = clamp(blend, 0.0, 1.0 - 1e-5);
+        facing = pow(facing, b < 0.5 ? 2.0 * b : 0.5 / (1.0 - b));
+    }
+    return vec2(fresnel, 1.0 - facing);
+}
+
+// Run material `m`'s program at the hit on `triangle`: point p, outward
+// shading normal n, `view` the unit direction toward the camera's side of the
+// path, texture coordinates surface_uv. Sets program_mask, values and viewed.
+void run_program(uint m, uint triangle, vec3 p, vec3 n, vec3 view) {
     program_mask = 0u;
+    program_viewed = false;
     if (!HAS_PROGRAMS) return;
     float entry = material_at(m, 13u).x;
     if (entry < 0.0) return;
@@ -291,6 +324,18 @@ void run_program(uint m, uint triangle, vec3 p, vec3 n) {
             pc += 9u;
             vec3 bent = bumped(p, n, normal, strength, distance_scale, pixels, hc, hx, hy);
             for (uint k = 0u; k < 3u; k++) program_stack[code.words[pc++]] = bent[k];
+        } else if (op == 18u || op == 19u) {
+            float parameter = program_operand(code.words[pc]);
+            vec3 normal = vec3(program_operand(code.words[pc + 1u]), program_operand(code.words[pc + 2u]), program_operand(code.words[pc + 3u]));
+            pc += 4u;
+            program_viewed = true;
+            if (op == 18u) {
+                program_stack[code.words[pc++]] = fresnel_node(n, normal, view, parameter);
+            } else {
+                vec2 weights = layer_weight_node(n, normal, view, parameter);
+                program_stack[code.words[pc++]] = weights.x;
+                program_stack[code.words[pc++]] = weights.y;
+            }
         } else if (op == 16u) {
             uint first = code.words[pc++];
             uint width = code.words[pc++];

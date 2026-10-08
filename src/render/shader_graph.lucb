@@ -27,6 +27,7 @@
 #           ramp                            two colors at two positions, by `fac`
 #           normal_map                      a tangent-space normal map's color as a normal
 #           bump                            a normal from `height`'s slope (Cycles' bump)
+#           fresnel, layer_weight           how the surface faces the view (Cycles' nodes)
 #
 #       A bump compiles its height's nodes three times: at the point and with the point
 #       moved a footprint along each of two tangents (the uv and position ops carry the
@@ -36,8 +37,10 @@
 #
 #       The program (shaders/shader_program.glsl) is a flat u32 array, one opcode then
 #       its operands and output slots. An operand is a constant's bits, or a stack slot
-#       tagged in a NaN (0x7FC10000 | slot); colors and vectors take three. Programs are
-#       direction-free, so camera and light paths see one surface (connect.glsl).
+#       tagged in a NaN (0x7FC10000 | slot); colors and vectors take three. Programs see
+#       the outward normal, and only fresnel and layer_weight read the view, so camera
+#       and light paths see one surface (shader_program.glsl says how the view's
+#       readers keep that).
 #
 #==============================================================================================
 
@@ -62,6 +65,8 @@ let op_ramp: u32 = 14
 let op_normal_map: u32 = 15
 let op_output: u32 = 16
 let op_bump: u32 = 17
+let op_fresnel: u32 = 18
+let op_layer_weight: u32 = 19
 
 ## A socket: its name, how many floats it is (1 or 3) and its default.
 struct Socket:
@@ -188,6 +193,17 @@ func kind_of(name: str) -> (Kind, bool)!:
         # Unlinked: zero, which the kernel reads as the shading normal.
         try i.push(three("normal", 0.0, 0.0, 0.0))
         try o.push(three("normal", 0.0, 0.0, 0.0))
+    elif name == "fresnel":
+        kind.opcode = op_fresnel
+        try i.push(one("ior", 1.5))
+        try i.push(three("normal", 0.0, 0.0, 0.0))
+        try o.push(one("fac", 0.0))
+    elif name == "layer_weight":
+        kind.opcode = op_layer_weight
+        try i.push(one("blend", 0.5))
+        try i.push(three("normal", 0.0, 0.0, 0.0))
+        try o.push(one("fresnel", 0.0))
+        try o.push(one("facing", 0.0))
     else:
         kind.close()
         return (Kind(0, Growing[Socket](), Growing[Socket]()), false)

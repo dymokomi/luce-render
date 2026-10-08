@@ -71,8 +71,19 @@ void shade_light(uint path) {
 
     vec3 normal = normalize((1.0 - hit.z - hit.w) * octahedral_decode(attributes.x) + hit.z * octahedral_decode(attributes.y) + hit.w * octahedral_decode(attributes.z));
     if (dot(normal, geometric) < 0.0) normal = -normal;
+    // Where the camera sees this point from: a program reading the view sees
+    // it from there, as the camera path would.
+    uint pixel;
+    vec3 to_point;
+    float camera_distance;
+    vec3 lens = lens_point(sample4(LIGHT_PATH_ID(path), params.sample_index, GROUP_LIGHT(total)).xy);
+    bool on_film = camera_pixel(p, lens, pixel, to_point, camera_distance);
     // The material's node graph, as camera paths run it.
-    run_program(attributes.w, triangle, p, normal);
+    run_program(attributes.w, triangle, p, back ? -normal : normal, on_film ? -to_point : -ray.xyz);
+    // Such a program has no surface for directions the camera does not see
+    // from: the path connects here, if it can, and goes no further.
+    bool viewed = program_viewed;
+    if (viewed && !on_film) return;
     if (driven(9u)) {
         normal = normalize(driven3(11u));
         if (dot(normal, geometric) < 0.0) normal = -normal;
@@ -103,11 +114,7 @@ void shade_light(uint path) {
     float shading_in = cos_shading_in / cos_in;
 
     // Connect to the camera.
-    uint pixel;
-    vec3 to_point;
-    float camera_distance;
-    vec3 lens = lens_point(sample4(LIGHT_PATH_ID(path), params.sample_index, GROUP_LIGHT(total)).xy);
-    if (camera_pixel(p, lens, pixel, to_point, camera_distance)) {
+    if (on_film) {
         vec3 to_camera = -to_point;
         float side = dot(to_camera, geometric);
         Surface seen = side > 0.0 ? lit : turned(lit);
@@ -138,7 +145,7 @@ void shade_light(uint path) {
     }
 
     // Scatter on, unless the next vertex would be past the bounce limit.
-    if (total + 1u >= uint(constants[K_INFO].y)) return;
+    if (viewed || total + 1u >= uint(constants[K_INFO].y)) return;
     vec4 u = sample4(LIGHT_PATH_ID(path), params.sample_index, GROUP_BSDF(total));
     Surface choosing = lit;
     light_lobes(choosing);

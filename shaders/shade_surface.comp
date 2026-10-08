@@ -132,8 +132,13 @@ void shade_camera(uint path) {
 
     vec3 normal = normalize((1.0 - hit.z - hit.w) * octahedral_decode(attributes.x) + hit.z * octahedral_decode(attributes.y) + hit.w * octahedral_decode(attributes.z));
     if (dot(normal, geometric) < 0.0) normal = -normal;
-    // The material's node graph, once for this hit; it may bend the normal.
-    run_program(attributes.w, triangle, p, normal);
+    // The material's node graph, once for this hit, on the outward normal; it
+    // may bend the normal.
+    run_program(attributes.w, triangle, p, inside ? -normal : normal, -ray.xyz);
+    // A light path through here would have to scatter toward this path's last
+    // vertex, which a program reading the view cannot (light_paths.glsl): past
+    // the first vertex the light tracer's density is zero.
+    bool viewed = program_viewed;
     if (driven(9u)) {
         normal = normalize(driven3(11u));
         if (dot(normal, geometric) < 0.0) normal = -normal;
@@ -206,13 +211,13 @@ void shade_camera(uint path) {
                 float traced = 0.0;
                 if (light_tracing() && !s.delta && emitter != NONE && density > 0.0) {
                     float d2 = s.distance * s.distance;
-                    float at_last = total == 0u ? 1.0 : light_sampler_pdf(surface, s.direction, -ray.xyz) * back_reach / mis.y;
+                    float at_last = total == 0u ? 1.0 : (viewed ? 0.0 : light_sampler_pdf(surface, s.direction, -ray.xyz) * back_reach / mis.y);
                     float at_vertex = emission_direction_pdf(emitter, s.cos_light) * abs(side) / d2 / density;
                     float at_light = emitter_area_pdf(emitter) / (bsdf_pdf * s.cos_light / d2);
                     traced = mis.x * at_last * at_vertex * at_light;
                 }
                 if (light_tracing() && afar != NONE && emits_from_afar(afar) && density > 0.0) {
-                    float at_last = total == 0u ? 1.0 : light_sampler_pdf(surface, s.direction, -ray.xyz) * back_reach / mis.y;
+                    float at_last = total == 0u ? 1.0 : (viewed ? 0.0 : light_sampler_pdf(surface, s.direction, -ray.xyz) * back_reach / mis.y);
                     float at_vertex = afar_first_density(p, s.direction, abs(side)) / density;
                     float at_light = afar_emission_pdf(afar, s.direction) / bsdf_pdf;
                     traced = mis.x * at_last * at_vertex * at_light;
@@ -297,7 +302,7 @@ void shade_camera(uint path) {
     // alone, and this vertex's factor of the light tracer's density, settled
     // now that the light sampler's direction here is known.
     if (light_tracing()) {
-        float at_last = total == 0u ? 1.0 : light_sampler_pdf(surface, direction, -ray.xyz) * back_reach / mis.y;
+        float at_last = total == 0u ? 1.0 : (viewed ? 0.0 : light_sampler_pdf(surface, direction, -ray.xyz) * back_reach / mis.y);
         set_v(SV_MIS, path, vec4(mis.x * at_last, density, abs(side), 0.0));
         pdf = bsdf_only;
     }

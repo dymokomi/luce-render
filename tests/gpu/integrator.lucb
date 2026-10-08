@@ -54,6 +54,8 @@ pub func checks(device: gpu.Device) -> !:
     try graph_nodes(device, true)
     try graph_nodes(device, false)
     try bump_slope(device)
+    try viewed_graph(device, false)
+    try viewed_graph(device, true)
     try cutout_shadow(device)
     try adaptive(device)
     try guided_room(device)
@@ -673,6 +675,43 @@ func bump_slope(device: gpu.Device) -> !:
     assert(math.abs(means[1] / means[0] - 1.0) < 0.005 and math.abs(means[2] / means[0] - 1.0) < 0.005)
     # A constant height leaves the normal alone, which lights differently.
     assert(math.abs(means[3] / means[0] - 1.0) > 0.02)
+
+## A material whose graph reads the view (Layer Weight's facing picks its
+## color, Fresnel its roughness) on a sphere and the floor: light paths connect
+## at such surfaces but cannot scatter on from them, and camera paths count no
+## light-path density through them; the image's mean must not change.
+func viewed_graph(device: gpu.Device, spectral: bool) -> !:
+    let material = "materials/viewed"
+    let ball = try MeshPrimitives.sphere(0.5, 32)
+    defer ball.release()
+    let bound_ball = try MaterialAssignment.faces(ball, "", "material", material)
+    defer bound_ball.release()
+    let floor = try MeshPrimitives.grid(20.0, 8)
+    defer floor.release()
+    let bound_floor = try MaterialAssignment.faces(floor, "", "material", material)
+    defer bound_floor.release()
+    let both = try (try GeometrySet.of_mesh(bound_ball)).value().merged(try GeometrySet.of_mesh(bound_floor))
+    defer both.release()
+    let graph = "\nnode w layer_weight; input w blend 0.3; node m mix; link m fac w facing; input m a 0.8 0.7 0.6; input m b 0.1 0.2 0.4; node f fresnel; input f ior 1.45; node r map_range; link r value f fac; input r to_min 0.6; input r to_max 0.05; node surface openpbr_surface; link surface base_color m color; link surface specular_roughness r value"
+    let library = try both.value().with_material(material, "openpbr", "specular_weight\nshader_graph", [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], graph)
+    defer library.release()
+    let viewed = try library.value().with_camera("/camera", Vector3(0.0, 0.6, 3.0), Vector3(-0.1, 0.0, 0.0), 0, 50.0, 36.0, 24.0, 0.1, 100.0, 0.0, 2.0)
+    defer viewed.release()
+    let set = try viewed.value().with_light("/key", Vector3(0.0, 2.0, 0.0), Vector3(-0.5 * math.pi, 0.0, 0.0), 0, Vector3(1.0, 1.0, 1.0), 8.0, 0.0, 0.0, false, 1.0, 1.0, 0.5, 0.0, false)
+    defer set.release()
+    var means: f64[2] = [0.0, 0.0]
+    let pixels = try new f32[48 * 32 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    for way in 0..<(usize)2:
+        var settings = render.RenderSettings.of(48, 32, 2048)
+        settings.spectral = spectral
+        settings.max_bounces = 3
+        settings.light_tracing = 1.0 if way == 1 else 0.0
+        settings.seed = (u32)(way + 1)
+        try rendered(device, set.value(), settings, pixels)
+        for p in 0..<(usize)(48 * 32): means[way] += (f64)pixels[p * 4 + 1]
+    print(f"viewed graph (spectral {spectral}): light paths give {means[1] / means[0]} of the camera paths' mean")
+    assert(math.abs(means[1] / means[0] - 1.0) < 0.005)
 
 ## The mean of the window below the rect light, lit by it, of `library` (a floor).
 func floor_window(device: gpu.Device, library: interop.Reference[GeometrySet], spectral: bool) -> f64!:
