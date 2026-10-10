@@ -57,7 +57,9 @@ Hit trace_closest(vec3 origin, vec3 direction, float t_max) {
     uint stack[BVH_STACK];
     uint depth = 0u;
     uint node = 0u;
-    if (box_entry(nodes[0].lo, nodes[0].hi, origin, inverse, hit.t) < 0.0) return hit;
+    // An empty tree's root is inside out (low above high); the slab test
+    // would read it as a box and walk its missing children forever.
+    if (nodes[0].lo.x > nodes[0].hi.x || box_entry(nodes[0].lo, nodes[0].hi, origin, inverse, hit.t) < 0.0) return hit;
     while (true) {
         Node current = nodes[node];
         if (current.count > 0u) {
@@ -95,7 +97,7 @@ bool trace_any(vec3 origin, vec3 direction, float t_max) {
     uint stack[BVH_STACK];
     uint depth = 0u;
     uint node = 0u;
-    if (box_entry(nodes[0].lo, nodes[0].hi, origin, inverse, t_max) < 0.0) return false;
+    if (nodes[0].lo.x > nodes[0].hi.x || box_entry(nodes[0].lo, nodes[0].hi, origin, inverse, t_max) < 0.0) return false;
     while (true) {
         Node current = nodes[node];
         if (current.count > 0u) {

@@ -2,7 +2,8 @@
 // (binding 14) when built with RAY_QUERY=1, else the software BVH. Both give
 // the same Hit: t, the triangle slot (the BLAS is built from the reordered
 // indices, so its primitive index is the slot) and the barycentrics of
-// vertices 1 and 2.
+// vertices 1 and 2. The triangles' instance has mask 1 and the splats' (a
+// Blas of boxes, splats.glsl) mask 2, so triangle queries never see splats.
 
 #if RAY_QUERY
 #extension GL_EXT_ray_query : require
@@ -17,7 +18,7 @@ layout(set = 0, binding = 14) uniform accelerationStructureEXT scene_tlas;
 
 Hit trace_closest(vec3 origin, vec3 direction, float t_max) {
     rayQueryEXT query;
-    rayQueryInitializeEXT(query, scene_tlas, gl_RayFlagsOpaqueEXT, 0xffu, origin, 0.0, direction, t_max);
+    rayQueryInitializeEXT(query, scene_tlas, gl_RayFlagsOpaqueEXT, 0x01u, origin, 0.0, direction, t_max);
     while (rayQueryProceedEXT(query)) {
     }
     if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionTriangleEXT)
@@ -28,7 +29,7 @@ Hit trace_closest(vec3 origin, vec3 direction, float t_max) {
 
 bool trace_any(vec3 origin, vec3 direction, float t_max) {
     rayQueryEXT query;
-    rayQueryInitializeEXT(query, scene_tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xffu, origin, 0.0, direction, t_max);
+    rayQueryInitializeEXT(query, scene_tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0x01u, origin, 0.0, direction, t_max);
     while (rayQueryProceedEXT(query)) {
     }
     return rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT;

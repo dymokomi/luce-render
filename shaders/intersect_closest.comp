@@ -1,7 +1,11 @@
 #version 460
 // The nearest triangle or light along each queued ray: hits go to the surface
 // queue (camera paths) or the light queue (light paths), misses to the miss
-// queue. The last workgroup sizes the shading kernels.
+// queue. Gaussian splats on the way (splats.glsl) add their radiance to a
+// camera path's and keep their transmittance of its throughput; a light path
+// is only attenuated. A path the splats stop entirely (Russian roulette) ends
+// as a miss with no throughput left. The last workgroup sizes the shading
+// kernels.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -10,6 +14,33 @@ layout(local_size_x = 64) in;
 #include "spectrum.glsl"
 #include "lights.glsl"
 #include "trace.glsl"
+#include "splats.glsl"
+
+// Indirect light is clamped like the surfaces' (shade_surface's `clamped`).
+Spec clamped_indirect(Spec contribution, uint total) {
+    float clamp_value = constants[K_INFO].z;
+    if (total == 0u || clamp_value <= 0.0) return contribution;
+    float largest = spec_max(contribution);
+    return largest > clamp_value ? contribution * (clamp_value / largest) : contribution;
+}
+
+// The splats before the hit at `reach`: false when they stopped the path.
+bool through_splats(uint path, vec3 origin, vec3 direction, float reach) {
+    uint bounces = get_u(SU_BOUNCE, path);
+    uint seed = splat_seed(path, bounces, 0u);
+    Spec throughput = get_v(SV_THROUGHPUT, path);
+    float kept;
+    if (is_light_path(path)) {
+        kept = splat_transmittance(origin, direction, 0.0, reach, seed);
+    } else {
+        Spec added;
+        splat_composite(origin, direction, reach, get_v(SV_LAMBDA, path), seed, added, kept);
+        set_v(SV_RADIANCE, path, get_v(SV_RADIANCE, path) + clamped_indirect(throughput * added, bounce_total(bounces)));
+    }
+    if (kept == 1.0) return true;
+    set_v(SV_THROUGHPUT, path, throughput * kept);
+    return kept > 0.0;
+}
 
 void work() {
     uint queue = Q_CLOSEST + params.current;
@@ -30,6 +61,10 @@ void work() {
             hit.t = t;
             what = LIGHT_HIT | light;
         }
+    }
+    if (splats_present() && !through_splats(path, origin, direction, what == NONE ? INFINITY : hit.t)) {
+        queue_push(Q_MISS, path);
+        return;
     }
     if (what == NONE) {
         queue_push(Q_MISS, path);

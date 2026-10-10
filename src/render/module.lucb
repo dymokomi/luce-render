@@ -12,7 +12,8 @@
 #
 #       module.lucb    imports and error codes
 #       scene.lucb     CompiledScene: world-space triangles, faces and scene objects
-#       bvh.lucb       a binned-SAH BVH over the triangles, in the kernels' node layout
+#       bvh.lucb       a binned-SAH BVH over boxes (triangles, splats), in the kernels' node layout
+#       splats.lucb    Gaussian splat clouds packed for ray tracing (3DGRT), with their BVH
 #       camera.lucb    a camera's primary-ray frame for a resolution
 #       device.lucb    GpuScene, the scene's buffers, and the primary-ray probe
 #       spectrum.lucb  color matching, spectral fits of colors, blackbodies, film matrix
@@ -35,6 +36,7 @@ import interop
 from luce_std import clock
 from luce_std import math
 from luce_std import math32
+from luce_std import parallel
 from luce_std import files
 import strings
 from luce_exr import exr
@@ -44,6 +46,9 @@ from luce_raster.model import Raster
 from luce_raster.binary import to_half
 from luce_geocore.geocore import Vector3, Matrix4, Mesh, MeshPrimitives, GeometrySet, SceneObject, SceneKind, Camera, Projection, LightShape
 from luce_geocore.kernel import Float3, append_text, Instances, Component, SceneObjects, Materials, MaterialParameter, mesh_component, instances_component, scene_flattened, materials_flattened
+from luce_geocore.kernel import AttributeStore, Attribute, points_component, set_cloud, cloud_store, cloud_positions, cloud_origin, set_detail
+from luce_geocore.splats import Quat, Floats, ColorSpace, point_floats, is_splat_store, sh_attribute, sh_items, sh_frame, detail_color_space, from_linear
+from luce_geocore.splats import placed_point_store, orient_name, scale_name, opacity_name, color_name, restorient_name
 from luce_geocore.core.growing import Growing
 from luce_gpu import gpu
 

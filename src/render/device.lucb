@@ -5,7 +5,8 @@
 #   DESCRIPTION:
 #       GpuScene holds the scene's buffers: BVH nodes, positions and indices (every
 #       tracing kernel's bindings 0..2), each triangle's polygon (the probe's), and
-#       each triangle's shading attributes (normals and material). `probe` traces one ray per pixel through a camera's
+#       each triangle's shading attributes (normals and material); and the splats'
+#       records, harmonics, boxes and BVH, which kernels reach by address. `probe` traces one ray per pixel through a camera's
 #       frame and reads back each pixel's polygon and distance: the check that the GPU
 #       BVH agrees with the host, and what picking through a render camera uses.
 #       Device calls happen on the main thread (luce-gpu's rule).
@@ -18,11 +19,19 @@ pub struct GpuScene:
     pub var indices: gpu.Buffer
     pub var faces: gpu.Buffer
     pub var shading: gpu.Buffer
-    ## Hardware ray tracing's view of the triangles, where the device has it
-    ## (and the scene has triangles): one BLAS and a one-instance TLAS.
+    ## Hardware ray tracing's view of the scene, where the device has it: a
+    ## BLAS of the triangles (instance mask 1) and one of the splats' boxes
+    ## (mask 2), each where the scene has some, in one TLAS.
     pub var accelerated: bool
     pub var blas: gpu.Blas
+    pub var splat_blas: gpu.Blas
     pub var tlas: gpu.Tlas
+    ## The splats (splats.lucb): records, harmonics, boxes and the software BVH.
+    pub var splat_count: usize
+    pub var splat_records: gpu.Buffer
+    pub var splat_harmonics: gpu.Buffer
+    pub var splat_boxes: gpu.Buffer
+    pub var splat_nodes: gpu.Buffer
 
     ## The scene's buffers on `device`; an empty array still gets a word. With
     ## `accelerate` and a device that traces rays, the TLAS is built too.
@@ -37,21 +46,47 @@ pub struct GpuScene:
         errdefer faces.destroy()
         var shading = try buffer_of(device, u8[]((u8*)scene.shading.items.data, scene.shading.count * 4))
         errdefer shading.destroy()
-        if not accelerate or scene.triangle_count() == 0 or not (try device.limits()).ray_query:
-            return GpuScene(nodes, positions, indices, faces, shading, false, gpu.Blas(), gpu.Tlas())
-        let triangles = gpu.Triangles(vertices = positions, vertex_count = (u32)scene.point_count(), indices = indices, triangle_count = (u32)scene.triangle_count())
-        var blas = try gpu.Blas.create(device, triangles, false)
-        errdefer blas.destroy()
-        var tlas = try gpu.Tlas.create(device, 1)
-        errdefer tlas.destroy()
+        let splats = &scene.splats
+        var splat_records = try buffer_of(device, u8[]((u8*)splats.records.items.data, splats.records.count * 4))
+        errdefer splat_records.destroy()
+        var splat_harmonics = try buffer_of(device, u8[]((u8*)splats.harmonics.items.data, splats.harmonics.count * 4))
+        errdefer splat_harmonics.destroy()
+        var splat_boxes = try buffer_of(device, u8[]((u8*)splats.boxes.items.data, splats.boxes.count * 4))
+        errdefer splat_boxes.destroy()
+        var splat_nodes = try buffer_of(device, u8[]((u8*)splats.nodes.items.data, splats.nodes.count * memory.size_of(BvhNode)))
+        errdefer splat_nodes.destroy()
+        var uploaded = GpuScene(nodes, positions, indices, faces, shading, false, gpu.Blas(), gpu.Blas(), gpu.Tlas(), splats.count(),
+                                splat_records, splat_harmonics, splat_boxes, splat_nodes)
+        if not accelerate or (scene.triangle_count() == 0 and splats.count() == 0) or not (try device.limits()).ray_query:
+            return uploaded
+        errdefer uploaded.destroy()
+        var instances: gpu.Instance[2] = [gpu.Instance(blas = gpu.Blas()), gpu.Instance(blas = gpu.Blas())]
+        var instance_count: usize = 0
         var pass = try gpu.Compute.begin(device)
         defer pass.close()
-        try pass.build_blas(blas, triangles)
-        let instances: gpu.Instance[1] = [gpu.Instance(blas = blas)]
-        try pass.build_tlas(tlas, instances)
+        if scene.triangle_count() > 0:
+            let triangles = gpu.Triangles(vertices = positions, vertex_count = (u32)scene.point_count(), indices = indices, triangle_count = (u32)scene.triangle_count())
+            uploaded.blas = try gpu.Blas.create(device, triangles, false)
+            try pass.build_blas(uploaded.blas, triangles)
+            instances[instance_count] = gpu.Instance(blas = uploaded.blas, mask = 1)
+            instance_count += 1
+        if splats.count() > 0:
+            let boxes = gpu.Boxes(buffer = splat_boxes, count = (u32)splats.count())
+            uploaded.splat_blas = try gpu.Blas.create_boxes(device, boxes, false)
+            try pass.build_boxes(uploaded.splat_blas, boxes)
+            instances[instance_count] = gpu.Instance(blas = uploaded.splat_blas, mask = 2)
+            instance_count += 1
+        uploaded.tlas = try gpu.Tlas.create(device, (u32)instance_count)
+        try pass.build_tlas(uploaded.tlas, instances[..<instance_count])
         # Later passes are ordered after this one; nothing waits for it.
         try pass.submit()
-        return GpuScene(nodes, positions, indices, faces, shading, true, blas, tlas)
+        uploaded.accelerated = true
+        return uploaded
+
+    ## The splat buffers' addresses for the kernels' constants (splats.glsl):
+    ## records, harmonics and the software BVH.
+    pub func splat_addresses() -> u64[3]!:
+        return [try self.splat_records.address(), try self.splat_harmonics.address(), try self.splat_nodes.address()]
 
     pub func destroy():
         self.nodes.destroy()
@@ -59,9 +94,13 @@ pub struct GpuScene:
         self.indices.destroy()
         self.faces.destroy()
         self.shading.destroy()
-        if self.accelerated:
-            self.tlas.destroy()
-            self.blas.destroy()
+        self.splat_records.destroy()
+        self.splat_harmonics.destroy()
+        self.splat_boxes.destroy()
+        self.splat_nodes.destroy()
+        self.tlas.destroy()
+        self.blas.destroy()
+        self.splat_blas.destroy()
 
 ## A buffer of `bytes`; an empty one still gets 64 zero bytes, since Metal wants
 ## room for at least one element of whatever the kernel declares (a vec4, a node).

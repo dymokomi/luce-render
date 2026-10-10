@@ -1,0 +1,349 @@
+## Gaussian splats in the integrator (shaders/splats.glsl), against a CPU
+## evaluation of the same model in f64 (3DGRT: each splat at its point of
+## maximum response along the ray, composited front to back):
+## - primary visibility: overlapping, rotated, anisotropic splats with SH, over
+##   an emissive quad that hides one splat behind it and shows through the
+##   others, every pixel against the CPU, in both builds, on the software BVH
+##   and by hardware ray queries;
+## - shadows: a splat between the sun and a floor keeps 1 - α of the light,
+##   checked under it and around it, on both traversals;
+## - a ball of 3000 random splats and no triangles looks the same on both
+##   traversals.
+import memory
+import interop
+from luce_std import math
+from luce_gpu import gpu
+from luce_render import render
+from luce_geocore.geocore import Vector3, MeshPrimitives, GeometrySet
+from luce_geocore.kernel import Attribute, AttributeStore, Domain, DataType, Float3, empty_set, adopt_set, dispose_set, points_component, cloud_assembled, set_detail
+from luce_geocore.core.shared import Column
+from luce_geocore.splats import Quat, display_color, detail_color_space
+
+pub func checks(device: gpu.Device) -> !:
+    let rays = (try device.limits()).ray_query
+    try primary(device, true, false)
+    try primary(device, false, false)
+    if rays:
+        try primary(device, true, true)
+        try primary(device, false, true)
+    try shadow(device, false)
+    if rays:
+        try shadow(device, true)
+        try traversals_agree(device)
+
+## One splat as the checks describe it.
+pub struct Splat:
+    pub var center: Vector3
+    pub var orient: Quat = Quat(0.0, 0.0, 0.0, 1.0)
+    pub var scale: Vector3 = Vector3(0.1, 0.1, 0.1)
+    pub var opacity: f64 = 1.0
+    ## Linear.
+    pub var color: Vector3 = Vector3(0.5, 0.5, 0.5)
+    ## Band 1's three RGB items.
+    pub var sh: f32[9] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+## A set holding `splats` as a splat cloud with SH degree 1.
+pub func splat_set(splats: const Splat[]) -> interop.Reference[GeometrySet]!:
+    let count = splats.length
+    var store = AttributeStore()
+    let orient = try Attribute.create("orient", Domain.point, DataType.float32, 4, count)
+    let scale = try Attribute.create("scale", Domain.point, DataType.float32, 3, count)
+    let opacity = try Attribute.create("opacity", Domain.point, DataType.float32, 1, count)
+    let color = try Attribute.create("Cd", Domain.point, DataType.float32, 3, count)
+    let o = f32[]((f32*)orient.data.span().data, count * 4)
+    let s = f32[]((f32*)scale.data.span().data, count * 3)
+    let a = f32[]((f32*)opacity.data.span().data, count)
+    let c = f32[]((f32*)color.data.span().data, count * 3)
+    var positions = try Column[Float3].allocate(count)
+    let out = positions.span()
+    var offsets = try Column[u8].allocate((count + 1) * 4)
+    let bounds = u32[]((u32*)offsets.span().data, count + 1)
+    var values = try Column[u8].allocate(count * 3 * 12)
+    let items = f32[]((f32*)values.span().data, count * 9)
+    for at in 0..<count:
+        let splat = splats[at]
+        out[at] = Float3.of(splat.center)
+        let q: f64[4] = [splat.orient.x, splat.orient.y, splat.orient.z, splat.orient.w]
+        for k in 0..<(usize)4: o[at * 4 + k] = (f32)q[k]
+        let sv: f64[3] = [splat.scale.x, splat.scale.y, splat.scale.z]
+        let cv: f64[3] = [splat.color.x, splat.color.y, splat.color.z]
+        for k in 0..<(usize)3:
+            s[at * 3 + k] = (f32)sv[k]
+            c[at * 3 + k] = (f32)cv[k]
+        a[at] = (f32)splat.opacity
+        for k in 0..<(usize)9: items[at * 9 + k] = splat.sh[k]
+    for at in 0..<count + 1: bounds[at] = (u32)(at * 3)
+    for made in [orient, scale, opacity, color]: try store.put(made)
+    try store.put(try Attribute.ragged("sh", Domain.point, DataType.float32, 3, offsets, values))
+    let cloud = try cloud_assembled(positions, Vector3(), store)
+    let storage = empty_set() catch failure:
+        let close = points_component().close
+        close((void*)cloud)
+        error(failure.code, failure.message)
+    storage.put(points_component(), (void*)cloud) catch failure:
+        dispose_set(storage)
+        error(failure.code, failure.message)
+    return try adopt_set(storage)
+
+## Linear Rec.709 to ACEScg, as the renderer converts splat colors.
+func to_acescg(c: Vector3) -> Vector3:
+    return Vector3(0.613097 * c.x + 0.339523 * c.y + 0.047379 * c.z, 0.070194 * c.x + 0.916354 * c.y + 0.013452 * c.z,
+                   0.020616 * c.x + 0.109570 * c.y + 0.869815 * c.z)
+
+## Splat `splat`'s α along the ray (unit `d`) and the distance there, in f64.
+func splat_alpha(splat: const Splat*, o: Vector3, d: Vector3) -> (f64, f64):
+    let r = splat.orient.normalized().matrix().transposed()
+    let inverse = Vector3(1.0 / splat.scale.x, 1.0 / splat.scale.y, 1.0 / splat.scale.z)
+    let a = r.transform(o.subtract(splat.center))
+    let b = r.transform(d)
+    let lo = Vector3(a.x * inverse.x, a.y * inverse.y, a.z * inverse.z)
+    let ld = Vector3(b.x * inverse.x, b.y * inverse.y, b.z * inverse.z)
+    let dd = ld.dot(ld)
+    let t = -lo.dot(ld) / dd
+    let c = lo.cross(ld)
+    let m2 = c.dot(c) / dd
+    if m2 > 9.0: return (0.0, t)
+    let alpha = math.min(0.99, splat.opacity * math.exp(-0.5 * m2))
+    return (alpha if alpha >= render.splat_cull else 0.0, t)
+
+## The radiance (ACEScg) along the ray: the splats before `t_end` front to
+## back (at most 16), then `behind` with what they pass on.
+func composite(splats: const Splat[], o: Vector3, d: Vector3, t_end: f64, behind: Vector3, set: const GeometrySet*) -> Vector3:
+    var ts: f64[16]
+    var alphas: f64[16]
+    var used: usize[16]
+    var n: usize = 0
+    for at in 0..<splats.length:
+        let (alpha, t) = splat_alpha(&splats[at], o, d)
+        if alpha <= 0.0 or t <= 0.0 or t >= t_end: continue
+        var k = n
+        while k > 0 and ts[k - 1] > t:
+            ts[k] = ts[k - 1]
+            alphas[k] = alphas[k - 1]
+            used[k] = used[k - 1]
+            k -= 1
+        ts[k] = t
+        alphas[k] = alpha
+        used[k] = at
+        n += 1
+    var sum = Vector3()
+    var kept: f64 = 1.0
+    let space = detail_color_space(set_detail(set))
+    for k in 0..<n:
+        let splat = &splats[used[k]]
+        let color = to_acescg(display_color(splat.color, splat.sh, 3, d, space))
+        sum = sum.add(color.multiply_scalar(kept * alphas[k]))
+        kept *= 1.0 - alphas[k]
+    return sum.add(behind.multiply_scalar(kept))
+
+## The emissive quad's plane, z = -2, and its half size.
+let quad_z: f64 = -2.0
+let quad_half: f64 = 1.5
+
+## Overlapping splats in front of an emissive quad (one hidden behind it),
+## primary rays only: every pixel against the CPU's composite at its center,
+## where the image changes slowly within the pixel.
+func primary(device: gpu.Device, spectral: bool, rays: bool) -> !:
+    var splats: Splat[6] = [
+        Splat(center = Vector3(-0.4, 0.1, 0.0), scale = Vector3(0.5, 0.25, 0.3), orient = Quat.about(Vector3(0.0, 0.0, 1.0), 0.6), opacity = 0.8,
+              color = Vector3(0.9, 0.2, 0.1), sh = [0.1, 0.0, -0.05, 0.0, 0.08, 0.0, -0.1, 0.0, 0.1]),
+        Splat(center = Vector3(0.3, -0.1, -0.5), scale = Vector3(0.35, 0.6, 0.2), orient = Quat.about(Vector3(0.2822, 0.9406, 0.1881), 0.9),
+              opacity = 0.7, color = Vector3(0.1, 0.8, 0.2)),
+        Splat(center = Vector3(0.0, 0.0, 0.6), scale = Vector3(0.2, 0.2, 0.2), opacity = 0.5, color = Vector3(0.2, 0.3, 1.0)),
+        Splat(center = Vector3(0.9, 0.6, 0.2), scale = Vector3(0.3, 0.1, 0.3), orient = Quat.about(Vector3(1.0, 0.0, 0.0), 1.1), opacity = 0.99,
+              color = Vector3(1.0, 1.0, 0.3)),
+        Splat(center = Vector3(-0.8, -0.7, -1.0), scale = Vector3(0.4, 0.4, 0.4), opacity = 0.35, color = Vector3(0.6, 0.6, 0.6)),
+        # Behind the quad: hidden where the quad covers it.
+        Splat(center = Vector3(0.5, -0.5, -2.6), scale = Vector3(0.5, 0.5, 0.5), opacity = 0.95, color = Vector3(1.0, 0.0, 1.0))]
+    let cloud = try splat_set(splats)
+    defer cloud.release()
+    let grid = try MeshPrimitives.grid(2.0 * quad_half, 2)
+    defer grid.release()
+    let quad = try (try GeometrySet.of_mesh(grid)).value().transformed(Vector3(0.0, 0.0, quad_z), Vector3(0.5 * math.pi, 0.0, 0.0), Vector3(1.0, 1.0, 1.0))
+    defer quad.release()
+    let joined = try cloud.value().merged(quad)
+    defer joined.release()
+    let set = try joined.value().with_camera("/camera", Vector3(0.0, 0.0, 5.0), Vector3(), 0, 50.0, 36.0, 24.0, 0.1, 100.0, 0.0, 5.0)
+    defer set.release()
+    let width: u32 = 96
+    let height: u32 = 64
+    var settings = render.RenderSettings.of(width, height, 64)
+    settings.spectral = spectral
+    settings.software_bvh = not rays
+    settings.max_bounces = 1
+    settings.material.base_weight = 0.0
+    settings.material.specular_weight = 0.0
+    settings.material.emission_luminance = 1.0
+    settings.material.emission_color = Vector3(0.2, 0.4, 0.9)
+    var scene = try render.compile_scene(set.value())
+    defer scene.close()
+    assert(scene.splats.count() == 6)
+    var renderer = try render.Renderer.create(device, &scene, settings)
+    defer renderer.destroy()
+    assert(renderer.ray_traced() == rays)
+    try renderer.finish()
+    let pixels = try new f32[(usize)width * (usize)height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    try renderer.read(pixels)
+    let frame = try render.ray_frame(scene.objects.object(0), width, height)
+    # The quad's emission in ACEScg: its color times its luminance.
+    let emitted = settings.material.emission_color.multiply_scalar(settings.material.emission_luminance)
+    var worst: f64 = 0.0
+    var squares: f64 = 0.0
+    var compared: usize = 0
+    for y in 0..<(usize)height:
+        for x in 0..<(usize)width:
+            let expected = reference(splats, &frame, (f64)x + 0.5, (f64)y + 0.5, emitted, set.value())
+            # Skip pixels the image changes across (quad edges, splat rims).
+            var spread: f64 = 0.0
+            for corner in 0..<(usize)4:
+                let other = reference(splats, &frame, (f64)x + 0.5 + (0.45 if corner % 2 == 0 else -0.45), (f64)y + 0.5 + (0.45 if corner < 2 else -0.45), emitted, set.value())
+                spread = math.max(spread, other.subtract(expected).length())
+            if spread > 0.02: continue
+            let at = (y * (usize)width + x) * 4
+            let got = Vector3((f64)pixels[at], (f64)pixels[at + 1], (f64)pixels[at + 2])
+            let miss = got.subtract(expected).length()
+            worst = math.max(worst, miss)
+            squares += miss * miss
+            compared += 1
+    let rms = math.sqrt(squares / (f64)compared)
+    # The spectral build turns colors into spectra and back: a few percent.
+    let bound = 0.03 if spectral else 0.012
+    if rms > bound * 0.5 or worst > bound * 2.5 or compared < (usize)width * (usize)height // 2:
+        print(f"splats primary (spectral {spectral}, ray queries {rays}): rms {rms}, worst {worst} over {compared} pixels")
+        assert(false)
+
+## The CPU's radiance through film point (x, y).
+func reference(splats: const Splat[], frame: const render.RayFrame*, x: f64, y: f64, emitted: Vector3, set: const GeometrySet*) -> Vector3:
+    let (origin, toward) = frame.ray(x, y)
+    let d = toward.multiply_scalar(1.0 / toward.length())
+    # The quad, facing the camera.
+    let t_quad = (quad_z - origin.z) / d.z
+    let p = origin.add(d.multiply_scalar(t_quad))
+    let on_quad = t_quad > 0.0 and math.abs(p.x) <= quad_half and math.abs(p.y) <= quad_half
+    return composite(splats, origin, d, t_quad if on_quad else 1.0e30, emitted if on_quad else Vector3(), set)
+
+## A white floor under the sun (straight down) with a black splat of opacity 1
+## and σ 0.25 one unit above it: at distance r from under its center the floor
+## keeps 1 - min(0.99, e^(-r²/2σ²)) of the light. Direct light only.
+func shadow(device: gpu.Device, rays: bool) -> !:
+    var splats: Splat[1] = [Splat(center = Vector3(0.0, 1.0, 0.0), scale = Vector3(0.25, 0.25, 0.25), opacity = 1.0, color = Vector3())]
+    let cloud = try splat_set(splats)
+    defer cloud.release()
+    let grid = try MeshPrimitives.grid(8.0, 8)
+    defer grid.release()
+    let floor = try GeometrySet.of_mesh(grid)
+    defer floor.release()
+    let joined = try cloud.value().merged(floor)
+    defer joined.release()
+    let viewed = try joined.value().with_camera("/camera", Vector3(0.0, 2.0, 4.0), Vector3(-0.6, 0.0, 0.0), 0, 35.0, 36.0, 24.0, 0.1, 100.0, 0.0, 5.0)
+    defer viewed.release()
+    let set = try viewed.value().with_light("/sun", Vector3(), Vector3(-0.5 * math.pi, 0.0, 0.0), 3, Vector3(1.0, 1.0, 1.0), 3.0, 0.0, 0.0, false, 1.0, 1.0, 0.5, 0.01, false)
+    defer set.release()
+    let width: u32 = 96
+    let height: u32 = 64
+    var settings = render.RenderSettings.of(width, height, 64)
+    settings.software_bvh = not rays
+    settings.max_bounces = 1
+    settings.material.base_color = Vector3(0.8, 0.8, 0.8)
+    settings.material.specular_weight = 0.0
+    var scene = try render.compile_scene(set.value())
+    defer scene.close()
+    var renderer = try render.Renderer.create(device, &scene, settings)
+    defer renderer.destroy()
+    try renderer.finish()
+    let pixels = try new f32[(usize)width * (usize)height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    try renderer.read(pixels)
+    let frame = try render.ray_frame(scene.objects.object(0), width, height)
+    # The open floor's brightness, away from the shadow.
+    var open: f64 = 0.0
+    var open_count: usize = 0
+    for y in 0..<(usize)height:
+        for x in 0..<(usize)width:
+            let point = floor_point(&frame, (f64)x + 0.5, (f64)y + 0.5) else continue
+            if point.length() > 1.5 and point.length() < 3.0:
+                open += (f64)pixels[(y * (usize)width + x) * 4 + 1]
+                open_count += 1
+    assert(open_count > 50)
+    open /= (f64)open_count
+    var checked: usize = 0
+    for y in 0..<(usize)height:
+        for x in 0..<(usize)width:
+            let point = floor_point(&frame, (f64)x + 0.5, (f64)y + 0.5) else continue
+            let r = point.length()
+            if r > 0.9: continue
+            # The camera's own ray may pass near the (black) splat too.
+            let (origin, toward) = frame.ray((f64)x + 0.5, (f64)y + 0.5)
+            let (seen, t) = splat_alpha(&splats[0], origin, toward.multiply_scalar(1.0 / toward.length()))
+            _ = t
+            let kept = (1.0 - math.min(0.99, math.exp(-0.5 * r * r / (0.25 * 0.25)))) * (1.0 - seen)
+            let got = (f64)pixels[(y * (usize)width + x) * 4 + 1] / open
+            # The pixel spans a little of the floor, and samples are noisy.
+            let slope = math.abs(0.99 * math.exp(-0.5 * r * r / 0.0625) * r / 0.0625) * 0.05
+            if math.abs(got - kept) > 0.02 + slope:
+                print(f"splat shadow (ray queries {rays}) at r {r}: kept {got}, expected {kept}")
+                assert(false)
+            checked += 1
+    assert(checked > 20)
+
+## Where the film point's ray meets the floor (y = 0), when it does within the floor.
+func floor_point(frame: const render.RayFrame*, x: f64, y: f64) -> Vector3?:
+    let (origin, d) = frame.ray(x, y)
+    if d.y >= 0.0: return none
+    let t = -origin.y / d.y
+    let p = origin.add(d.multiply_scalar(t))
+    if math.abs(p.x) > 3.9 or math.abs(p.z) > 3.9: return none
+    return Vector3(p.x, 0.0, p.z)
+
+## A ball of 3000 random splats, many overlapping, a few large, and no
+## triangles: both traversals (the software BVH and ray queries over boxes)
+## give the same image within the samples' noise.
+func traversals_agree(device: gpu.Device) -> !:
+    let count: usize = 3000
+    let splats = try new Splat[count] --- in memory.heap
+    defer free(splats) in memory.heap
+    var state: u64 = 7
+    for at in 0..<count:
+        var r: f64[10]
+        for k in 0..<(usize)10: r[k] = draw(&state)
+        let size = 0.01 + 0.1 * r[3] * r[3] + (0.4 if at % 500 == 0 else 0.0)
+        splats[at] = Splat(center = Vector3(2.0 * r[0] - 1.0, 2.0 * r[1] - 1.0, 2.0 * r[2] - 1.0), scale = Vector3(size, size * (0.2 + r[4]), size * (0.2 + r[5])),
+                           orient = Quat(r[6] - 0.5, r[7] - 0.5, r[8] - 0.5, 0.5).normalized(), opacity = 0.05 + 0.95 * r[9], color = Vector3(r[4], r[6], r[8]))
+    let cloud = try splat_set(splats)
+    defer cloud.release()
+    let set = try cloud.value().with_camera("/camera", Vector3(0.0, 0.0, 4.0), Vector3(), 0, 50.0, 36.0, 24.0, 0.1, 100.0, 0.0, 5.0)
+    defer set.release()
+    let width: u32 = 96
+    let height: u32 = 64
+    let software = try new f32[(usize)width * (usize)height * 4] --- in memory.heap
+    defer free(software) in memory.heap
+    let queried = try new f32[(usize)width * (usize)height * 4] --- in memory.heap
+    defer free(queried) in memory.heap
+    for traversal in 0..<(usize)2:
+        var settings = render.RenderSettings.of(width, height, 16)
+        settings.spectral = false
+        settings.software_bvh = traversal == 1
+        settings.max_bounces = 1
+        var scene = try render.compile_scene(set.value())
+        defer scene.close()
+        var renderer = try render.Renderer.create(device, &scene, settings)
+        defer renderer.destroy()
+        try renderer.finish()
+        try renderer.read(software if traversal == 1 else queried)
+    var difference: f64 = 0.0
+    var total: f64 = 0.0
+    for at in 0..<(usize)width * (usize)height * 4:
+        difference += math.abs((f64)software[at] - (f64)queried[at])
+        total += math.abs((f64)queried[at])
+    if difference > 0.02 * total or total <= 0.0:
+        print(f"splat traversals: software and ray queries differ by {difference / total} of the image")
+        assert(false)
+
+## A uniform number in [0, 1) (SplitMix64).
+func draw(state: u64*) -> f64:
+    *state = *state +% 0x9E3779B97F4A7C15
+    var z = *state
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB
+    return (f64)((z ^ (z >> 31)) >> 11) / 9007199254740992.0

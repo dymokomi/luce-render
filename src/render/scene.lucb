@@ -19,6 +19,10 @@
 #       triangles until a Tessellate node; such components are counted in
 #       `skipped`, not drawn.
 #
+#       Splat clouds (Gaussian splats) of the set and its instances are packed by
+#       splats.lucb into `splats`, with a BVH of their own; plain point clouds are
+#       counted there, not drawn.
+#
 #       Instances are realized into one triangle list for now; a two-level hierarchy
 #       (one BVH per prototype, instances above) replaces this with hardware ray tracing.
 #
@@ -40,6 +44,8 @@ pub struct CompiledScene:
     pub var materials: Materials
     ## Components with no triangles to trace (CAD before Tessellate).
     pub var skipped: usize
+    ## Gaussian splats, placed in world space (splats.lucb).
+    pub var splats: CompiledSplats
 
     pub func init():
         self.positions = Growing[f32]()
@@ -51,6 +57,7 @@ pub struct CompiledScene:
         self.objects = SceneObjects()
         self.materials = Materials()
         self.skipped = 0
+        self.splats = CompiledSplats()
 
     pub func triangle_count() -> usize:
         return self.indices.count // 3
@@ -67,9 +74,10 @@ pub struct CompiledScene:
         self.nodes.close()
         self.objects.close()
         self.materials.close()
+        self.splats.close()
 
-## `set` compiled: its triangles in world space with their BVH, and its cameras
-## and lights.
+## `set` compiled: its triangles in world space with their BVH, its splats with
+## theirs, and its cameras and lights.
 pub func compile_scene(set: const GeometrySet*) -> CompiledScene!:
     var scene = CompiledScene()
     errdefer scene.close()
@@ -79,6 +87,7 @@ pub func compile_scene(set: const GeometrySet*) -> CompiledScene!:
     if scene.point_count() > 4294967295: error(limit, "a scene holds at most 2^32 points")
     try scene_flattened(set, Matrix4(), &scene.objects)
     try build_bvh(&scene)
+    try build_splat_bvh(&scene.splats)
     return scene
 
 func add_set(scene: CompiledScene*, set: const GeometrySet*, matrix: Matrix4, face_base: u32*, depth: usize) -> !:
@@ -87,6 +96,8 @@ func add_set(scene: CompiledScene*, set: const GeometrySet*, matrix: Matrix4, fa
         let entry = set.component(index)
         if entry.kind == mesh_component():
             try add_mesh(scene, (const Mesh*)entry.data, matrix, face_base)
+        elif entry.kind == points_component():
+            try add_cloud(&scene.splats, set, matrix)
         elif entry.kind == instances_component():
             let instances = (const Instances*)entry.data
             for at in 0..<instances.count():

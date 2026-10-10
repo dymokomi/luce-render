@@ -33,6 +33,8 @@ layout(constant_id = 6) const uint LIGHTS = 0xffffffffu;
 layout(constant_id = 7) const bool LIGHT_TRACING = true;
 // Materials with node graphs (shader_program.glsl).
 layout(constant_id = 8) const bool HAS_PROGRAMS = true;
+// Gaussian splats (splats.glsl).
+layout(constant_id = 9) const bool HAS_SPLATS = true;
 
 layout(push_constant) uniform Params {
     vec4 position;      // camera; w: 1 orthographic

@@ -23,11 +23,14 @@ KERNELS = [('probe.comp', 'probe', ''), ('tables.comp', 'tables', ''), ('guide_f
 for name in ['camera', 'shade_surface', 'shade_miss', 'finish', 'film_convert', 'adaptive', 'light_emit']:
     KERNELS.append((f'{name}.comp', f'{name}', 'SPECTRAL=1'))
     KERNELS.append((f'{name}.comp', f'{name}_rgb', 'SPECTRAL=0'))
-# Intersection reads no spectra, so both builds share it: on the software
-# BVH, or by hardware ray queries where the device has them.
-for name in ['intersect_closest', 'intersect_shadow']:
-    KERNELS.append((f'{name}.comp', f'{name}', 'RAY_QUERY=0'))
-    KERNELS.append((f'{name}.comp', f'{name}_rq', 'RAY_QUERY=1'))
+# Intersection on the software BVH, or by hardware ray queries where the
+# device has them. Closest hits add the splats' emission, spectral or RGB;
+# shadow rays read no spectra, so both builds share them.
+for defines, stem in [('SPECTRAL=1', ''), ('SPECTRAL=0', '_rgb')]:
+    KERNELS.append(('intersect_closest.comp', f'intersect_closest{stem}', f'{defines},RAY_QUERY=0'))
+    KERNELS.append(('intersect_closest.comp', f'intersect_closest{stem}_rq', f'{defines},RAY_QUERY=1'))
+KERNELS.append(('intersect_shadow.comp', 'intersect_shadow', 'RAY_QUERY=0'))
+KERNELS.append(('intersect_shadow.comp', 'intersect_shadow_rq', 'RAY_QUERY=1'))
 
 def main() -> int:
     specs = []

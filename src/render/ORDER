@@ -1,6 +1,7 @@
 module.lucb
 scene.lucb
 bvh.lucb
+splats.lucb
 camera.lucb
 device.lucb
 spectrum.lucb

@@ -9,6 +9,7 @@ from luce_geocore.geocore import Vector3, Mesh, MeshPrimitives, GeometrySet
 from luce_geocore.core.growing import Growing
 import integrator
 import overhead
+import splats
 
 pub func main(arguments: str[]) -> i32!:
     _ = arguments
@@ -46,6 +47,8 @@ pub func main(arguments: str[]) -> i32!:
     print(f"PASS probe: BVH traversal on the GPU agrees with brute force over {scene.triangle_count()} triangles, perspective and orthographic")
     try overhead.measure(device)
     try integrator.checks(device)
+    try splats.checks(device)
+    print("PASS splats: primary visibility over an emissive quad against the CPU (both builds, both traversals), shadows on a floor, traversals agree")
     print("PASS integrator: white furnace (diffuse under specular, rough EON, rough metal, coat, glass), cut-out opacity, emission, assigned materials, area light irradiance (UsdLux and emissive mesh), spectral against RGB (both builds), hardware ray queries against the BVH")
     return 0
 

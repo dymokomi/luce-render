@@ -134,7 +134,7 @@ struct Kernels:
         if spectral:
             var camera = try Kernel.create(device, constants, camera_comp_words, camera_comp_msl, camera_comp_group, camera_comp_bindings)
             errdefer camera.kernel.destroy()
-            var closest = try intersect_kernel(device, rays, constants)
+            var closest = try intersect_kernel(device, true, rays, constants)
             errdefer closest.kernel.destroy()
             var surface = try Kernel.create(device, constants, shade_surface_comp_words, shade_surface_comp_msl, shade_surface_comp_group, shade_surface_comp_bindings, table = shade_surface_comp_table)
             errdefer surface.kernel.destroy()
@@ -154,7 +154,7 @@ struct Kernels:
             return Kernels(camera, closest, surface, miss, shadow, finish, convert, adaptive, fit, emit)
         var camera = try Kernel.create(device, constants, camera_rgb_comp_words, camera_rgb_comp_msl, camera_rgb_comp_group, camera_rgb_comp_bindings)
         errdefer camera.kernel.destroy()
-        var closest = try intersect_kernel(device, rays, constants)
+        var closest = try intersect_kernel(device, false, rays, constants)
         errdefer closest.kernel.destroy()
         var surface = try Kernel.create(device, constants, shade_surface_rgb_comp_words, shade_surface_rgb_comp_msl, shade_surface_rgb_comp_group, shade_surface_rgb_comp_bindings, table = shade_surface_rgb_comp_table)
         errdefer surface.kernel.destroy()
@@ -186,9 +186,13 @@ struct Kernels:
         self.light_emit.kernel.destroy()
 
 ## Intersection kernels serve both builds: they read no spectra.
-func intersect_kernel(device: gpu.Device, rays: bool, constants: const gpu.Constant[]) -> Kernel!:
-    if rays: return try Kernel.create(device, constants, intersect_closest_rq_comp_words, intersect_closest_rq_comp_msl, intersect_closest_rq_comp_group, intersect_closest_rq_comp_bindings, false)
-    return try Kernel.create(device, constants, intersect_closest_comp_words, intersect_closest_comp_msl, intersect_closest_comp_group, intersect_closest_comp_bindings, false)
+## Closest hits, spectral or RGB (splats add their emission in the build's terms).
+func intersect_kernel(device: gpu.Device, spectral: bool, rays: bool, constants: const gpu.Constant[]) -> Kernel!:
+    if spectral:
+        if rays: return try Kernel.create(device, constants, intersect_closest_rq_comp_words, intersect_closest_rq_comp_msl, intersect_closest_rq_comp_group, intersect_closest_rq_comp_bindings, false)
+        return try Kernel.create(device, constants, intersect_closest_comp_words, intersect_closest_comp_msl, intersect_closest_comp_group, intersect_closest_comp_bindings, false)
+    if rays: return try Kernel.create(device, constants, intersect_closest_rgb_rq_comp_words, intersect_closest_rgb_rq_comp_msl, intersect_closest_rgb_rq_comp_group, intersect_closest_rgb_rq_comp_bindings, false)
+    return try Kernel.create(device, constants, intersect_closest_rgb_comp_words, intersect_closest_rgb_comp_msl, intersect_closest_rgb_comp_group, intersect_closest_rgb_comp_bindings, false)
 
 func shadow_kernel(device: gpu.Device, rays: bool, constants: const gpu.Constant[]) -> Kernel!:
     if rays: return try Kernel.create(device, constants, intersect_shadow_rq_comp_words, intersect_shadow_rq_comp_msl, intersect_shadow_rq_comp_group, intersect_shadow_rq_comp_bindings, false)
@@ -330,6 +334,13 @@ pub struct Renderer:
         memory.write[u64]((void*)&rows[92], try tables.address())
         memory.write[u64]((void*)&rows[94], try uvs.address())
         memory.write[u64]((void*)&rows[96], try programs.address())
+        # The splats, reached by address (shaders/splats.glsl: K_SPLATS, K_SPLAT_TREE).
+        let splat_addresses = try uploaded.splat_addresses()
+        memory.write[u64]((void*)&rows[100], splat_addresses[0])
+        memory.write[u64]((void*)&rows[102], splat_addresses[1])
+        memory.write[u64]((void*)&rows[104], splat_addresses[2])
+        rows[106] = (f32)uploaded.splat_count
+        rows[107] = (f32)splat_cull
         var records = Growing[f32]()
         defer records.close()
         var cutouts = false
@@ -369,7 +380,7 @@ pub struct Renderer:
         # light count, guiding.
         var has_programs = false
         for entry in textures.entries.view(): has_programs = has_programs or entry >= 0.0
-        var features = scene_features(library.view(), light_count, settings, light_paths > 0, has_programs)
+        var features = scene_features(library.view(), light_count, settings, light_paths > 0, has_programs, uploaded.splat_count > 0)
         var kernels = try Kernels.create(device, settings.spectral, uploaded.accelerated, features)
         errdefer kernels.destroy()
         var materials = try buffer_of(device, u8[]((u8*)records.items.data, records.count * 4))
@@ -655,8 +666,8 @@ func make_tables(device: gpu.Device) -> gpu.Buffer!:
 
 ## The specialization constants of the integrator kernels (shaders/common.glsl):
 ## which material features the scene uses, cut-outs, guiding, the light count,
-## light tracing.
-func scene_features(library: const OpenPbr[], light_count: usize, settings: RenderSettings, light_tracing: bool, programs: bool) -> gpu.Constant[9]:
+## light tracing, node graphs, splats.
+func scene_features(library: const OpenPbr[], light_count: usize, settings: RenderSettings, light_tracing: bool, programs: bool, splats: bool) -> gpu.Constant[10]:
     var coat = false
     var transmission = false
     var metal = false
@@ -670,7 +681,8 @@ func scene_features(library: const OpenPbr[], light_count: usize, settings: Rend
         cutouts = cutouts or material.geometry_opacity < 1.0
     return [gpu.Constant.boolean(0, coat), gpu.Constant.boolean(1, transmission), gpu.Constant.boolean(2, metal),
             gpu.Constant.boolean(3, emission), gpu.Constant.boolean(4, cutouts), gpu.Constant.boolean(5, settings.guiding),
-            gpu.Constant.uint32(6, (u32)light_count), gpu.Constant.boolean(7, light_tracing), gpu.Constant.boolean(8, programs)]
+            gpu.Constant.uint32(6, (u32)light_count), gpu.Constant.boolean(7, light_tracing), gpu.Constant.boolean(8, programs),
+            gpu.Constant.boolean(9, splats)]
 
 ## The camera to render through: `index`, or the first camera when it is -1.
 func find_camera(scene: const CompiledScene*, index: i64) -> usize!:

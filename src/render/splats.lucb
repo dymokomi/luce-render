@@ -1,0 +1,213 @@
+#==============================================================================================
+#
+#   render/splats - Gaussian splat clouds in the kernels' layout
+#
+#   DESCRIPTION:
+#       Every splat cloud of a set and its visible instances (luce-geocore's conventions:
+#       orient, scale, opacity, linear Cd, the `sh` array, optional restorient), placed in
+#       world space exactly (luce-geocore's placed_point_store) and packed for ray tracing
+#       as 3D Gaussian Ray Tracing does (Moenne-Loccoz et al. 2024): a ray meets each
+#       Gaussian once, at its point of maximum response, where the Gaussian's opacity is
+#       α = min(0.99, opacity · exp(-½ d²)), d the Mahalanobis distance of the ray from
+#       the center. Splats whose α would stay under the cull (3DGS's 1/255, the
+#       viewport's) never count, and nor does anything past 3σ, as the viewport draws.
+#
+#       Per splat, 16 words (`records`, std430 uvec4 × 4):
+#       - 0..3: the center (f32 × 3) and the opacity;
+#       - 4..7: the rotation from world to the splat's axes (conjugate orient, xyzw);
+#       - 8..11: one over the scales (f32 × 3), and the splat's first word in `harmonics`;
+#       - 12..15: the DC color in the cloud's encoding (f32 × 3, encode(Cd)), and flags:
+#         the SH items (0, 3, 8 or 15) in bits 0..4, bit 5 when the encoding is sRGB.
+#       `harmonics` holds, per splat, its SH frame turn (world to SH frame, half × 4,
+#       two words) and its SH items (RGB halves, padded to a whole word). The color
+#       seen along a ray adds the bands toward its direction to the DC, clamps at 0 and
+#       decodes, as luce-geocore's display_color and the viewport do.
+#
+#       `boxes` are each splat's box out to where its α falls to the cull (at most
+#       3σ): hardware ray tracing builds a Blas of boxes from them, and the software
+#       BVH (`nodes`, bvh.lucb's layout) is built over them, with the records in leaf
+#       order.
+#
+#==============================================================================================
+
+## The opacity below which a splat's contribution is dropped: 3DGS's 1/255, as
+## luce-3d's viewport culls (SplatLook.alpha_cull).
+pub let splat_cull: f64 = 0.00392156862745098
+let record_words: usize = 16
+## Flags in a record's last word.
+let flag_srgb: u32 = 32
+
+pub struct CompiledSplats:
+    ## 16 words a splat, in leaf order once the BVH is built.
+    pub var records: Growing[u32]
+    ## Each splat's SH frame and items; records name their first word.
+    pub var harmonics: Growing[u32]
+    ## Six f32s a splat (low, high), in the records' order.
+    pub var boxes: Growing[f32]
+    ## The software BVH over the boxes.
+    pub var nodes: Growing[BvhNode]
+    ## Point clouds that are plain points (no orient, scale and opacity): not rendered.
+    pub var plain_clouds: usize
+
+    pub func init():
+        self.records = Growing[u32]()
+        self.harmonics = Growing[u32]()
+        self.boxes = Growing[f32]()
+        self.nodes = Growing[BvhNode]()
+        self.plain_clouds = 0
+
+    pub func count() -> usize:
+        return self.records.count // record_words
+
+    pub func close():
+        self.records.close()
+        self.harmonics.close()
+        self.boxes.close()
+        self.nodes.close()
+
+## A cloud's columns for packing, shared by its workers.
+struct SplatPacking:
+    let positions: const Float3[]
+    let origin: Vector3
+    let matrix: Matrix4
+    let orient: Floats
+    let scale: Floats
+    let opacity: Floats
+    let color: Floats
+    let restorient: Floats
+    let sh: const Attribute*?
+    let items: usize
+    let space: ColorSpace
+    ## The cloud's first record word, harmonics word and box float.
+    let record_base: usize
+    let harmonic_base: usize
+    let box_base: usize
+    ## Words of harmonics a splat: the frame's two and its items'.
+    let harmonic_stride: usize
+    var out: CompiledSplats*
+
+## Add `set`'s splat cloud placed by `matrix`; a plain point cloud is counted
+## in `plain_clouds` and skipped.
+func add_cloud(splats: CompiledSplats*, set: const GeometrySet*, matrix: Matrix4) -> !:
+    let cloud = set_cloud(set) else return
+    let source = cloud_store(cloud)
+    if not is_splat_store(source):
+        splats.plain_clouds += 1
+        return
+    let count = cloud.count()
+    if count == 0: return
+    if splats.count() + count > 67108864: error(limit, "a render holds at most 2^26 splats")
+    # Placed exactly: orient, scale, restorient and the SH follow the placement.
+    var placed = AttributeStore()
+    defer placed.close()
+    let identity = matrix.is_identity()
+    if not identity: placed = try placed_point_store(source, count, matrix)
+    let store = source if identity else (const AttributeStore*)&placed
+    let items = sh_items(store)
+    let sh_index = sh_attribute(store)
+    let stride = 2 + (items * 3 + 1) // 2
+    var restorient = Floats()
+    if let found = point_floats(store, restorient_name, 4): restorient = found
+    var work = SplatPacking(positions = cloud_positions(cloud), origin = cloud_origin(cloud), matrix = matrix,
+                            orient = point_floats(store, orient_name, 4) else Floats(), scale = point_floats(store, scale_name, 3) else Floats(),
+                            opacity = point_floats(store, opacity_name, 1) else Floats(), color = point_floats(store, color_name, 3) else Floats(),
+                            restorient = restorient, sh = store.entry((usize)sh_index) if sh_index >= 0 and items > 0 else none, items = items,
+                            space = detail_color_space(set_detail(set)), record_base = splats.records.count, harmonic_base = splats.harmonics.count,
+                            box_base = splats.boxes.count, harmonic_stride = stride, out = splats)
+    try splats.records.reserve(splats.records.count + count * record_words)
+    try splats.harmonics.reserve(splats.harmonics.count + count * stride)
+    try splats.boxes.reserve(splats.boxes.count + count * 6)
+    try parallel.for_each_range(count, 8192, (void*)&work, pack_splats)
+    splats.records.count += count * record_words
+    splats.harmonics.count += count * stride
+    splats.boxes.count += count * 6
+
+## Pack splats first..<end of one cloud.
+func pack_splats(context: void*, first: usize, end: usize, worker: usize) -> !:
+    _ = worker
+    let work = (SplatPacking*)context
+    let out = work.out
+    for index in first..<end:
+        let local = work.positions[index].vector().add(work.origin)
+        let center = work.matrix.transform_point(local)
+        let orient = Quat(work.orient.at(index, 0), work.orient.at(index, 1), work.orient.at(index, 2), work.orient.at(index, 3))
+        let spin = orient.normalized() if orient.x * orient.x + orient.y * orient.y + orient.z * orient.z + orient.w * orient.w > 1.0e-30 else Quat.identity()
+        # Scales are kept off zero, so one over them stays finite.
+        let scale = Vector3(math.max(math.abs(work.scale.at(index, 0)), 1.0e-12), math.max(math.abs(work.scale.at(index, 1)), 1.0e-12),
+                            math.max(math.abs(work.scale.at(index, 2)), 1.0e-12))
+        let opacity = math.clamp(work.opacity.at(index, 0), 0.0, 1.0)
+        let words = out.records.items[work.record_base + index * record_words..<work.record_base + (index + 1) * record_words]
+        let turn = spin.conjugate()
+        let values: f64[12] = [center.x, center.y, center.z, opacity, turn.x, turn.y, turn.z, turn.w, 1.0 / scale.x, 1.0 / scale.y, 1.0 / scale.z, 0.0]
+        for at in 0..<(usize)11: words[at] = float_bits(values[at])
+        let first_word = work.harmonic_base + index * work.harmonic_stride
+        words[11] = (u32)first_word
+        for channel in 0..<(usize)3:
+            let linear = work.color.at(index, channel) if work.color.present() else 0.5
+            words[12 + channel] = float_bits(from_linear(linear, work.space))
+        words[15] = (u32)work.items | (flag_srgb if work.space == ColorSpace.srgb else 0)
+        # The SH frame turn (world to the frame the SH were authored in), then the items.
+        let rest = Quat(work.restorient.at(index, 0), work.restorient.at(index, 1), work.restorient.at(index, 2), work.restorient.at(index, 3)) if work.restorient.present() else spin
+        let rest_unit = rest.normalized() if rest.x * rest.x + rest.y * rest.y + rest.z * rest.z + rest.w * rest.w > 1.0e-30 else spin
+        let frame = sh_frame(spin, rest_unit).conjugate()
+        let harmonics = out.harmonics.items[first_word..<first_word + work.harmonic_stride]
+        harmonics[0] = half_pair(frame.x, frame.y)
+        harmonics[1] = half_pair(frame.z, frame.w)
+        for at in 2..<harmonics.length: harmonics[at] = 0
+        if let sh = work.sh:
+            var have = sh.item_count(index)
+            if have > work.items: have = work.items
+            let source = f32[]((f32*)sh.data.view().data, sh.data.view().length // 4)
+            let start = sh.first_item(index) * 3
+            for at in 0..<have * 3:
+                let value = math.clamp((f64)source[start + at], -60000.0, 60000.0)
+                let word = 2 + at // 2
+                let bits = (u32)to_half(value)
+                harmonics[word] = harmonics[word] | (bits << 16 if at % 2 == 1 else bits)
+        # The box out to where α falls to the cull (at most 3σ); a splat that
+        # never reaches the cull gets an empty box at its center.
+        let reach = 2.0 * math.log(opacity / splat_cull) if opacity > splat_cull else 0.0
+        let k = math.min(3.0, math.sqrt(math.max(reach, 0.0)))
+        let rotation = spin.matrix()
+        let box = out.boxes.items[work.box_base + index * 6..<work.box_base + (index + 1) * 6]
+        let centers: f64[3] = [center.x, center.y, center.z]
+        let scales: f64[3] = [scale.x, scale.y, scale.z]
+        for axis in 0..<(usize)3:
+            var variance: f64 = 0.0
+            for j in 0..<(usize)3:
+                let r = rotation.at(axis, j) * scales[j]
+                variance += r * r
+            let extent = k * math.sqrt(variance)
+            box[axis] = (f32)(centers[axis] - extent)
+            box[3 + axis] = (f32)(centers[axis] + extent)
+
+func float_bits(value: f64) -> u32:
+    var single = (f32)value
+    return memory.read[u32]((void*)&single)
+
+## Two halves in one word, `low` in the low 16 bits (GLSL's unpackHalf2x16).
+func half_pair(low: f64, high: f64) -> u32:
+    return (u32)to_half(low) | ((u32)to_half(high) << 16)
+
+## The splats' BVH, with the records (and boxes) in its leaf order.
+func build_splat_bvh(splats: CompiledSplats*) -> !:
+    let count = splats.count()
+    let boxes = try new Box[count] --- in memory.heap
+    defer free(boxes) in memory.heap
+    for at in 0..<count:
+        let b = splats.boxes.items[at * 6..<(at + 1) * 6]
+        boxes[at] = Box(Float3(b[0], b[1], b[2]), Float3(b[3], b[4], b[5]))
+    let order = try new u32[count] --- in memory.heap
+    defer free(order) in memory.heap
+    try build_tree(boxes, order, &splats.nodes)
+    if count == 0: return
+    let records = try new u32[count * record_words] --- in memory.heap
+    defer free(records) in memory.heap
+    let placed = try new f32[count * 6] --- in memory.heap
+    defer free(placed) in memory.heap
+    for at in 0..<count:
+        let source = (usize)order[at]
+        memory.copy(records[at * record_words..<(at + 1) * record_words], splats.records.items[source * record_words..<(source + 1) * record_words], record_words)
+        memory.copy(placed[at * 6..<(at + 1) * 6], splats.boxes.items[source * 6..<(source + 1) * 6], 6)
+    memory.copy(splats.records.items, records, count * record_words)
+    memory.copy(splats.boxes.items, placed, count * 6)

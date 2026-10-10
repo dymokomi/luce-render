@@ -45,6 +45,48 @@ Planned layout changes for the integrator:
 - **Per-triangle material id.**
 - **No `vec3[]` arrays:** std430 pads each element to 16 bytes.
 
+## Gaussian splats
+
+Splat clouds (luce-geocore's conventions: `orient`, `scale`, `opacity`,
+linear `Cd`, the `sh` array, optional `restorient`) are ray traced as 3D
+Gaussian Ray Tracing does (Moenne-Loccoz et al. 2024). The code is our own.
+
+- **The model.** A ray meets each Gaussian once, at its point of maximum
+  response. There it covers α = min(0.99, opacity · exp(-½ d²)), with d the
+  ray's Mahalanobis distance from the center. Its color is the SH evaluated
+  toward the ray's direction, added to the DC in the cloud's encoding,
+  clamped and decoded, exactly as the viewport's `display_color`. Splats under
+  1/255 or past 3σ do not count, as in the viewport.
+- **The scene** (`splats.lucb`): every cloud and visible instance placed
+  exactly (`placed_point_store`), 64 bytes a splat plus its SH halves, and a
+  box out to where α falls to the cull. Hardware ray queries trace a Blas of
+  those boxes (luce-gpu `Blas.create_boxes`), instanced beside the triangles'
+  Blas with mask 2 (triangles have mask 1). The software path has a BVH of
+  its own over the boxes, reached by address.
+- **Traversal** (`shaders/splats.glsl`): a k-buffer. Each round gathers the 16
+  nearest splats past the last round's farthest; once full, a generated
+  intersection at the 16th culls everything beyond it. The round is
+  composited front to back, and rounds go on until a round is not full.
+  Shadow rays and light paths need only the product of (1 - α), in any order.
+- **In the integrator** splats are a non-scattering layer that emits and
+  absorbs:
+  - A camera path's segment adds Σ Tᵢ αᵢ cᵢ times the path's throughput, then
+    keeps T = Π (1 - αᵢ) of its throughput for what lies behind.
+  - Shadow rays, light paths and light paths' camera connections keep T.
+  - No technique samples splats as emitters, so their emission has one
+    technique and weight 1. Transmittance is deterministic and the same for
+    every technique that carries light along a segment, so the MIS weights
+    are untouched and the estimate stays unbiased.
+  - Captured light is emitted as captured. Relighting (Relight GSplats) bakes
+    new colors into `Cd` and the SH before rendering.
+  - Below T = 0.01 a segment goes on by Russian roulette (survives with
+    probability T / 0.01 at T = 0.01), so expected emission and transmittance
+    are exact.
+- **Checked** (`tests/gpu/splats.lucb`): every pixel of overlapping, rotated,
+  anisotropic splats with SH over an emissive quad, against a CPU composite in
+  f64 (both builds, both traversals); a splat's shadow on a floor against
+  1 - α; the software BVH against ray queries on 3000 random splats.
+
 ## Spectral and RGB from one code path
 
 All tracing code works on a `Spec` type:

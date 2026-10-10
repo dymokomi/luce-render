@@ -1,21 +1,22 @@
 #==============================================================================================
 #
-#   render/bvh - A binned-SAH bounding volume hierarchy over the triangles
+#   render/bvh - A binned-SAH bounding volume hierarchy over boxes
 #
 #   DESCRIPTION:
-#       A binary BVH built top down: each node splits its triangles at the best of 12
-#       centroid bins on each axis by the surface area heuristic (Wald 2007), or stays a
-#       leaf when that is cheaper (at most 4 triangles a leaf unless they cannot be
-#       separated). Children are stored as a pair, so an interior node names only its
-#       first child. The kernels traverse it with a short stack; it is the software path,
-#       and the layout hardware ray tracing does not need.
+#       A binary BVH built top down over primitives' boxes: each node splits its
+#       primitives at the best of 12 centroid bins on each axis by the surface area
+#       heuristic (Wald 2007), or stays a leaf when that is cheaper (at most 4 primitives a
+#       leaf unless they cannot be separated). Children are stored as a pair, so an
+#       interior node names only its first child. The kernels traverse it with a short
+#       stack; it is the software path, and the layout hardware ray tracing does not need.
 #
-#       The triangles' indices, polygons and shading attributes are reordered into
-#       leaf order together.
+#       The scene's triangles get one (their indices, polygons and shading attributes
+#       reordered into leaf order together), and so do its splats (splats.lucb).
 #
 #       Node layout (32 bytes, std430 { vec3 lo; uint first; vec3 hi; uint count; }):
 #       an interior node has count 0 and children at `first` and `first + 1`; a leaf
-#       has `count` triangles from triangle `first` in the reordered index list.
+#       has `count` primitives from primitive `first` in leaf order. An empty tree is
+#       one root whose low corner is above its high one, which the kernels skip.
 #
 #==============================================================================================
 
@@ -64,17 +65,8 @@ struct Pending:
 ## Build the scene's BVH and reorder its triangles (and their faces) into leaf order.
 pub func build_bvh(scene: CompiledScene*) -> !:
     let count = scene.triangle_count()
-    scene.nodes.clear()
-    if count == 0:
-        # An inside-out box no ray enters, so traversal stops at the root.
-        try scene.nodes.push(BvhNode(Float3(1.0, 1.0, 1.0), 0, Float3(-1.0, -1.0, -1.0), 0))
-        return
     let boxes = try new Box[count] --- in memory.heap
     defer free(boxes) in memory.heap
-    let centers = try new Float3[count] --- in memory.heap
-    defer free(centers) in memory.heap
-    let order = try new u32[count] --- in memory.heap
-    defer free(order) in memory.heap
     let p = scene.positions.view()
     for at in 0..<count:
         var box = Box.empty()
@@ -82,10 +74,27 @@ pub func build_bvh(scene: CompiledScene*) -> !:
             let i = (usize)scene.indices.items[at * 3 + k] * 3
             box = box.grow_point(Float3(p[i], p[i + 1], p[i + 2]))
         boxes[at] = box
+    let order = try new u32[count] --- in memory.heap
+    defer free(order) in memory.heap
+    try build_tree(boxes, order, &scene.nodes)
+    if count > 0: try reorder(scene, order)
+
+## A BVH over `boxes` into `nodes` (cleared first), and `order`: the primitive
+## at each leaf position. No boxes give an empty root (low above high).
+func build_tree(boxes: const Box[], order: u32[], nodes: Growing[BvhNode]*) -> !:
+    let count = boxes.length
+    nodes.clear()
+    if count == 0:
+        try nodes.push(BvhNode(Float3(1.0, 1.0, 1.0), 0, Float3(-1.0, -1.0, -1.0), 0))
+        return
+    let centers = try new Float3[count] --- in memory.heap
+    defer free(centers) in memory.heap
+    for at in 0..<count:
+        let box = boxes[at]
         centers[at] = Float3(0.5 * (box.lo.x + box.hi.x), 0.5 * (box.lo.y + box.hi.y), 0.5 * (box.lo.z + box.hi.z))
         order[at] = (u32)at
-    try scene.nodes.reserve(2 * count)
-    try scene.nodes.push(BvhNode(Float3(0.0, 0.0, 0.0), 0, Float3(0.0, 0.0, 0.0), 0))
+    try nodes.reserve(2 * count)
+    try nodes.push(BvhNode(Float3(0.0, 0.0, 0.0), 0, Float3(0.0, 0.0, 0.0), 0))
     var stack = Growing[Pending]()
     defer stack.close()
     try stack.push(Pending(0, 0, count))
@@ -107,15 +116,14 @@ pub func build_bvh(scene: CompiledScene*) -> !:
                 # Centroids that bins cannot separate: halve by count.
                 left_count = job.count // 2
         if left_count == 0:
-            scene.nodes.items[job.node] = BvhNode(bounds.lo, (u32)job.first, bounds.hi, (u32)job.count)
+            nodes.items[job.node] = BvhNode(bounds.lo, (u32)job.first, bounds.hi, (u32)job.count)
             continue
-        let child = scene.nodes.count
-        try scene.nodes.push(BvhNode(Float3(0.0, 0.0, 0.0), 0, Float3(0.0, 0.0, 0.0), 0))
-        try scene.nodes.push(BvhNode(Float3(0.0, 0.0, 0.0), 0, Float3(0.0, 0.0, 0.0), 0))
-        scene.nodes.items[job.node] = BvhNode(bounds.lo, (u32)child, bounds.hi, 0)
+        let child = nodes.count
+        try nodes.push(BvhNode(Float3(0.0, 0.0, 0.0), 0, Float3(0.0, 0.0, 0.0), 0))
+        try nodes.push(BvhNode(Float3(0.0, 0.0, 0.0), 0, Float3(0.0, 0.0, 0.0), 0))
+        nodes.items[job.node] = BvhNode(bounds.lo, (u32)child, bounds.hi, 0)
         try stack.push(Pending(child + 1, job.first + left_count, job.count - left_count))
         try stack.push(Pending(child, job.first, left_count))
-    try reorder(scene, order)
 
 struct Split:
     var axis: i64
@@ -131,7 +139,7 @@ func bin_of(center: Float3, middle: Box, axis: usize) -> usize:
     return (usize)at if at < (i64)bins else bins - 1
 
 ## The cheapest bin boundary on any axis: SAH cost relative to the node's area,
-## in triangle intersections (one traversal step costs one).
+## in primitive intersections (one traversal step costs one).
 func best_split(boxes: const Box[], centers: const Float3[], order: const u32[], middle: Box) -> Split:
     var best = Split(-1, 0, 3.0e38)
     var parent = Box.empty()
@@ -171,7 +179,7 @@ func best_split(boxes: const Box[], centers: const Float3[], order: const u32[],
             if cost < best.cost: best = Split((i64)axis, split, cost)
     return best
 
-## Triangles of bins below `bin` first; the count of those.
+## Primitives of bins below `bin` first; the count of those.
 func partition(centers: const Float3[], order: u32[], middle: Box, axis: usize, bin: usize) -> usize:
     var low: usize = 0
     var high = order.length
