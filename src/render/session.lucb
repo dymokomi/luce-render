@@ -26,9 +26,12 @@
 #==============================================================================================
 
 ## A scene compiling on a thread of its own: the set (held until the compile
-## is collected), whether to compile its geometry, and the result.
+## is collected, and only by the main thread: a reference belongs to its
+## runtime thread), a storage of it sharing its arrays for the compile's
+## thread, whether to compile its geometry, and the result.
 struct Compiling:
     var set: interop.Reference[GeometrySet]
+    var storage: GeometrySet*
     var geometry: bool
     var scene: CompiledScene
     var failed: bool
@@ -38,12 +41,7 @@ struct Compiling:
 
 func compile_entry(context: void*?):
     let job = (Compiling*)(context else return)
-    let set = job.set.get() catch failure:
-        job.failed = true
-        append_text(&job.message, failure.message) catch _: _ = 0
-        job.finished.store(1, .release)
-        return
-    job.scene = compile_scene(set, job.geometry) catch failure:
+    job.scene = compile_scene(job.storage, job.geometry) catch failure:
         job.failed = true
         append_text(&job.message, failure.message) catch _: _ = 0
         recover CompiledScene()
@@ -254,12 +252,13 @@ pub struct RenderSession:
             if let held = self.geometry_set:
                 let made = running.render_settings()
                 reloads = made.pool == self.settings.pool and made.software_bvh == self.settings.software_bvh and (try same_geometry(try set.get(), try held.get()))
-        let job = try new Compiling(set = set.clone(), geometry = not reloads, scene = CompiledScene(), failed = false, message = Growing[u8]()) in memory.heap
+        let storage = try (try set.get()).storage()
+        let job = new Compiling(set = set.clone(), storage = storage, geometry = not reloads, scene = CompiledScene(), failed = false, message = Growing[u8]()) in memory.heap catch failure:
+            dispose_storage(storage)
+            error(failure.code, failure.message)
         job.finished.store(0, .relaxed)
         job.thread = thread.spawn(compile_entry, (void*)job, name = "render compile") catch failure:
-            job.set.release()
-            job.message.close()
-            free(job) in memory.heap
+            release_job(job)
             error(failure.code, failure.message)
         self.compiling = job
         self.compiles += 1
@@ -273,9 +272,7 @@ pub struct RenderSession:
         if self.queued != none:
             # Superseded: the newer set compiles instead.
             job.scene.close()
-            job.set.release()
-            job.message.close()
-            free(job) in memory.heap
+            release_job(job)
             let next = self.queued else return
             self.queued = none
             defer next.release()
@@ -284,13 +281,11 @@ pub struct RenderSession:
         if job.failed:
             try self.note((str)job.message.view())
             job.scene.close()
-            job.set.release()
         else:
             self.waiting = job.scene
             self.waiting_reloads = not job.geometry
-            self.waiting_set = job.set
-        job.message.close()
-        free(job) in memory.heap
+            self.waiting_set = job.set.clone()
+        release_job(job)
 
     ## Make the renderer of the waiting scene (or reload it), on `native`'s device.
     func take_waiting(native: const gpu.RenderTarget*) -> bool!:
@@ -433,9 +428,7 @@ pub struct RenderSession:
         if let job = self.compiling:
             job.thread.join() catch _: _ = 0
             job.scene.close()
-            job.set.release()
-            job.message.close()
-            free(job) in memory.heap
+            release_job(job)
             self.compiling = none
         if let next = self.queued: next.release()
         self.queued = none
@@ -462,6 +455,17 @@ pub struct RenderSession:
         self.camera_path.close()
 
 pub let render_session_type: interop.Type[RenderSession] = interop.Type[RenderSession]("RenderSession", RenderSession.close)
+
+## Free a collected (or never started) compile: its set, storage and message.
+func release_job(job: Compiling*):
+    job.set.release()
+    dispose_storage(job.storage)
+    job.message.close()
+    free(job) in memory.heap
+
+func dispose_storage(storage: GeometrySet*):
+    storage.close()
+    free(storage) in memory.heap
 
 ## The camera at `path` ("" the first camera).
 func find_camera_path(scene: const CompiledScene*, path: str) -> usize!:
