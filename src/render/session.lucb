@@ -170,6 +170,27 @@ pub struct RenderSession:
         self.started = clock.now()
         self.took = 0.0
 
+    ## The default material of the next start (faces with none assigned):
+    ## OpenPBR parameters by name, one per line, four numbers each, as a
+    ## Material node writes them.
+    pub func set_material(names: str, values: const f64[]) -> !:
+        var library = Materials()
+        defer library.close()
+        try library.add("default", "openpbr", names, values, none)
+        self.material = openpbr_of(&library, 0)
+
+    ## Bounce limits by kind, the indirect clamp (0 off), adaptive sampling's
+    ## noise threshold (0 off), path guiding and light paths a pixel (0 off) of
+    ## the next start.
+    pub func set_limits(diffuse: i64, glossy: i64, transmission: i64, clamp_indirect: f64, noise_threshold: f64, guiding: bool, light_tracing: f64):
+        self.diffuse = (u32)math.max(0.0, (f64)diffuse)
+        self.glossy = (u32)math.max(0.0, (f64)glossy)
+        self.transmission = (u32)math.max(0.0, (f64)transmission)
+        self.clamp_indirect = math.max(0.0, clamp_indirect)
+        self.noise_threshold = math.max(0.0, noise_threshold)
+        self.guiding = guiding
+        self.light_tracing = math.max(0.0, light_tracing)
+
     ## Take up to `samples` a pixel: a render that has finished goes on, one
     ## past it stops.
     pub func set_samples(samples: i64) -> !:
