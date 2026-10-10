@@ -26,9 +26,11 @@
 // segment survives with probability T / 0.01 and keeps T = 0.01, so the
 // expected transmittance and emission are exact.
 
+#extension GL_EXT_control_flow_attributes : require
+
 #define K_SPLATS 25         // xy the records' address, zw the harmonics' address
 #define K_SPLAT_TREE 26     // xy the software BVH's address, z the splat count, w the cull
-#define SPLAT_K 16          // hits gathered per round (the k-buffer)
+#define SPLAT_K 32          // hits gathered per round (the k-buffer)
 #define SPLAT_ROULETTE 0.01
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer SplatRecords { uvec4 records[]; };
@@ -160,28 +162,38 @@ float splat_roulette(float kept, uint seed, uint round) {
     return splat_random(seed, round) * SPLAT_ROULETTE < kept ? SPLAT_ROULETTE : 0.0;
 }
 
-// The k nearest splats of a round: distances ascending, splats, alphas.
+// The k nearest splats of a round: distances ascending and the splats; empty
+// slots hold t = INFINITY. Every index below is a constant once the loops are
+// unrolled, so the arrays stay in registers (indexed at run time they went to
+// thread memory, the kernel's largest cost), and α is not kept but evaluated
+// again when the round is composited, which keeps the state a third smaller.
+// 32 slots finish most rays in one round; a round costs a whole traversal.
 struct SplatHits {
     float t[SPLAT_K];
     uint s[SPLAT_K];
-    float a[SPLAT_K];
-    uint n;
 };
 
-// Keep hit (t, s, a) among the nearest SPLAT_K; the farthest drops out when full.
-void splat_keep(inout SplatHits hits, float t, uint s, float a) {
-    if (hits.n == SPLAT_K && t >= hits.t[SPLAT_K - 1u]) return;
-    int at = int(min(hits.n, SPLAT_K - 1u));
-    if (hits.n < SPLAT_K) hits.n++;
-    while (at > 0 && hits.t[at - 1] > t) {
-        hits.t[at] = hits.t[at - 1];
-        hits.s[at] = hits.s[at - 1];
-        hits.a[at] = hits.a[at - 1];
-        at--;
+void splat_hits_clear(out SplatHits hits) {
+    [[unroll]] for (uint i = 0u; i < SPLAT_K; i++) {
+        hits.t[i] = INFINITY;
+        hits.s[i] = 0u;
     }
-    hits.t[at] = t;
-    hits.s[at] = s;
-    hits.a[at] = a;
+}
+
+bool splat_hits_full(SplatHits hits) { return hits.t[SPLAT_K - 1u] < INFINITY; }
+
+// Keep hit (t, s) among the nearest SPLAT_K by insertion: each slot keeps
+// the nearer of itself and the hit carried down; the farthest falls off the end.
+void splat_keep(inout SplatHits hits, float t, uint s) {
+    [[unroll]] for (uint i = 0u; i < SPLAT_K; i++) {
+        bool nearer = t < hits.t[i];
+        float kt = hits.t[i];
+        uint ks = hits.s[i];
+        hits.t[i] = nearer ? t : kt;
+        hits.s[i] = nearer ? s : ks;
+        t = nearer ? kt : t;
+        s = nearer ? ks : s;
+    }
 }
 
 // The entry distance of the ray into a node's box within [t_lo, t_hi], or -1.
@@ -200,11 +212,10 @@ float splat_box_entry(vec3 lo, vec3 hi, vec3 origin, vec3 inverse, float t_lo, f
 // The SPLAT_K nearest splats whose maximum response lies in (t_lo, t_hi).
 SplatHits splat_gather(vec3 o, vec3 d, float t_lo, float t_hi) {
     SplatHits hits;
-    hits.n = 0u;
+    splat_hits_clear(hits);
     SplatRecords records = splat_records();
     float cutoff = t_hi;
 #if RAY_QUERY
-    rayQueryEXT query;
     rayQueryInitializeEXT(query, scene_tlas, gl_RayFlagsNoneEXT, 0x02u, o, t_lo, d, t_hi);
     while (rayQueryProceedEXT(query)) {
         if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionAABBEXT) continue;
@@ -212,9 +223,9 @@ SplatHits splat_gather(vec3 o, vec3 d, float t_lo, float t_hi) {
         float t;
         float alpha = splat_alpha(records, s, o, d, t);
         if (alpha <= 0.0 || !(t > t_lo && t < cutoff)) continue;
-        splat_keep(hits, t, s, alpha);
+        splat_keep(hits, t, s);
         // Full: nothing past the farthest kept can enter, so the query culls beyond it.
-        if (hits.n == SPLAT_K) {
+        if (splat_hits_full(hits)) {
             cutoff = hits.t[SPLAT_K - 1u];
             rayQueryGenerateIntersectionEXT(query, cutoff);
         }
@@ -235,8 +246,8 @@ SplatHits splat_gather(vec3 o, vec3 d, float t_lo, float t_hi) {
                 float t;
                 float alpha = splat_alpha(records, s, o, d, t);
                 if (alpha <= 0.0 || !(t > t_lo && t < cutoff)) continue;
-                splat_keep(hits, t, s, alpha);
-                if (hits.n == SPLAT_K) cutoff = hits.t[SPLAT_K - 1u];
+                splat_keep(hits, t, s);
+                if (splat_hits_full(hits)) cutoff = hits.t[SPLAT_K - 1u];
             }
         } else {
             uint left = current.first;
@@ -273,11 +284,14 @@ void splat_composite(vec3 o, vec3 d, float t_hi, vec4 lambda, uint seed, out Spe
     float t_lo = 0.0;
     for (uint round = 0u; round < 4096u; round++) {
         SplatHits hits = splat_gather(o, d, t_lo, t_hi);
-        for (uint i = 0u; i < hits.n; i++) {
-            added += splat_radiance(records, hits.s[i], d, lambda) * (kept * hits.a[i]);
-            kept *= 1.0 - hits.a[i];
+        [[unroll]] for (uint i = 0u; i < SPLAT_K; i++) {
+            if (hits.t[i] == INFINITY) break;
+            float t;
+            float alpha = splat_alpha(records, hits.s[i], o, d, t);
+            added += splat_radiance(records, hits.s[i], d, lambda) * (kept * alpha);
+            kept *= 1.0 - alpha;
         }
-        if (hits.n < SPLAT_K) return;
+        if (!splat_hits_full(hits)) return;
         t_lo = hits.t[SPLAT_K - 1u];
         kept = splat_roulette(kept, seed, round);
         if (kept == 0.0) return;
@@ -291,7 +305,6 @@ float splat_transmittance(vec3 o, vec3 d, float t_lo, float t_hi, uint seed) {
     uint round = 0u;
     SplatRecords records = splat_records();
 #if RAY_QUERY
-    rayQueryEXT query;
     rayQueryInitializeEXT(query, scene_tlas, gl_RayFlagsNoneEXT, 0x02u, o, t_lo, d, t_hi);
     while (rayQueryProceedEXT(query)) {
         if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionAABBEXT) continue;

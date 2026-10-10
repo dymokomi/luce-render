@@ -63,11 +63,15 @@ Gaussian Ray Tracing does (Moenne-Loccoz et al. 2024). The code is our own.
   those boxes (luce-gpu `Blas.create_boxes`), instanced beside the triangles'
   Blas with mask 2 (triangles have mask 1). The software path has a BVH of
   its own over the boxes, reached by address.
-- **Traversal** (`shaders/splats.glsl`): a k-buffer. Each round gathers the 16
+- **Traversal** (`shaders/splats.glsl`): a k-buffer. Each round gathers the 32
   nearest splats past the last round's farthest; once full, a generated
-  intersection at the 16th culls everything beyond it. The round is
+  intersection at the 32nd culls everything beyond it. The round is
   composited front to back, and rounds go on until a round is not full.
   Shadow rays and light paths need only the product of (1 - α), in any order.
+  The k-buffer is distances and splats only, inserted by a fully unrolled
+  pass so it stays in registers; α is evaluated again when a round is
+  composited. Box candidates come once each (the Blas forbids duplicate
+  any-hit candidates).
 - **In the integrator** splats are a non-scattering layer that emits and
   absorbs:
   - A camera path's segment adds Σ Tᵢ αᵢ cᵢ times the path's throughput, then
@@ -86,6 +90,40 @@ Gaussian Ray Tracing does (Moenne-Loccoz et al. 2024). The code is our own.
   anisotropic splats with SH over an emissive quad, against a CPU composite in
   f64 (both builds, both traversals); a splat's shadow on a floor against
   1 - α; the software BVH against ray queries on 3000 random splats.
+
+### Splat tracing speed
+
+The bonsai capture (1.24M splats) at 1920 × 1080, splats alone, ms a sample
+(the least of several runs, A and B alternated):
+
+| | Metal (M4 Max, GPU shared) | RADV (Radeon 890M) | NVIDIA (RTX A5500 Laptop) |
+| --- | --- | --- | --- |
+| 16-hit k-buffer indexed at run time, α kept | 3046 | 673 | 150 |
+| unrolled, α kept | | 597 | 99 |
+| unrolled, α evaluated again | | 539 | 94 |
+| 32 hits | | 433 | 75 |
+| one ray query object a kernel | 1936 | 357 | 76 |
+
+Another program held the Mac's GPU at 100% throughout, so its numbers are
+several times what an idle M4 Max gives (the 16-hit kernel took about 670 ms
+idle); their ratio is what counts. Images are the same to 0.04% (roulette).
+
+Where the time goes (NVIDIA, 32 hits): a traversal that tests nothing costs
+52 of the 76 ms; testing every box's splat, 4 more; SH colors about 11.
+
+Tried and dropped:
+- **Proxy meshes** (3DGRT's): an icosahedron around each splat in triangle
+  Blases, back faces culled, so the hardware rejects misses; a zero-length
+  query of the proxies' boxes finds those that hold a ray's start (their
+  entry face lies behind it). Candidates fall from 139 to 40 a ray and the
+  image matches, but rays cost 2× on NVIDIA, 6× on RADV and about 1.3× on
+  Metal: 25M triangles make a deep, overlapping BVH, and a ray query returns
+  to the kernel for a triangle candidate as for a box. Only a triangle's own
+  distance can be committed, so the k-buffer's cutoff culls less. Without
+  duplicate-free candidates the same splat was met up to three times.
+- **8 hits**: more rounds, each a whole traversal (120 ms on NVIDIA).
+- **No cutoff commit**: 136 ms on NVIDIA.
+- **48 hits**: no better than 32.
 
 ## Spectral and RGB from one code path
 

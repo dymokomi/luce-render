@@ -16,8 +16,11 @@ struct Hit {
 
 layout(set = 0, binding = 14) uniform accelerationStructureEXT scene_tlas;
 
+// One query object for every trace of a kernel: they never overlap, and on
+// Metal each declared query is thread state held for the whole kernel.
+rayQueryEXT query;
+
 Hit trace_closest(vec3 origin, vec3 direction, float t_max) {
-    rayQueryEXT query;
     rayQueryInitializeEXT(query, scene_tlas, gl_RayFlagsOpaqueEXT, 0x01u, origin, 0.0, direction, t_max);
     while (rayQueryProceedEXT(query)) {
     }
@@ -28,7 +31,6 @@ Hit trace_closest(vec3 origin, vec3 direction, float t_max) {
 }
 
 bool trace_any(vec3 origin, vec3 direction, float t_max) {
-    rayQueryEXT query;
     rayQueryInitializeEXT(query, scene_tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0x01u, origin, 0.0, direction, t_max);
     while (rayQueryProceedEXT(query)) {
     }
