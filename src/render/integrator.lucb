@@ -88,6 +88,10 @@ let constants_rows: usize = 32
 ## 2^21 paths (about 410 MB of state): a 1920 × 1080 image in one band, which
 ## halves the per-dispatch overhead of two (measured: 9.9 to 9.0 ms a sample).
 let default_pool: usize = 2097152
+## With splats a path costs far more (the bonsai capture's 1080p sample takes
+## about 0.6 s on an M4 Max), so passes cover 2^19 paths, about 150 ms each,
+## and the UI and other GPU users get their turns; 2^18 cost 25% more.
+let splat_pool: usize = 524288
 
 ## Profiling buckets (Renderer.kernel_times).
 let kind_camera: u8 = 0
@@ -259,7 +263,7 @@ pub struct Renderer:
         let camera = try find_camera(scene, settings.camera)
         let frame = try ray_frame(scene.objects.object(camera), settings.width, settings.height)
         let pixels = (usize)settings.width * (usize)settings.height
-        let pool = (usize)settings.pool if settings.pool > 0 else default_pool
+        let pool = (usize)settings.pool if settings.pool > 0 else (splat_pool if scene.splats.count() > 0 else default_pool)
         let band = pool if pool < pixels else pixels
         var uploaded = try GpuScene.upload(device, scene, not settings.software_bvh)
         errdefer uploaded.destroy()
