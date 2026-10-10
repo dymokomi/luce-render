@@ -11,6 +11,7 @@ textures.lucb
 lights.lucb
 materials.lucb
 light_tree.lucb
+loading.lucb
 integrator.lucb
 session.lucb
 kernels.lucb

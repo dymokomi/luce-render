@@ -3,21 +3,72 @@
 #   render/session - A progressive render an application shows
 #
 #   DESCRIPTION:
-#       RenderSession is what a Luce application holds: `start` compiles a GeometrySet
-#       on the CPU, and each `draw` into a view's target advances the render one pass
-#       (never waiting for the GPU) and draws the latest image fitted into a rectangle.
-#       The renderer is made on the first draw, on the device the view draws with.
-#       `draw` returns whether more passes are coming, so the view can ask for another
-#       frame.
+#       RenderSession is what a Luce application holds, for a render panel's image
+#       through a scene camera (`start`) or a viewport's through a view it places
+#       (`look`, then `start_view`).
+#
+#       Starting compiles the GeometrySet on a thread of its own, since a big scene
+#       (a million splats) takes seconds; each `draw` into a view's target picks up a
+#       finished compile, advances the render one pass (never waiting for the GPU) and
+#       draws the latest image fitted into a rectangle. The renderer is made on the
+#       first draw after a compile, on the device the view draws with. `draw` returns
+#       whether more passes are coming, so the view can ask for another frame.
+#
+#       Nothing is done twice:
+#       - a new view (`look`: an orbit, a resize) restarts the film; the scene stays
+#         on the device;
+#       - a new scene whose geometry is the renderer's (its meshes and clouds the
+#         same components, placed the same: a light or a material changed) compiles
+#         without splats or BVHs and reloads the lights, materials and kernels,
+#         keeping the geometry, its BLAS and TLAS on the device;
+#       - only other geometry compiles and uploads everything.
 #
 #==============================================================================================
 
+## A scene compiling on a thread of its own: the set (held until the compile
+## is collected), whether to compile its geometry, and the result.
+struct Compiling:
+    var set: interop.Reference[GeometrySet]
+    var geometry: bool
+    var scene: CompiledScene
+    var failed: bool
+    var message: Growing[u8]
+    var finished: @u32
+    var thread: thread.Handle
+
+func compile_entry(context: void*?):
+    let job = (Compiling*)(context else return)
+    let set = job.set.get() catch failure:
+        job.failed = true
+        append_text(&job.message, failure.message) catch _: _ = 0
+        job.finished.store(1, .release)
+        return
+    job.scene = compile_scene(set, job.geometry) catch failure:
+        job.failed = true
+        append_text(&job.message, failure.message) catch _: _ = 0
+        recover CompiledScene()
+    job.finished.store(1, .release)
+
 pub struct RenderSession:
     var device: gpu.Device
-    ## A compiled scene waiting for the first draw's device.
+    ## The compile in progress, and a scene started meanwhile (which replaces
+    ## it once it finishes); then the compiled scene waiting for the next draw.
+    var compiling: Compiling*?
+    var queued: interop.Reference[GeometrySet]?
     var waiting: CompiledScene?
+    ## Whether `waiting` is only what a reload needs (the geometry is the renderer's).
+    var waiting_reloads: bool
+    var waiting_set: interop.Reference[GeometrySet]?
+    ## The set the renderer's geometry came from (scene.lucb's same_geometry
+    ## tells a new set's apart).
+    var geometry_set: interop.Reference[GeometrySet]?
     var settings: RenderSettings
     var renderer: Renderer?
+    ## A view placed by `look` in place of a scene camera.
+    var viewing: bool
+    var framing: RayFrame
+    ## The scene camera of `start` ("" the first).
+    var camera_path: Growing[u8]
     var started: clock.Instant
     ## Seconds the render took, once it has finished (0 while it runs).
     var took: f64
@@ -33,12 +84,28 @@ pub struct RenderSession:
     var noise_threshold: f64
     var guiding: bool
     var light_tracing: f64
+    ## Paths a pass traces (0: the renderer's choice); radiance where no
+    ## surface is (linear ACEScg).
+    var pool: u32
+    var background: Vector3
+    ## Compiles and uploads the session has made, for tests and benchmarks.
+    var compiles: i64
+    var uploads: i64
+    var reloads: i64
 
     pub func init():
         self.device = gpu.Device()
+        self.compiling = none
+        self.queued = none
         self.waiting = none
+        self.waiting_reloads = false
+        self.waiting_set = none
+        self.geometry_set = none
         self.settings = RenderSettings.of(1, 1, 1)
         self.renderer = none
+        self.viewing = false
+        self.framing = RayFrame(Vector3(), Vector3(), Vector3(), Vector3(), Vector3(0.0, 0.0, -1.0), false, 0, 0, 0.0, 1.0)
+        self.camera_path = Growing[u8]()
         self.started = clock.now()
         self.took = 0.0
         self.exposure_stops = 0.0
@@ -52,6 +119,11 @@ pub struct RenderSession:
         self.noise_threshold = 0.0
         self.guiding = false
         self.light_tracing = RenderSettings.of(1, 1, 1).light_tracing
+        self.pool = 0
+        self.background = Vector3()
+        self.compiles = 0
+        self.uploads = 0
+        self.reloads = 0
 
     pub static func make() -> interop.Reference[RenderSession]!:
         return try interop.Reference[RenderSession].adopt(try new RenderSession() in memory.heap, render_session_type, memory.heap)
@@ -60,23 +132,71 @@ pub struct RenderSession:
     ## `width` × `height` pixels, `samples` a pixel, at most `bounces`, spectral or RGB.
     ## Replaces any render in progress.
     pub func start(set: interop.Reference[GeometrySet], camera: str, width: i64, height: i64, samples: i64, bounces: i64, spectral: bool) -> !:
-        self.stop()
-        self.problem_text.clear()
         if width < 1 or height < 1 or width > 16384 or height > 16384: error(invalid, "an image is 1 to 16384 pixels on a side")
+        try self.prepare(samples, bounces, spectral)
+        self.settings.width = (u32)width
+        self.settings.height = (u32)height
+        self.viewing = false
+        self.camera_path.clear()
+        try append_text(&self.camera_path, camera)
+        try self.begin(set)
+
+    ## Render `set` through the view `look` placed, `samples` a pixel at most,
+    ## at most `bounces`, spectral or RGB: a viewport's render. Its cameras are
+    ## not used. Replaces any render in progress; while its geometry is the
+    ## renderer's, only lights, materials and settings load again.
+    pub func start_view(set: interop.Reference[GeometrySet], samples: i64, bounces: i64, spectral: bool) -> !:
+        if self.framing.width == 0: error(invalid, "a view render needs a view: call look first")
+        try self.prepare(samples, bounces, spectral)
+        self.settings.width = self.framing.width
+        self.settings.height = self.framing.height
+        self.viewing = true
+        try self.begin(set)
+
+    ## Place the view (a viewport's camera): at `position`, looking along
+    ## `forward`, `up` toward the image's top, `tan_half_height` the tangent of
+    ## half the vertical field of view, `width` × `height` pixels. A render in
+    ## progress starts over through it without loading anything again.
+    pub func look(position: Vector3, forward: Vector3, up: Vector3, tan_half_height: f64, width: i64, height: i64) -> !:
+        if width < 1 or height < 1 or width > 16384 or height > 16384: error(invalid, "an image is 1 to 16384 pixels on a side")
+        self.framing = try look_frame(position, forward, up, tan_half_height, (u32)width, (u32)height)
+        self.viewing = true
+        self.settings.width = (u32)width
+        self.settings.height = (u32)height
+        if let running = self.renderer:
+            var renderer = running
+            try renderer.restart(self.framing)
+            self.renderer = renderer
+        self.started = clock.now()
+        self.took = 0.0
+
+    ## Take up to `samples` a pixel: a render that has finished goes on, one
+    ## past it stops.
+    pub func set_samples(samples: i64) -> !:
+        if samples < 1: error(invalid, "a render needs samples")
+        self.settings.samples = (u32)samples
+        if let running = self.renderer:
+            var renderer = running
+            try renderer.set_samples((u32)samples)
+            self.renderer = renderer
+        if self.took > 0.0 and self.samples_done() < samples:
+            self.took = 0.0
+
+    ## Paths a pass traces from the next start (0: the renderer's choice):
+    ## fewer keeps each pass short where a path costs much (splats).
+    pub func set_pool(paths: i64):
+        self.pool = (u32)math.max(0.0, (f64)paths)
+
+    ## Radiance from wherever no surface is, from the next start (linear ACEScg).
+    pub func set_background(red: f64, green: f64, blue: f64):
+        self.background = Vector3(red, green, blue)
+
+    func prepare(samples: i64, bounces: i64, spectral: bool) -> !:
         if samples < 1 or bounces < 1 or bounces > 1024: error(invalid, "a render needs samples and 1 to 1024 bounces")
-        var scene = try compile_scene(try set.get())
-        errdefer scene.close()
-        var index: i64 = -1
-        for at in 0..<scene.objects.count():
-            if scene.objects.object(at).kind != SceneKind.camera: continue
-            if camera == "" or scene.objects.path(at) == camera:
-                index = (i64)at
-                break
-        if index < 0: error(invalid, "the scene has no camera" if camera == "" else "no camera at that path")
-        var settings = RenderSettings.of((u32)width, (u32)height, (u32)samples)
+        self.problem_text.clear()
+        var settings = RenderSettings.of(1, 1, (u32)samples)
         settings.max_bounces = (u32)bounces
         settings.spectral = spectral
-        settings.camera = index
         settings.material = self.material
         settings.diffuse_bounces = self.diffuse
         settings.glossy_bounces = self.glossy
@@ -85,81 +205,159 @@ pub struct RenderSession:
         settings.noise_threshold = self.noise_threshold
         settings.guiding = self.guiding
         settings.light_tracing = self.light_tracing
+        settings.pool = self.pool
+        settings.background = self.background
         self.settings = settings
-        self.waiting = scene
+
+    ## Compile `set` on a thread, or queue it behind the compile in progress.
+    func begin(set: interop.Reference[GeometrySet]) -> !:
         self.started = clock.now()
         self.took = 0.0
+        if let held = self.waiting:
+            var scene = held
+            scene.close()
+            self.waiting = none
+        if let older = self.waiting_set: older.release()
+        self.waiting_set = none
+        if self.compiling != none:
+            if let older = self.queued: older.release()
+            self.queued = set.clone()
+            return
+        try self.spawn(set)
 
-    ## The default material of the next `start` (faces with none assigned):
-    ## OpenPBR parameters by name, one per line, four numbers each, as a
-    ## Material node writes them.
-    pub func set_material(names: str, values: const f64[]) -> !:
-        var library = Materials()
-        defer library.close()
-        try library.add("default", "openpbr", names, values, none)
-        self.material = openpbr_of(&library, 0)
+    func spawn(set: interop.Reference[GeometrySet]) -> !:
+        # The renderer's geometry again (and the same pool and BVH choice):
+        # compile only what a reload needs.
+        var reloads = false
+        if let running = self.renderer:
+            if let held = self.geometry_set:
+                let made = running.render_settings()
+                reloads = made.pool == self.settings.pool and made.software_bvh == self.settings.software_bvh and (try same_geometry(try set.get(), try held.get()))
+        let job = try new Compiling(set = set.clone(), geometry = not reloads, scene = CompiledScene(), failed = false, message = Growing[u8]()) in memory.heap
+        job.finished.store(0, .relaxed)
+        job.thread = thread.spawn(compile_entry, (void*)job, name = "render compile") catch failure:
+            job.set.release()
+            job.message.close()
+            free(job) in memory.heap
+            error(failure.code, failure.message)
+        self.compiling = job
+        self.compiles += 1
 
-    ## Bounce limits by kind, the indirect clamp (0 off), adaptive sampling's
-    ## noise threshold (0 off), path guiding and light paths a pixel (0 off) of
-    ## the next `start`.
-    pub func set_limits(diffuse: i64, glossy: i64, transmission: i64, clamp_indirect: f64, noise_threshold: f64, guiding: bool, light_tracing: f64):
-        self.diffuse = (u32)math.max(0.0, (f64)diffuse)
-        self.glossy = (u32)math.max(0.0, (f64)glossy)
-        self.transmission = (u32)math.max(0.0, (f64)transmission)
-        self.clamp_indirect = math.max(0.0, clamp_indirect)
-        self.noise_threshold = math.max(0.0, noise_threshold)
-        self.guiding = guiding
-        self.light_tracing = math.max(0.0, light_tracing)
+    ## A finished compile becomes the waiting scene; a queued set starts next.
+    func collect() -> !:
+        let job = self.compiling else return
+        if job.finished.load(.acquire) == 0: return
+        job.thread.join() catch _: _ = 0
+        self.compiling = none
+        if self.queued != none:
+            # Superseded: the newer set compiles instead.
+            job.scene.close()
+            job.set.release()
+            job.message.close()
+            free(job) in memory.heap
+            let next = self.queued else return
+            self.queued = none
+            defer next.release()
+            try self.spawn(next)
+            return
+        if job.failed:
+            try self.note((str)job.message.view())
+            job.scene.close()
+            job.set.release()
+        else:
+            self.waiting = job.scene
+            self.waiting_reloads = not job.geometry
+            self.waiting_set = job.set
+        job.message.close()
+        free(job) in memory.heap
+
+    ## Make the renderer of the waiting scene (or reload it), on `native`'s device.
+    func take_waiting(native: const gpu.RenderTarget*) -> bool!:
+        let scene = self.waiting else return true
+        var held = scene
+        self.waiting = none
+        defer held.close()
+        let set = self.waiting_set else return true
+        self.waiting_set = none
+        defer set.release()
+        if not self.device.is_open():
+            self.device = gpu.device_of(native) catch failure:
+                if failure.code == gpu.unavailable: return false
+                error(failure.code, failure.message)
+        var frame = self.framing
+        if not self.viewing:
+            let camera = find_camera_path(&held, (str)self.camera_path.view()) catch failure:
+                try self.note(failure.message)
+                return false
+            frame = try ray_frame(held.objects.object(camera), self.settings.width, self.settings.height)
+        if self.waiting_reloads:
+            if let running = self.renderer:
+                var renderer = running
+                renderer.reload(&held, self.settings) catch failure:
+                    try self.note(failure.message)
+                    self.stop()
+                    return false
+                renderer.restart(frame) catch failure:
+                    try self.note(failure.message)
+                    self.stop()
+                    return false
+                self.renderer = renderer
+                self.reloads += 1
+                return true
+        self.destroy_renderer()
+        var made = Renderer.create_viewed(self.device, &held, self.settings, frame) catch failure:
+            try self.note(failure.message)
+            return false
+        made.set_display(self.exposure_stops, self.view) catch failure:
+            made.destroy()
+            error(failure.code, failure.message)
+        self.renderer = made
+        self.geometry_set = set.clone()
+        self.uploads += 1
+        return true
 
     ## Advance the render a pass and draw it fitted into (x, y, width, height) of
     ## `target`; whether passes are still coming.
     pub func draw(target: interop.View[gpu.RenderTarget], x: f64, y: f64, width: f64, height: f64) -> bool!:
         let native = try target.get()
-        if let scene = self.waiting:
-            var held = scene
-            self.waiting = none
-            defer held.close()
-            if not self.device.is_open():
-                self.device = gpu.device_of(native) catch failure:
-                    if failure.code == gpu.unavailable: return false
-                    error(failure.code, failure.message)
-            var made = Renderer.create(self.device, &held, self.settings) catch failure:
-                try self.note(failure.message)
-                return false
-            made.set_display(self.exposure_stops, self.view) catch failure:
-                made.destroy()
-                error(failure.code, failure.message)
-            self.renderer = made
-            self.started = clock.now()
-        let running = self.renderer else return false
+        try self.collect()
+        if not (try self.take_waiting(native)): return false
+        let running = self.renderer else return self.compiling != none
         var renderer = running
         let busy = renderer.advance() catch failure:
             try self.note(failure.message)
             self.stop()
             return false
         self.renderer = renderer
-        if not busy and self.took == 0.0: self.took = self.started.elapsed().seconds()
-        let image_width = (f64)self.settings.width
-        let image_height = (f64)self.settings.height
+        if not busy and self.took == 0.0 and self.compiling == none: self.took = self.started.elapsed().seconds()
+        let shown = renderer.shown_size()
+        if shown[0] == 0 or shown[1] == 0: return busy or self.compiling != none
+        let image_width = (f64)shown[0]
+        let image_height = (f64)shown[1]
         let scale = math.min(width / image_width, height / image_height)
         let shown_width = image_width * scale
         let shown_height = image_height * scale
         let area = gpu.Rect(x + 0.5 * (width - shown_width), y + 0.5 * (height - shown_height), shown_width, shown_height)
-        try gpu.draw_image(native, renderer.display(), area, none, 1.0, gpu.Filter.linear)
-        return busy
+        try gpu.draw_image(native, renderer.display(), area, gpu.Region(0, 0, shown[0], shown[1]), 1.0, gpu.Filter.linear)
+        return busy or self.compiling != none
 
     func note(message: str) -> !:
         self.problem_text.clear()
         try append_text(&self.problem_text, message)
 
-    ## Whether a render is in progress or waiting for its first draw.
+    ## Whether a render is in progress, compiling or waiting for its first draw.
     pub func running() -> bool:
-        if self.waiting != none: return true
+        if self.compiling != none or self.waiting != none: return true
         let renderer = self.renderer else return false
         return renderer.samples_done() < self.settings.samples
 
+    ## Whether a scene is compiling (the image shown, if any, is the last scene's).
+    pub func compiling_scene() -> bool:
+        return self.compiling != none or self.waiting != none
+
     pub func has_image() -> bool:
-        return self.renderer != none
+        let renderer = self.renderer else return false
+        return renderer.shown_size()[0] > 0
 
     pub func samples_done() -> i64:
         let renderer = self.renderer else return 0
@@ -176,6 +374,17 @@ pub struct RenderSession:
 
     pub func spectral() -> bool:
         return self.settings.spectral
+
+    ## Compiles started, renderers made (geometry uploaded) and reloads
+    ## (geometry kept) over the session.
+    pub func compile_count() -> i64:
+        return self.compiles
+
+    pub func upload_count() -> i64:
+        return self.uploads
+
+    pub func reload_count() -> i64:
+        return self.reloads
 
     ## Seconds since the render started, or what it took once finished.
     pub func seconds() -> f64:
@@ -198,20 +407,44 @@ pub struct RenderSession:
             try renderer.set_display(exposure, view)
             self.renderer = renderer
 
-    ## End the render; its image goes too.
+    ## End the render; its image goes too. A compile in progress is waited for.
     pub func stop():
+        if let job = self.compiling:
+            job.thread.join() catch _: _ = 0
+            job.scene.close()
+            job.set.release()
+            job.message.close()
+            free(job) in memory.heap
+            self.compiling = none
+        if let next = self.queued: next.release()
+        self.queued = none
         if let scene = self.waiting:
             var held = scene
             held.close()
             self.waiting = none
+        if let set = self.waiting_set: set.release()
+        self.waiting_set = none
+        self.destroy_renderer()
+
+    func destroy_renderer():
         if let running = self.renderer:
             var renderer = running
             renderer.destroy()
             self.renderer = none
+        if let set = self.geometry_set: set.release()
+        self.geometry_set = none
 
     pub func close():
         self.stop()
         if self.device.is_open(): self.device.destroy()
         self.problem_text.close()
+        self.camera_path.close()
 
 pub let render_session_type: interop.Type[RenderSession] = interop.Type[RenderSession]("RenderSession", RenderSession.close)
+
+## The camera at `path` ("" the first camera).
+func find_camera_path(scene: const CompiledScene*, path: str) -> usize!:
+    for at in 0..<scene.objects.count():
+        if scene.objects.object(at).kind != SceneKind.camera: continue
+        if path == "" or scene.objects.path(at) == path: return at
+    error(invalid, "the scene has no camera" if path == "" else "no camera at that path")

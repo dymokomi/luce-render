@@ -205,38 +205,53 @@ func shadow_kernel(device: gpu.Device, rays: bool, constants: const gpu.Constant
 pub struct Renderer:
     var device: gpu.Device
     var settings: RenderSettings
-    var kernels: Kernels
+    ## The geometry (uploaded once per geometry), and what is loaded beside it
+    ## (replaced by `reload`): loading.lucb.
     var scene: GpuScene
-    var lights: gpu.Buffer
-    var constants: gpu.Buffer
-    var materials: gpu.Buffer
+    var loaded: Loaded
+    ## The geometry's triangles in BVH leaf order (CompiledScene.order), for
+    ## reloads compiled without a BVH.
+    var order: Growing[u32]
+    ## The albedo tables and the path-guiding grid (guide.glsl), reached by
+    ## their addresses; neither depends on the scene.
     var tables: gpu.Buffer
-    var emitters: gpu.Buffer
-    ## The path-guiding grid (guide.glsl), reached by its address.
     var guide: gpu.Buffer
     var guide_address: u64
+    ## The view: path state for `slots` paths (a band's camera paths, then
+    ## light paths), queues, the film and the images, made for at most
+    ## `capacity` pixels and images of `image_width` × `image_height`.
     var state_v: gpu.Buffer
     var state_u: gpu.Buffer
     var queues: gpu.Buffer
     var film: gpu.Buffer
     var output: gpu.Texture
     var shown: gpu.Texture
+    var capacity: usize
+    var image_width: u32
+    var image_height: u32
     ## Display settings changed since the display image was last made.
     var display_stale: bool
+    ## The view rendered now, and the paths a pass traces (a band of pixels).
     var frame: RayFrame
     var pool: usize
-    var light_count: usize
-    ## Rounds of each pass beyond the bounces, for rays passing through cut-outs.
-    var through: usize
-    ## The passes in flight (older first) and the samples each completes; what
-    ## comes next: sample `sample`, band `band`.
+    var slots: usize
+    ## The film must be cleared before the next pass (a restart).
+    var clear_film: bool
+    ## The passes in flight (older first), the samples each completes and the
+    ## size of the image each leaves; what comes next: sample `sample`, band
+    ## `band`. `completed` samples are in the image of `shown_width` ×
+    ## `shown_height` pixels.
     var older: gpu.Compute?
     var newer: gpu.Compute?
     var older_completes: u32
     var newer_completes: u32
+    var older_size: u32[2]
+    var newer_size: u32[2]
     var sample: u32
     var band: usize
     var completed: u32
+    var shown_width: u32
+    var shown_height: u32
     ## Profiling: the kind of each timestamp of the pass in flight (kind_*), and
     ## the nanoseconds each kind has taken in finished passes.
     var marks: Growing[u8]
@@ -245,184 +260,192 @@ pub struct Renderer:
     ## light paths have been recorded.
     var light_count_per_sample: usize
     var light_samples: u32
-    ## Light paths in the pass being recorded (common.glsl params.light_count),
-    ## and the pool's slots: a band's camera paths, then the light paths.
+    ## Light paths in the pass being recorded (common.glsl params.light_count).
     var lights_in_pass: u32
-    var slots: usize
-    ## The materials' textures, and the triangles' texture coordinates.
-    var textures: MaterialTextures
-    var uvs: gpu.Buffer
-    ## The materials' node-graph programs (shader_graph.lucb).
-    var programs: gpu.Buffer
 
     ## A renderer of `scene` through its camera (see RenderSettings.camera). The
     ## scene's buffers are uploaded; `scene` may be closed afterwards.
     pub static func create(device: gpu.Device, scene: const CompiledScene*, settings: RenderSettings) -> Renderer!:
         if settings.width == 0 or settings.height == 0 or settings.width > 16384 or settings.height > 16384: error(invalid, "an image is 1 to 16384 pixels on a side")
-        if settings.samples == 0 or settings.max_bounces == 0 or settings.max_bounces > 1024: error(invalid, "a render needs samples and 1 to 1024 bounces")
         let camera = try find_camera(scene, settings.camera)
         let frame = try ray_frame(scene.objects.object(camera), settings.width, settings.height)
-        let pixels = (usize)settings.width * (usize)settings.height
-        let pool = (usize)settings.pool if settings.pool > 0 else (splat_pool if scene.splats.count() > 0 else default_pool)
-        let band = pool if pool < pixels else pixels
+        return try Renderer.create_viewed(device, scene, settings, frame)
+
+    ## A renderer of `scene` through `frame`, a view of the caller's (a
+    ## viewport's camera, `look_frame`), in place of a scene camera; its size is
+    ## the image's. `restart` moves it.
+    pub static func create_viewed(device: gpu.Device, scene: const CompiledScene*, settings: RenderSettings, frame: RayFrame) -> Renderer!:
+        if frame.width == 0 or frame.height == 0 or frame.width > 16384 or frame.height > 16384: error(invalid, "an image is 1 to 16384 pixels on a side")
+        if settings.samples == 0 or settings.max_bounces == 0 or settings.max_bounces > 1024: error(invalid, "a render needs samples and 1 to 1024 bounces")
+        var chosen = settings
+        chosen.width = frame.width
+        chosen.height = frame.height
         var uploaded = try GpuScene.upload(device, scene, not settings.software_bvh)
         errdefer uploaded.destroy()
-        var packed = Growing[f32]()
-        defer packed.close()
-        # The first dome with an image lights by it (environment.lucb).
-        var environment = Environment()
-        defer environment.close()
-        var environment_view: const Environment*? = none
-        for index in 0..<scene.objects.count():
-            let item = scene.objects.object(index)
-            if item.kind != SceneKind.light or item.light.shape != LightShape.dome or scene.objects.texture(index).length == 0: continue
-            environment = try load_environment(scene.objects.texture(index))
-            environment_view = &environment
-            break
-        let (light_count, distant_power, dome) = try pack_lights(&scene.objects, scene_radius(scene), &packed, environment_view)
-        # Materials: the default first (material 0), then the scene's library.
-        var library = Growing[OpenPbr]()
-        defer library.close()
-        try library.push(settings.material)
-        for index in 0..<scene.materials.count(): try library.push(openpbr_of(&scene.materials, index))
-        # The light tree's nodes follow the light records; its links, emitter
-        # records and triangle map make the emitter buffer.
-        var tree = try build_light_tree(scene, packed.view(), light_count, library.view())
-        defer tree.close()
-        let node_offset = packed.count // 4
-        for value in tree.nodes.view(): try packed.push(value)
-        # The dome's texels (a vec4 each), then its cumulative weights.
-        var dome_row: f64[8] = [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        if dome >= 0:
-            while packed.count % 4 != 0: try packed.push(0.0)
-            let texel_base = packed.count // 4
-            for value in environment.texels.view(): try packed.push(value)
-            let cdf_base = packed.count
-            for value in environment.cdf.view(): try packed.push(value)
-            while packed.count % 4 != 0: try packed.push(0.0)
-            dome_row = [(f64)dome, (f64)texel_base, (f64)environment.width, (f64)environment.height, (f64)cdf_base, environment.total, 0.0, 0.0]
-        var lights = try buffer_of(device, u8[]((u8*)packed.items.data, packed.count * 4))
-        errdefer lights.destroy()
-        var links = Growing[u32]()
-        defer links.close()
-        try links.assign(tree.links.view())
-        for value in tree.records.view(): try links.push(value)
-        var emitters = try buffer_of(device, u8[]((u8*)links.items.data, links.count * 4))
-        errdefer emitters.destroy()
-        let total = distant_power + tree.energy
-        let p_distant = (distant_power / total if total > 0.0 else 0.0) if tree.emitter_count > 0 else (1.0 if distant_power > 0.0 else 0.0)
-        var rows: f32[128]
-        # A pixel's width at unit distance (perspective; orthographic cells
-        # grow with distance just the same, which is harmless).
-        try fill_constants(rows, settings, light_count, scene_radius(scene), frame.du.length())
-        let tree_row: f64[4] = [(f64)tree.node_count(), (f64)node_offset, p_distant, (f64)tree.emitter_count]
-        let offsets_row: f64[4] = [(f64)tree.links.count, (f64)(tree.links.count + tree.emitter_count * 4), 0.0, 0.0]
-        for k in 0..<(usize)4:
-            rows[32 + k] = (f32)tree_row[k]
-            rows[40 + k] = (f32)offsets_row[k]
-        # The materials' textures (slots a material, the default's first),
-        # and the buffers kernels reach by address: the albedo tables and the
-        # triangles' texture coordinates.
-        var textures = try load_textures(device, &scene.materials)
-        errdefer textures.destroy()
         var tables = try make_tables(device)
         errdefer tables.destroy()
-        var corner_uvs = Growing[f32]()
-        defer corner_uvs.close()
-        try corner_uvs.assign(scene.uvs.view())
-        while corner_uvs.count < 6: try corner_uvs.push(0.0)
-        var uvs = try buffer_of(device, u8[]((u8*)corner_uvs.items.data, corner_uvs.count * 4))
-        errdefer uvs.destroy()
-        var programs = try buffer_of(device, u8[]((u8*)textures.programs.items.data, textures.programs.count * 4))
-        errdefer programs.destroy()
-        memory.write[u64]((void*)&rows[92], try tables.address())
-        memory.write[u64]((void*)&rows[94], try uvs.address())
-        memory.write[u64]((void*)&rows[96], try programs.address())
-        # The splats, reached by address (shaders/splats.glsl: K_SPLATS, K_SPLAT_TREE).
-        let splat_addresses = try uploaded.splat_addresses()
-        memory.write[u64]((void*)&rows[100], splat_addresses[0])
-        memory.write[u64]((void*)&rows[102], splat_addresses[1])
-        memory.write[u64]((void*)&rows[104], splat_addresses[2])
-        rows[106] = (f32)uploaded.splat_count
-        rows[107] = (f32)splat_cull
-        var records = Growing[f32]()
-        defer records.close()
-        var cutouts = false
-        for index in 0..<library.count:
-            let material = library.items[index]
-            try pack_material(material, textures.entries.items[index], &records)
-            cutouts = cutouts or material.geometry_opacity < 1.0
-        rows[3] = 1.0 if cutouts else 0.0
-        # The camera: light paths a sample (at most a band's; they take the
-        # pool's slots after the band's camera paths), the image plane's pixel
-        # area at unit distance, the lens, the camera's axis.
-        # Domes and distant lights with a size start light paths too, on a disk
-        # around what casts caustics (shaders/lights.glsl), sharing them with
-        # the tree's emitters by power.
-        let (focus, focus_radius, casters) = caster_bounds(scene, library.view())
-        var afar = false
-        for index in 0..<light_count:
-            let kind = packed.items[index * light_stride * 4 + 3]
-            if kind == 4.0 or (kind == 3.0 and packed.items[index * light_stride * 4 + 11] < 1.0 - 1e-7): afar = casters
-        let afar_power = distant_power * (focus_radius / scene_radius(scene)) * (focus_radius / scene_radius(scene)) if afar else 0.0
-        let afar_share = afar_power / (afar_power + tree.energy) if afar_power + tree.energy > 0.0 else 0.0
-        let emit_rows: f64[8] = [afar_share, focus_radius, 0.0, 0.0, focus.x, focus.y, focus.z, 0.0]
-        for k in 0..<(usize)8: rows[84 + k] = (f32)emit_rows[k]
-        var light_paths: usize = 0
-        if settings.light_tracing > 0.0 and not frame.orthographic and (tree.emitter_count > 0 or afar):
-            let wanted = (usize)math.max(1.0, math.round(settings.light_tracing * (f64)pixels))
-            light_paths = wanted if wanted < band else band
-        let slots = band + light_paths
-        let pixel_area = frame.du.length() * frame.dv.length()
-        let view_rows: f64[8] = [(f64)light_paths, 1.0 / pixel_area if pixel_area > 0.0 else 0.0, frame.lens_radius, frame.focus_distance,
-                                 frame.forward.x, frame.forward.y, frame.forward.z, 0.0]
-        for k in 0..<(usize)8: rows[56 + k] = (f32)view_rows[k]
-        for k in 0..<(usize)8: rows[64 + k] = (f32)dome_row[k]
-        var constants = try gpu.Buffer.create(device, u8[]((u8*)&rows[0], constants_rows * 16))
-        errdefer constants.destroy()
-        # Kernels specialized to the scene: the features its materials use, its
-        # light count, guiding.
-        var has_programs = false
-        for entry in textures.entries.view(): has_programs = has_programs or entry >= 0.0
-        var features = scene_features(library.view(), light_count, settings, light_paths > 0, has_programs, uploaded.splat_count > 0)
-        var kernels = try Kernels.create(device, settings.spectral, uploaded.accelerated, features)
-        errdefer kernels.destroy()
-        var materials = try buffer_of(device, u8[]((u8*)records.items.data, records.count * 4))
-        errdefer materials.destroy()
         var guide = try gpu.Buffer.allocate(device, guide_bytes)
         errdefer guide.destroy()
         let guide_address = try guide.address()
-        var state_v = try gpu.Buffer.allocate(device, state_v_fields * slots * 16)
-        errdefer state_v.destroy()
-        var state_u = try gpu.Buffer.allocate(device, state_u_fields * slots * 4)
-        errdefer state_u.destroy()
-        var queues = try gpu.Buffer.allocate(device, (queue_base + queue_count * slots) * 4)
-        errdefer queues.destroy()
-        var film = try gpu.Buffer.allocate(device, 4 * pixels * 16)
-        errdefer film.destroy()
-        var output = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
-        errdefer output.destroy()
-        let shown = try gpu.Texture.create(device, settings.width, settings.height, gpu.Format.rgba32_float, storage = true)
-        return Renderer(device, settings, kernels, uploaded, lights, constants, materials, tables, emitters, guide, guide_address, state_v, state_u, queues, film, output, shown, false, frame, band, light_count, 8 if cutouts else 0, none, none, 0, 0, 0, 0, 0, Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], light_paths, 0, 0, slots, textures, uvs, programs)
+        var loaded = try Loaded.create(device, scene, chosen, scene_radius(scene), &uploaded, &tables, &frame)
+        errdefer loaded.destroy()
+        var order = Growing[u32]()
+        order.assign(scene.order.view()) catch failure:
+            order.close()
+            loaded.destroy()
+            error(failure.code, failure.message)
+        var renderer = Renderer(device, chosen, uploaded, loaded, order, tables, guide, guide_address, gpu.Buffer(), gpu.Buffer(), gpu.Buffer(), gpu.Buffer(), gpu.Texture(), gpu.Texture(),
+                                0, 0, 0, false, frame, 0, 0, false, none, none, 0, 0, [0, 0], [0, 0], 0, 0, 0, 0, 0,
+                                Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0, 0, 0)
+        try renderer.allocate_view(frame.width, frame.height) catch failure:
+            renderer.destroy()
+            error(failure.code, failure.message)
+        renderer.show_view() catch failure:
+            renderer.destroy()
+            error(failure.code, failure.message)
+        return renderer
+
+    ## The buffers that follow the view's size, for `width` × `height` pixels:
+    ## path state for a band (the pool, or every pixel when fewer) and its
+    ## light paths, the queues, the film and the images. Any before go.
+    func allocate_view(width: u32, height: u32) -> !:
+        self.release_view()
+        let pixels = (usize)width * (usize)height
+        let pool = (usize)self.settings.pool if self.settings.pool > 0 else (splat_pool if self.scene.splat_count > 0 else default_pool)
+        let band = pool if pool < pixels else pixels
+        let slots = band + self.loaded.light_paths(self.settings, pixels, band)
+        self.state_v = try gpu.Buffer.allocate(self.device, state_v_fields * slots * 16)
+        self.state_u = try gpu.Buffer.allocate(self.device, state_u_fields * slots * 4)
+        self.queues = try gpu.Buffer.allocate(self.device, (queue_base + queue_count * slots) * 4)
+        self.film = try gpu.Buffer.allocate(self.device, 4 * pixels * 16)
+        self.output = try gpu.Texture.create(self.device, width, height, gpu.Format.rgba32_float, storage = true)
+        self.shown = try gpu.Texture.create(self.device, width, height, gpu.Format.rgba32_float, storage = true)
+        self.capacity = pixels
+        self.image_width = width
+        self.image_height = height
+        self.pool = band
+        self.slots = slots
+        self.shown_width = 0
+        self.shown_height = 0
+        self.clear_film = true
+
+    func release_view():
+        self.state_v.destroy()
+        self.state_u.destroy()
+        self.queues.destroy()
+        self.film.destroy()
+        self.output.destroy()
+        self.shown.destroy()
+
+    ## The light paths a sample of the current view, and the constants' view rows.
+    func show_view() -> !:
+        let pixels = self.pixels()
+        let band = self.pool if self.pool < pixels else pixels
+        self.light_count_per_sample = self.loaded.light_paths(self.settings, pixels, band)
+        try self.loaded.show_view(self.settings, &self.frame, self.light_count_per_sample)
+
+    ## Start over through `frame` (a moved camera, a resized view): the film is
+    ## cleared before the next pass, and passes still in flight count for
+    ## nothing, though the image they leave shows until the next pass's. The
+    ## scene stays on the device; the view's buffers are made again only when
+    ## the view outgrows them. `frame` keeps the projection (perspective or
+    ## orthographic) the renderer was made with.
+    pub func restart(frame: RayFrame) -> !:
+        if frame.width == 0 or frame.height == 0 or frame.width > 16384 or frame.height > 16384: error(invalid, "an image is 1 to 16384 pixels on a side")
+        if frame.orthographic != self.frame.orthographic: error(invalid, "a restart keeps the view's projection")
+        if (usize)frame.width * (usize)frame.height > self.capacity or frame.width > self.image_width or frame.height > self.image_height:
+            try self.settle()
+            try self.allocate_view(frame.width, frame.height)
+        self.frame = frame
+        self.settings.width = frame.width
+        self.settings.height = frame.height
+        try self.show_view()
+        self.forget_passes()
+
+    ## Load `scene`'s lights, materials and constants again, keeping the
+    ## geometry on the device: `scene` must have the same triangles and splats
+    ## as the scene the renderer was made from (a light or a material changed;
+    ## `compile_scene` with `geometry` false makes such a scene without
+    ## repeating the splats and BVHs, and its triangles are put in the BVH's
+    ## order here). `settings` replace the renderer's but for the size and the
+    ## pool; the film starts over.
+    pub func reload(scene: CompiledScene*, settings: RenderSettings) -> !:
+        if scene.nodes.count == 0 and scene.triangle_count() > 0:
+            if scene.triangle_count() != self.order.count: error(invalid, "a reload keeps the scene's geometry")
+            try reorder(scene, self.order.view())
+        if settings.samples == 0 or settings.max_bounces == 0 or settings.max_bounces > 1024: error(invalid, "a render needs samples and 1 to 1024 bounces")
+        var chosen = settings
+        chosen.width = self.settings.width
+        chosen.height = self.settings.height
+        chosen.pool = self.settings.pool
+        chosen.software_bvh = self.settings.software_bvh
+        # The radius is the geometry's, which `scene` may have no BVH to tell.
+        var loaded = try Loaded.create(self.device, scene, chosen, self.loaded.radius, &self.scene, &self.tables, &self.frame)
+        errdefer loaded.destroy()
+        try self.scene.replace_shading(self.device, scene)
+        # Light paths need slots: a view made without them grows its state.
+        let pixels = self.pixels()
+        let band = self.pool if self.pool < pixels else pixels
+        let grow = band + loaded.light_paths(chosen, pixels, band) > self.slots
+        self.loaded.destroy()
+        self.loaded = loaded
+        self.settings = chosen
+        if grow:
+            try self.settle()
+            try self.allocate_view(self.image_width, self.image_height)
+        try self.show_view()
+        self.forget_passes()
+
+    ## Passes in flight finish uncounted; the next pass clears the film and
+    ## starts sample 0.
+    func forget_passes():
+        self.older_completes = 0
+        self.newer_completes = 0
+        self.sample = 0
+        self.band = 0
+        self.completed = 0
+        self.light_samples = 0
+        self.clear_film = true
+        self.display_stale = false
+
+    ## Wait for the passes in flight (before their buffers are replaced).
+    func settle() -> !:
+        while self.older != none:
+            if let running = self.older:
+                var waiting = running
+                try waiting.wait()
+            try self.retire()
+
+    ## Take samples up to `samples` a pixel: more continues a render that has
+    ## finished, fewer stops it sooner.
+    pub func set_samples(samples: u32) -> !:
+        if samples == 0: error(invalid, "a render needs samples")
+        self.settings.samples = samples
+
+    ## Retire the older pass if it has finished: its samples and image size count.
+    func retire() -> !:
+        let running = self.older else return
+        if not (try running.done()): return
+        var finished = running
+        try finished.wait()
+        if self.settings.profile and self.marks.count > 1:
+            var stamps: u64[64]
+            try finished.timestamps(stamps[..<self.marks.count])
+            for at in 1..<self.marks.count:
+                self.kernel_ns[(usize)self.marks.items[at]] += (f64)(stamps[at] - stamps[at - 1])
+        finished.close()
+        self.completed = self.older_completes
+        self.shown_width = self.older_size[0]
+        self.shown_height = self.older_size[1]
+        self.older = self.newer
+        self.older_completes = self.newer_completes
+        self.older_size = self.newer_size
+        self.newer = none
 
     ## Start the next pass if the last has finished. True while there is work,
     ## running or to come; false once every sample is in the image.
     pub func advance() -> bool!:
-        # Retire the older pass when it has finished.
-        if let running = self.older:
-            if try running.done():
-                var finished = running
-                try finished.wait()
-                if self.settings.profile and self.marks.count > 1:
-                    var stamps: u64[64]
-                    try finished.timestamps(stamps[..<self.marks.count])
-                    for at in 1..<self.marks.count:
-                        self.kernel_ns[(usize)self.marks.items[at]] += (f64)(stamps[at] - stamps[at - 1])
-                finished.close()
-                self.completed = self.older_completes
-                self.older = self.newer
-                self.older_completes = self.newer_completes
-                self.newer = none
+        try self.retire()
         # Keep two passes in flight (one when profiling, whose timestamps belong
         # to one pass), so the GPU never waits for the CPU to notice a finish.
         let in_flight = (0 if self.older == none else 1) + (0 if self.newer == none else 1)
@@ -438,7 +461,7 @@ pub struct Renderer:
             var frame: f32[16]
             try self.frame.pack(frame)
             memory.copy(block[0..<64], u8[]((u8*)&frame[0], 64), 64)
-            try self.dispatch(&convert, &self.kernels.film_convert, block, 0, 0, 0, self.light_samples, (self.settings.width + 7) // 8, (self.settings.height + 7) // 8)
+            try self.dispatch(&convert, &self.loaded.kernels.film_convert, block, 0, 0, 0, self.light_samples, (self.frame.width + 7) // 8, (self.frame.height + 7) // 8)
             try convert.submit()
             self.queue_pass(convert, self.sample)
             return true
@@ -447,6 +470,9 @@ pub struct Renderer:
         errdefer pass.close()
         self.marks.clear()
         if self.settings.profile: try self.mark(&pass, kind_rest)
+        if self.clear_film:
+            try pass.fill(self.film, 0, 4 * self.capacity * 16, 0)
+            self.clear_film = false
         try self.record(&pass)
         if self.settings.profile: try self.mark(&pass, kind_rest)
         try pass.submit()
@@ -455,17 +481,20 @@ pub struct Renderer:
         if self.band == bands:
             self.band = 0
             self.sample += 1
-        self.queue_pass(pass, self.sample if self.band == 0 else self.sample)
+        self.queue_pass(pass, self.sample)
         return true
 
     ## Hold a submitted pass: the samples every pixel has once it finishes.
     func queue_pass(pass: gpu.Compute, completes: u32):
+        let size: u32[2] = [self.frame.width, self.frame.height]
         if self.older == none:
             self.older = pass
             self.older_completes = completes
+            self.older_size = size
         else:
             self.newer = pass
             self.newer_completes = completes
+            self.newer_size = size
 
     ## Run every remaining pass to the end (offline renders and tests).
     pub func finish() -> !:
@@ -479,7 +508,8 @@ pub struct Renderer:
     pub func samples_done() -> u32:
         return self.completed
 
-    ## The render as linear ACEScg, rgba32f: what is saved.
+    ## The render as linear ACEScg, rgba32f: what is saved. A restarted view
+    ## smaller than the images fills their top-left corner (`shown_size`).
     pub func image() -> gpu.Texture:
         return self.output
 
@@ -487,11 +517,16 @@ pub struct Renderer:
     pub func display() -> gpu.Texture:
         return self.shown
 
+    ## The size of the image the last finished pass left in `display`, from
+    ## its top-left corner ((0, 0) before the first).
+    pub func shown_size() -> u32[2]:
+        return [self.shown_width, self.shown_height]
+
     ## Show the image at `exposure` stops through `view` (0 standard, 1 neutral
     ## tone mapping); the next pass, or a conversion of its own, applies it.
     pub func set_display(exposure: f64, view: i64) -> !:
         var row: f32[4] = [(f32)exposure, (f32)view, 0.0, 0.0]
-        try self.constants.upload(9 * 16, u8[]((u8*)&row[0], 16))
+        try self.loaded.constants.upload(9 * 16, u8[]((u8*)&row[0], 16))
         self.display_stale = true
 
     ## How many pixels adaptive sampling has stopped (waits for work in flight).
@@ -512,14 +547,16 @@ pub struct Renderer:
     pub func render_settings() -> RenderSettings:
         return self.settings
 
-    ## The image as rgba32f, row by row from the top (waits for work in flight).
+    ## The image as rgba32f, row by row from the top (waits for work in flight);
+    ## the view must fill the images (never restarted smaller).
     pub func read(out: f32[]) -> !:
+        if self.frame.width != self.image_width or self.frame.height != self.image_height: error(invalid, "reading the image needs a view the size of the image")
         let pixels = self.pixels()
         if out.length != pixels * 4: error(invalid, "reading the image needs four floats a pixel")
         try self.output.read(u8[]((u8*)out.data, out.length * 4))
 
     func pixels() -> usize:
-        return (usize)self.settings.width * (usize)self.settings.height
+        return (usize)self.frame.width * (usize)self.frame.height
 
     ## One pass: the band's sample from camera to film, and the image updated.
     func record(pass: gpu.Compute*) -> !:
@@ -536,32 +573,32 @@ pub struct Renderer:
         # Every queue counter and the workgroups' done count start at zero; the
         # camera queues only pixels still sampling.
         try pass.fill(self.queues, 0, 64, 0)
-        try self.dispatch(pass, &self.kernels.camera, block, start, count, 0, 0, groups, 1)
+        try self.dispatch(pass, &self.loaded.kernels.camera, block, start, count, 0, 0, groups, 1)
         if self.lights_in_pass > 0:
-            try self.dispatch(pass, &self.kernels.light_emit, block, start, count, 0, 0, (self.lights_in_pass + 63) // 64, 1)
+            try self.dispatch(pass, &self.loaded.kernels.light_emit, block, start, count, 0, 0, (self.lights_in_pass + 63) // 64, 1)
             self.light_samples += 1
         # One more round than bounces: the last BSDF rays still find lights;
         # with cut-outs, rounds for rays passing through them at the same bounce.
-        for bounce in 0..<(usize)self.settings.max_bounces + 1 + self.through:
+        for bounce in 0..<(usize)self.settings.max_bounces + 1 + self.loaded.through:
             let current = (u32)(bounce % 2)
             # Each kernel's last workgroup sizes the next (common.glsl: last_group).
-            try self.indirect(pass, &self.kernels.intersect_closest, block, start, count, current, (usize)current)
-            try self.indirect(pass, &self.kernels.shade_surface, block, start, count, current, 2)
-            try self.indirect(pass, &self.kernels.shade_miss, block, start, count, current, 3)
-            try self.indirect(pass, &self.kernels.intersect_shadow, block, start, count, current, 4)
-        try self.dispatch(pass, &self.kernels.finish, block, start, count, 0, 0, groups, 1)
+            try self.indirect(pass, &self.loaded.kernels.intersect_closest, block, start, count, current, (usize)current)
+            try self.indirect(pass, &self.loaded.kernels.shade_surface, block, start, count, current, 2)
+            try self.indirect(pass, &self.loaded.kernels.shade_miss, block, start, count, current, 3)
+            try self.indirect(pass, &self.loaded.kernels.intersect_shadow, block, start, count, current, 4)
+        try self.dispatch(pass, &self.loaded.kernels.finish, block, start, count, 0, 0, groups, 1)
         if self.settings.guiding:
-            try self.dispatch(pass, &self.kernels.guide_fit, block, start, count, 0, 0, (u32)(guide_cells // 64), 1)
+            try self.dispatch(pass, &self.loaded.kernels.guide_fit, block, start, count, 0, 0, (u32)(guide_cells // 64), 1)
         # After the last band of every 4th sample past the minimum, check which
         # pixels have converged.
         let bands = (self.pixels() + self.pool - 1) // self.pool
         let taken = self.sample + 1
         if self.settings.noise_threshold > 0.0 and self.band + 1 == bands and taken >= self.settings.adaptive_minimum and taken % 4 == 0:
-            let x = (self.settings.width + 7) // 8
-            let y = (self.settings.height + 7) // 8
-            try self.dispatch(pass, &self.kernels.adaptive, block, start, count, 0, 0, x, y)
-            try self.dispatch(pass, &self.kernels.adaptive, block, start, count, 0, 1, x, y)
-        try self.dispatch(pass, &self.kernels.film_convert, block, start, count, 0, self.light_samples, (self.settings.width + 7) // 8, (self.settings.height + 7) // 8)
+            let x = (self.frame.width + 7) // 8
+            let y = (self.frame.height + 7) // 8
+            try self.dispatch(pass, &self.loaded.kernels.adaptive, block, start, count, 0, 0, x, y)
+            try self.dispatch(pass, &self.loaded.kernels.adaptive, block, start, count, 0, 1, x, y)
+        try self.dispatch(pass, &self.loaded.kernels.film_convert, block, start, count, 0, self.light_samples, (self.frame.width + 7) // 8, (self.frame.height + 7) // 8)
 
     ## The push constants after the camera frame: band, sample and step.
     func uniforms(block: u8[], start: usize, count: usize, current: u32, phase: u32):
@@ -571,11 +608,11 @@ pub struct Renderer:
 
     func bindings(kernel: const Kernel*) -> gpu.Binding[16]:
         var all: gpu.Binding[16] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
-                                    gpu.Binding(buffer = self.lights), gpu.Binding(buffer = self.state_v), gpu.Binding(buffer = self.state_u),
+                                    gpu.Binding(buffer = self.loaded.lights), gpu.Binding(buffer = self.state_v), gpu.Binding(buffer = self.state_u),
                                     gpu.Binding(buffer = self.queues), gpu.Binding(buffer = self.film), gpu.Binding(texture = self.output),
-                                    gpu.Binding(buffer = self.constants), gpu.Binding(texture = self.shown),
-                                    gpu.Binding(buffer = self.scene.shading), gpu.Binding(buffer = self.materials),
-                                    gpu.Binding(filter = gpu.Filter.linear), gpu.Binding(), gpu.Binding(buffer = self.emitters)]
+                                    gpu.Binding(buffer = self.loaded.constants), gpu.Binding(texture = self.shown),
+                                    gpu.Binding(buffer = self.scene.shading), gpu.Binding(buffer = self.loaded.materials),
+                                    gpu.Binding(filter = gpu.Filter.linear), gpu.Binding(), gpu.Binding(buffer = self.loaded.emitters)]
         if self.scene.accelerated: all[14] = gpu.Binding(accel = self.scene.tlas)
         for at in 0..<(usize)16:
             if at >= kernel.kinds.length or kernel.kinds[at] == 0: all[at] = gpu.Binding()
@@ -593,14 +630,14 @@ pub struct Renderer:
         try self.marks.push(kind)
 
     func kind_of(kernel: const Kernel*) -> u8:
-        if kernel == &self.kernels.camera: return kind_camera
-        if kernel == &self.kernels.intersect_closest: return kind_closest
-        if kernel == &self.kernels.shade_surface: return kind_surface
-        if kernel == &self.kernels.shade_miss: return kind_miss
-        if kernel == &self.kernels.intersect_shadow: return kind_shadow
-        if kernel == &self.kernels.finish: return kind_finish
-        if kernel == &self.kernels.film_convert: return kind_convert
-        if kernel == &self.kernels.light_emit: return kind_light
+        if kernel == &self.loaded.kernels.camera: return kind_camera
+        if kernel == &self.loaded.kernels.intersect_closest: return kind_closest
+        if kernel == &self.loaded.kernels.shade_surface: return kind_surface
+        if kernel == &self.loaded.kernels.shade_miss: return kind_miss
+        if kernel == &self.loaded.kernels.intersect_shadow: return kind_shadow
+        if kernel == &self.loaded.kernels.finish: return kind_finish
+        if kernel == &self.loaded.kernels.film_convert: return kind_convert
+        if kernel == &self.loaded.kernels.light_emit: return kind_light
         return kind_adaptive
 
     ## Milliseconds each kernel kind has taken over the finished passes, with
@@ -614,8 +651,8 @@ pub struct Renderer:
     func indirect(pass: gpu.Compute*, kernel: const Kernel*, block: u8[], start: usize, count: usize, current: u32, queue: usize) -> !:
         self.uniforms(block, start, count, current, 0)
         let bound = self.bindings(kernel)
-        if kernel == &self.kernels.shade_surface:
-            try pass.dispatch_indirect(kernel.kernel, bound, block, self.queues, (16 + 3 * queue) * 4, textures = self.textures.table)
+        if kernel == &self.loaded.kernels.shade_surface:
+            try pass.dispatch_indirect(kernel.kernel, bound, block, self.queues, (16 + 3 * queue) * 4, textures = self.loaded.textures.table)
         else:
             try pass.dispatch_indirect(kernel.kernel, bound, block, self.queues, (16 + 3 * queue) * 4)
         if self.settings.profile and self.marks.count < 62: try self.mark(pass, self.kind_of(kernel))
@@ -629,23 +666,12 @@ pub struct Renderer:
                 waiting.close()
         self.older = none
         self.newer = none
-        self.kernels.destroy()
+        self.loaded.destroy()
         self.scene.destroy()
-        self.lights.destroy()
-        self.constants.destroy()
-        self.materials.destroy()
         self.tables.destroy()
-        self.textures.destroy()
-        self.uvs.destroy()
-        self.programs.destroy()
-        self.emitters.destroy()
         self.guide.destroy()
-        self.state_v.destroy()
-        self.state_u.destroy()
-        self.queues.destroy()
-        self.film.destroy()
-        self.output.destroy()
-        self.shown.destroy()
+        self.release_view()
+        self.order.close()
         self.marks.close()
 
 ## The albedo tables energy compensation reads (shaders/microfacet.glsl),
@@ -664,29 +690,9 @@ func make_tables(device: gpu.Device) -> gpu.Buffer!:
     try pass.dispatch(kernel, bound, u8[]((u8*)&phase[0], 4), (u32)((32 * 32 * 17 + 63) // 64))
     phase[0] = 1
     try pass.dispatch(kernel, bound, u8[]((u8*)&phase[0], 4), 1)
+    # Later passes are ordered after this one; nothing waits for it.
     try pass.submit()
-    try pass.wait()
     return tables
-
-## The specialization constants of the integrator kernels (shaders/common.glsl):
-## which material features the scene uses, cut-outs, guiding, the light count,
-## light tracing, node graphs, splats.
-func scene_features(library: const OpenPbr[], light_count: usize, settings: RenderSettings, light_tracing: bool, programs: bool, splats: bool) -> gpu.Constant[10]:
-    var coat = false
-    var transmission = false
-    var metal = false
-    var emission = false
-    var cutouts = false
-    for material in library:
-        coat = coat or material.coat_weight > 0.0
-        transmission = transmission or material.transmission_weight > 0.0
-        metal = metal or material.base_metalness > 0.0
-        emission = emission or material.emission_luminance > 0.0
-        cutouts = cutouts or material.geometry_opacity < 1.0
-    return [gpu.Constant.boolean(0, coat), gpu.Constant.boolean(1, transmission), gpu.Constant.boolean(2, metal),
-            gpu.Constant.boolean(3, emission), gpu.Constant.boolean(4, cutouts), gpu.Constant.boolean(5, settings.guiding),
-            gpu.Constant.uint32(6, (u32)light_count), gpu.Constant.boolean(7, light_tracing), gpu.Constant.boolean(8, programs),
-            gpu.Constant.boolean(9, splats)]
 
 ## The camera to render through: `index`, or the first camera when it is -1.
 func find_camera(scene: const CompiledScene*, index: i64) -> usize!:
@@ -696,66 +702,3 @@ func find_camera(scene: const CompiledScene*, index: i64) -> usize!:
     for at in 0..<scene.objects.count():
         if scene.objects.object(at).kind == SceneKind.camera: return at
     error(invalid, "the scene has no camera")
-
-## Whether a material casts caustics: it refracts, or reflects sharply
-## enough (metal, glossy specular or a clear coat) to focus light.
-func casts_caustics(material: const OpenPbr*) -> bool:
-    if material.transmission_weight > 0.0: return true
-    if material.base_metalness > 0.0 and material.specular_roughness < 0.3: return true
-    if material.coat_weight > 0.0 and material.coat_roughness < 0.3: return true
-    return material.specular_weight > 0.0 and material.specular_roughness < 0.1
-
-## The sphere around the triangles that cast caustics, where light paths
-## from afar start toward (shaders/lights.glsl): light from a dome or the sun
-## needs light paths for what glass and mirrors focus, and only there. False
-## when nothing casts.
-func caster_bounds(scene: const CompiledScene*, library: const OpenPbr[]) -> (Vector3, f64, bool):
-    var lo = Vector3(1e30, 1e30, 1e30)
-    var hi = Vector3(-1e30, -1e30, -1e30)
-    var any = false
-    let p = scene.positions.view()
-    for triangle in 0..<scene.triangle_count():
-        let material = (usize)scene.shading.items[triangle * 4 + 3]
-        if material >= library.length or not casts_caustics(&library[material]): continue
-        for corner in 0..<(usize)3:
-            let at = (usize)scene.indices.items[triangle * 3 + corner] * 3
-            let point = Vector3((f64)p[at], (f64)p[at + 1], (f64)p[at + 2])
-            lo = Vector3(math.min(lo.x, point.x), math.min(lo.y, point.y), math.min(lo.z, point.z))
-            hi = Vector3(math.max(hi.x, point.x), math.max(hi.y, point.y), math.max(hi.z, point.z))
-        any = true
-    if not any: return (Vector3(), 1.0, false)
-    return (lo.add(hi).multiply_scalar(0.5), math.max(1e-3, 0.5 * hi.subtract(lo).length()), true)
-
-## Half the diagonal of the triangles' bounds (1 for an empty scene).
-func scene_radius(scene: const CompiledScene*) -> f64:
-    if scene.point_count() == 0: return 1.0
-    let root = scene.nodes.items[0]
-    let d = Vector3((f64)(root.hi.x - root.lo.x), (f64)(root.hi.y - root.lo.y), (f64)(root.hi.z - root.lo.z))
-    return math.max(1.0, 0.5 * d.length())
-
-## Constants rows (shaders/common.glsl K_*), 16 vec4s.
-func fill_constants(rows: f32[], settings: RenderSettings, light_count: usize, radius: f64, footprint: f64) -> !:
-    for at in 0..<rows.length: rows[at] = 0.0
-    let film = film_matrix()
-    let integrals = cmf_integrals()
-    let background = fit_spectrum(settings.background)
-    let values: f64[32] = [(f64)light_count, (f64)settings.max_bounces, settings.clamp_indirect, 0.0,
-                           background.c0, background.c1, background.c2, background.scale,
-                           settings.background.x, settings.background.y, settings.background.z, 0.0,
-                           film.m[0], film.m[1], film.m[2], 0.0,
-                           film.m[3], film.m[4], film.m[5], 0.0,
-                           film.m[6], film.m[7], film.m[8], 0.0,
-                           integrals.x, integrals.y, integrals.z, 0.0,
-                           (f64)settings.diffuse_bounces, (f64)settings.glossy_bounces, (f64)settings.transmission_bounces, 0.0]
-    rows[44] = (f32)settings.noise_threshold
-    rows[45] = (f32)settings.adaptive_minimum
-    # Guiding: on, the cell width per unit of distance from the camera (8
-    # pixels' footprint), the guide's share of samples where trained, the
-    # samples that train a cell; and the smallest cell.
-    let guide_row: f64[5] = [1.0 if settings.guiding else 0.0, 8.0 * footprint, 0.5, 16.0, radius * 1e-4]
-    for k in 0..<(usize)5: rows[48 + k] = (f32)guide_row[k]
-    for at in 0..<(usize)32: rows[at] = (f32)values[at]
-    # Environment texels' spectra: ACEScg to the basis spectra's weights.
-    let basis = basis_weights()
-    for r in 0..<(usize)3:
-        for k in 0..<(usize)3: rows[72 + r * 4 + k] = (f32)basis.m[r * 3 + k]

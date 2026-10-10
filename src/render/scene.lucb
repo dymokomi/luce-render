@@ -39,6 +39,10 @@ pub struct CompiledScene:
     ## Six f32s a triangle: its corners' texture coordinates.
     pub var uvs: Growing[f32]
     pub var nodes: Growing[BvhNode]
+    ## The leaf order build_bvh put the triangles in: the triangle at each
+    ## position was `order[position]` before (Renderer.reload puts a scene
+    ## compiled without its BVH in the same order).
+    pub var order: Growing[u32]
     pub var objects: SceneObjects
     ## Every material definition of the set and its instances.
     pub var materials: Materials
@@ -54,6 +58,7 @@ pub struct CompiledScene:
         self.shading = Growing[u32]()
         self.uvs = Growing[f32]()
         self.nodes = Growing[BvhNode]()
+        self.order = Growing[u32]()
         self.objects = SceneObjects()
         self.materials = Materials()
         self.skipped = 0
@@ -72,38 +77,106 @@ pub struct CompiledScene:
         self.shading.close()
         self.uvs.close()
         self.nodes.close()
+        self.order.close()
         self.objects.close()
         self.materials.close()
         self.splats.close()
 
 ## `set` compiled: its triangles in world space with their BVH, its splats with
-## theirs, and its cameras and lights.
-pub func compile_scene(set: const GeometrySet*) -> CompiledScene!:
+## theirs, and its cameras and lights. Without `geometry`, only what a renderer
+## reloads (Renderer.reload, for a set whose geometry it already has): the
+## triangles and their materials, no BVH, no splats.
+pub func compile_scene(set: const GeometrySet*, geometry: bool = true) -> CompiledScene!:
     var scene = CompiledScene()
     errdefer scene.close()
     var face_base: u32 = 0
     try materials_flattened(set, &scene.materials)
-    try add_set(&scene, set, Matrix4(), &face_base, 0)
+    try add_set(&scene, set, Matrix4(), &face_base, 0, geometry)
     if scene.point_count() > 4294967295: error(limit, "a scene holds at most 2^32 points")
     try scene_flattened(set, Matrix4(), &scene.objects)
-    try build_bvh(&scene)
-    try build_splat_bvh(&scene.splats)
+    if geometry:
+        try build_bvh(&scene)
+        try build_splat_bvh(&scene.splats)
     return scene
 
-func add_set(scene: CompiledScene*, set: const GeometrySet*, matrix: Matrix4, face_base: u32*, depth: usize) -> !:
+## Whether `set` and `other` hold the same geometry, so they compile to the
+## same triangles and splats: their meshes and point clouds in the same order
+## and places, made of the same arrays (blocks are never changed in place, so
+## the same block is the same data). Cameras, lights and materials are left
+## out: a light or a material node changes none of this.
+pub func same_geometry(set: const GeometrySet*, other: const GeometrySet*) -> bool!:
+    var first: u64 = 14695981039346656037
+    try hash_set(set, Matrix4(), 0, &first)
+    var second: u64 = 14695981039346656037
+    try hash_set(other, Matrix4(), 0, &second)
+    if first != second: return false
+    # Charged after the other's arrays, a set costs only its fixed overheads,
+    # as after its own.
+    return (try unseen(set, other)) == (try unseen(set, set)) and (try unseen(other, set)) == (try unseen(other, other))
+
+## The shape of a set's geometry: the kind of each mesh and point cloud and
+## where it is placed, through the visible instances.
+func hash_set(set: const GeometrySet*, matrix: Matrix4, depth: usize, key: u64*) -> !:
+    if depth > 64: error(invalid, "instances nest more than 64 deep")
+    for index in 0..<set.component_count():
+        let entry = set.component(index)
+        if entry.kind == mesh_component() or entry.kind == points_component():
+            mix(key, 1 if entry.kind == mesh_component() else 2)
+            let placement: f64[12] = [matrix.x.x, matrix.x.y, matrix.x.z, matrix.y.x, matrix.y.y, matrix.y.z,
+                                      matrix.z.x, matrix.z.y, matrix.z.z, matrix.translation.x, matrix.translation.y, matrix.translation.z]
+            for at in 0..<(usize)12: mix(key, memory.read[u64]((const void*)&placement[at]))
+        elif entry.kind == instances_component():
+            let instances = (const Instances*)entry.data
+            mix(key, 3)
+            for at in 0..<instances.count():
+                let item = instances.item(at)
+                if not item.visible: continue
+                try hash_set(item.set, matrix.multiply(item.matrix()), depth + 1, key)
+
+## Bytes of `set`'s geometry that `other`'s does not hold: the arrays it
+## lacks, and each component's fixed overhead.
+func unseen(set: const GeometrySet*, other: const GeometrySet*) -> usize!:
+    var ids = IdSet()
+    defer ids.close()
+    _ = try geometry_bytes(other, &ids, 0)
+    return try geometry_bytes(set, &ids, 0)
+
+func geometry_bytes(set: const GeometrySet*, ids: IdSet*, depth: usize) -> usize!:
+    if depth > 64: error(invalid, "instances nest more than 64 deep")
+    var bytes: usize = 0
+    for index in 0..<set.component_count():
+        let entry = set.component(index)
+        if entry.kind == mesh_component() or entry.kind == points_component():
+            let count = entry.kind.bytes
+            bytes += try count(entry.data, ids)
+        elif entry.kind == instances_component():
+            let instances = (const Instances*)entry.data
+            for at in 0..<instances.count():
+                let item = instances.item(at)
+                if item.visible: bytes += try geometry_bytes(item.set, ids, depth + 1)
+    return bytes
+
+## FNV-1a over a word's bytes.
+func mix(key: u64*, word: u64):
+    var value = word
+    for at in 0..<(usize)8:
+        *key = (*key ^ (value & 255)) *% 1099511628211
+        value = value >> 8
+
+func add_set(scene: CompiledScene*, set: const GeometrySet*, matrix: Matrix4, face_base: u32*, depth: usize, splats: bool) -> !:
     if depth > 64: error(invalid, "instances nest more than 64 deep")
     for index in 0..<set.component_count():
         let entry = set.component(index)
         if entry.kind == mesh_component():
             try add_mesh(scene, (const Mesh*)entry.data, matrix, face_base)
         elif entry.kind == points_component():
-            try add_cloud(&scene.splats, set, matrix)
+            if splats: try add_cloud(&scene.splats, set, matrix)
         elif entry.kind == instances_component():
             let instances = (const Instances*)entry.data
             for at in 0..<instances.count():
                 let item = instances.item(at)
                 if not item.visible: continue
-                try add_set(scene, item.set, matrix.multiply(item.matrix()), face_base, depth + 1)
+                try add_set(scene, item.set, matrix.multiply(item.matrix()), face_base, depth + 1, splats)
         elif entry.kind.unrealizable != "":
             scene.skipped += 1
 

@@ -1,0 +1,272 @@
+#==============================================================================================
+#
+#   render/loading - What a renderer loads from a scene besides its geometry
+#
+#   DESCRIPTION:
+#       A Renderer holds three kinds of device state, each replaced only when what it
+#       follows changes:
+#
+#       geometry   GpuScene (device.lucb): triangles, splats, their BVHs, the BLAS and
+#                  TLAS. Uploaded once per geometry.
+#       loaded     Loaded, here: the lights and their tree, the materials, textures and
+#                  node programs, the constants, and the kernels specialized to all of
+#                  them. A new light or material reloads it (Renderer.reload) and keeps
+#                  the geometry.
+#       view       the path state, the film and the images (integrator.lucb). A moved
+#                  camera or a resized view restarts the film (Renderer.restart) and
+#                  keeps both of the above.
+#
+#       The constants' guide and view rows (12..15) follow the view: `view_rows` makes
+#       them, and `Loaded.show_view` uploads them alone.
+#
+#==============================================================================================
+
+## The scene's lights, materials, constants and kernels on the device.
+struct Loaded:
+    var kernels: Kernels
+    var lights: gpu.Buffer
+    var constants: gpu.Buffer
+    var materials: gpu.Buffer
+    var emitters: gpu.Buffer
+    ## The materials' textures, and the triangles' texture coordinates.
+    var textures: MaterialTextures
+    var uvs: gpu.Buffer
+    ## The materials' node-graph programs (shader_graph.lucb).
+    var programs: gpu.Buffer
+    var light_count: usize
+    ## Rounds of each pass beyond the bounces, for rays passing through cut-outs.
+    var through: usize
+    ## Whether light paths run (light tracing on, a perspective view, and
+    ## emitters to start from): the kernels are specialized to it.
+    var tracing: bool
+    ## Half the diagonal of the triangles' bounds (scene_radius).
+    var radius: f64
+
+    ## Load `scene`'s lights, materials and constants, and the kernels for them,
+    ## beside its geometry `uploaded` (of size `radius`, scene_radius) and the
+    ## albedo `tables`, for views like `frame` (light paths need a perspective
+    ## one). The view rows are left for `show_view`.
+    pub static func create(device: gpu.Device, scene: const CompiledScene*, settings: RenderSettings, radius: f64, uploaded: const GpuScene*, tables: const gpu.Buffer*, frame: const RayFrame*) -> Loaded!:
+        var packed = Growing[f32]()
+        defer packed.close()
+        # The first dome with an image lights by it (environment.lucb).
+        var environment = Environment()
+        defer environment.close()
+        var environment_view: const Environment*? = none
+        for index in 0..<scene.objects.count():
+            let item = scene.objects.object(index)
+            if item.kind != SceneKind.light or item.light.shape != LightShape.dome or scene.objects.texture(index).length == 0: continue
+            environment = try load_environment(scene.objects.texture(index))
+            environment_view = &environment
+            break
+        let (light_count, distant_power, dome) = try pack_lights(&scene.objects, radius, &packed, environment_view)
+        # Materials: the default first (material 0), then the scene's library.
+        var library = Growing[OpenPbr]()
+        defer library.close()
+        try library.push(settings.material)
+        for index in 0..<scene.materials.count(): try library.push(openpbr_of(&scene.materials, index))
+        # The light tree's nodes follow the light records; its links, emitter
+        # records and triangle map make the emitter buffer.
+        var tree = try build_light_tree(scene, packed.view(), light_count, library.view())
+        defer tree.close()
+        let node_offset = packed.count // 4
+        for value in tree.nodes.view(): try packed.push(value)
+        # The dome's texels (a vec4 each), then its cumulative weights.
+        var dome_row: f64[8] = [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        if dome >= 0:
+            while packed.count % 4 != 0: try packed.push(0.0)
+            let texel_base = packed.count // 4
+            for value in environment.texels.view(): try packed.push(value)
+            let cdf_base = packed.count
+            for value in environment.cdf.view(): try packed.push(value)
+            while packed.count % 4 != 0: try packed.push(0.0)
+            dome_row = [(f64)dome, (f64)texel_base, (f64)environment.width, (f64)environment.height, (f64)cdf_base, environment.total, 0.0, 0.0]
+        var lights = try buffer_of(device, u8[]((u8*)packed.items.data, packed.count * 4))
+        errdefer lights.destroy()
+        var links = Growing[u32]()
+        defer links.close()
+        try links.assign(tree.links.view())
+        for value in tree.records.view(): try links.push(value)
+        var emitters = try buffer_of(device, u8[]((u8*)links.items.data, links.count * 4))
+        errdefer emitters.destroy()
+        let total = distant_power + tree.energy
+        let p_distant = (distant_power / total if total > 0.0 else 0.0) if tree.emitter_count > 0 else (1.0 if distant_power > 0.0 else 0.0)
+        var rows: f32[128]
+        fill_constants(rows, settings, light_count, radius)
+        let tree_row: f64[4] = [(f64)tree.node_count(), (f64)node_offset, p_distant, (f64)tree.emitter_count]
+        let offsets_row: f64[4] = [(f64)tree.links.count, (f64)(tree.links.count + tree.emitter_count * 4), 0.0, 0.0]
+        for k in 0..<(usize)4:
+            rows[32 + k] = (f32)tree_row[k]
+            rows[40 + k] = (f32)offsets_row[k]
+        # The materials' textures (slots a material, the default's first),
+        # and the buffers kernels reach by address: the albedo tables and the
+        # triangles' texture coordinates.
+        var textures = try load_textures(device, &scene.materials)
+        errdefer textures.destroy()
+        var corner_uvs = Growing[f32]()
+        defer corner_uvs.close()
+        try corner_uvs.assign(scene.uvs.view())
+        while corner_uvs.count < 6: try corner_uvs.push(0.0)
+        var uvs = try buffer_of(device, u8[]((u8*)corner_uvs.items.data, corner_uvs.count * 4))
+        errdefer uvs.destroy()
+        var programs = try buffer_of(device, u8[]((u8*)textures.programs.items.data, textures.programs.count * 4))
+        errdefer programs.destroy()
+        memory.write[u64]((void*)&rows[92], try tables.address())
+        memory.write[u64]((void*)&rows[94], try uvs.address())
+        memory.write[u64]((void*)&rows[96], try programs.address())
+        # The splats, reached by address (shaders/splats.glsl: K_SPLATS, K_SPLAT_TREE).
+        let splat_addresses = try uploaded.splat_addresses()
+        memory.write[u64]((void*)&rows[100], splat_addresses[0])
+        memory.write[u64]((void*)&rows[102], splat_addresses[1])
+        memory.write[u64]((void*)&rows[104], splat_addresses[2])
+        rows[106] = (f32)uploaded.splat_count
+        rows[107] = (f32)splat_cull
+        var records = Growing[f32]()
+        defer records.close()
+        var cutouts = false
+        for index in 0..<library.count:
+            let material = library.items[index]
+            try pack_material(material, textures.entries.items[index], &records)
+            cutouts = cutouts or material.geometry_opacity < 1.0
+        rows[3] = 1.0 if cutouts else 0.0
+        # Domes and distant lights with a size start light paths too, on a disk
+        # around what casts caustics (shaders/lights.glsl), sharing them with
+        # the tree's emitters by power.
+        let (focus, focus_radius, casters) = caster_bounds(scene, library.view())
+        var afar = false
+        for index in 0..<light_count:
+            let kind = packed.items[index * light_stride * 4 + 3]
+            if kind == 4.0 or (kind == 3.0 and packed.items[index * light_stride * 4 + 11] < 1.0 - 1e-7): afar = casters
+        let afar_power = distant_power * (focus_radius / radius) * (focus_radius / radius) if afar else 0.0
+        let afar_share = afar_power / (afar_power + tree.energy) if afar_power + tree.energy > 0.0 else 0.0
+        let emit_rows: f64[8] = [afar_share, focus_radius, 0.0, 0.0, focus.x, focus.y, focus.z, 0.0]
+        for k in 0..<(usize)8: rows[84 + k] = (f32)emit_rows[k]
+        for k in 0..<(usize)8: rows[64 + k] = (f32)dome_row[k]
+        let tracing = settings.light_tracing > 0.0 and not frame.orthographic and (tree.emitter_count > 0 or afar)
+        var constants = try gpu.Buffer.create(device, u8[]((u8*)&rows[0], constants_rows * 16))
+        errdefer constants.destroy()
+        # Kernels specialized to the scene: the features its materials use, its
+        # light count, guiding, light paths, programs and splats.
+        var has_programs = false
+        for entry in textures.entries.view(): has_programs = has_programs or entry >= 0.0
+        var features = scene_features(library.view(), light_count, settings, tracing, has_programs, uploaded.splat_count > 0)
+        var kernels = try Kernels.create(device, settings.spectral, uploaded.accelerated, features)
+        errdefer kernels.destroy()
+        let materials = try buffer_of(device, u8[]((u8*)records.items.data, records.count * 4))
+        return Loaded(kernels, lights, constants, materials, emitters, textures, uvs, programs, light_count, 8 if cutouts else 0, tracing, radius)
+
+    ## Light paths a sample for a view of `pixels` traced in bands of `band`
+    ## paths: light tracing's share of the pixels, at most a band's (they take
+    ## the pool's slots after the band's camera paths).
+    pub func light_paths(settings: RenderSettings, pixels: usize, band: usize) -> usize:
+        if not self.tracing: return 0
+        let wanted = (usize)math.max(1.0, math.round(settings.light_tracing * (f64)pixels))
+        return wanted if wanted < band else band
+
+    ## Upload the guide and view rows (constants 12..15) for `frame`.
+    pub func show_view(settings: RenderSettings, frame: const RayFrame*, light_paths: usize) -> !:
+        var rows: f32[16]
+        view_rows(rows, settings, frame, light_paths, self.radius)
+        try self.constants.upload(12 * 16, u8[]((u8*)&rows[0], 64))
+
+    pub func destroy():
+        self.kernels.destroy()
+        self.lights.destroy()
+        self.constants.destroy()
+        self.materials.destroy()
+        self.emitters.destroy()
+        self.textures.destroy()
+        self.uvs.destroy()
+        self.programs.destroy()
+
+## The specialization constants of the integrator kernels (shaders/common.glsl):
+## which material features the scene uses, cut-outs, guiding, the light count,
+## light tracing, node graphs, splats.
+func scene_features(library: const OpenPbr[], light_count: usize, settings: RenderSettings, light_tracing: bool, programs: bool, splats: bool) -> gpu.Constant[10]:
+    var coat = false
+    var transmission = false
+    var metal = false
+    var emission = false
+    var cutouts = false
+    for material in library:
+        coat = coat or material.coat_weight > 0.0
+        transmission = transmission or material.transmission_weight > 0.0
+        metal = metal or material.base_metalness > 0.0
+        emission = emission or material.emission_luminance > 0.0
+        cutouts = cutouts or material.geometry_opacity < 1.0
+    return [gpu.Constant.boolean(0, coat), gpu.Constant.boolean(1, transmission), gpu.Constant.boolean(2, metal),
+            gpu.Constant.boolean(3, emission), gpu.Constant.boolean(4, cutouts), gpu.Constant.boolean(5, settings.guiding),
+            gpu.Constant.uint32(6, (u32)light_count), gpu.Constant.boolean(7, light_tracing), gpu.Constant.boolean(8, programs),
+            gpu.Constant.boolean(9, splats)]
+
+## Whether a material casts caustics: it refracts, or reflects sharply
+## enough (metal, glossy specular or a clear coat) to focus light.
+func casts_caustics(material: const OpenPbr*) -> bool:
+    if material.transmission_weight > 0.0: return true
+    if material.base_metalness > 0.0 and material.specular_roughness < 0.3: return true
+    if material.coat_weight > 0.0 and material.coat_roughness < 0.3: return true
+    return material.specular_weight > 0.0 and material.specular_roughness < 0.1
+
+## The sphere around the triangles that cast caustics, where light paths
+## from afar start toward (shaders/lights.glsl): light from a dome or the sun
+## needs light paths for what glass and mirrors focus, and only there. False
+## when nothing casts.
+func caster_bounds(scene: const CompiledScene*, library: const OpenPbr[]) -> (Vector3, f64, bool):
+    var lo = Vector3(1e30, 1e30, 1e30)
+    var hi = Vector3(-1e30, -1e30, -1e30)
+    var any = false
+    let p = scene.positions.view()
+    for triangle in 0..<scene.triangle_count():
+        let material = (usize)scene.shading.items[triangle * 4 + 3]
+        if material >= library.length or not casts_caustics(&library[material]): continue
+        for corner in 0..<(usize)3:
+            let at = (usize)scene.indices.items[triangle * 3 + corner] * 3
+            let point = Vector3((f64)p[at], (f64)p[at + 1], (f64)p[at + 2])
+            lo = Vector3(math.min(lo.x, point.x), math.min(lo.y, point.y), math.min(lo.z, point.z))
+            hi = Vector3(math.max(hi.x, point.x), math.max(hi.y, point.y), math.max(hi.z, point.z))
+        any = true
+    if not any: return (Vector3(), 1.0, false)
+    return (lo.add(hi).multiply_scalar(0.5), math.max(1e-3, 0.5 * hi.subtract(lo).length()), true)
+
+## Half the diagonal of the triangles' bounds, by the BVH's root (1 for a
+## scene without triangles or BVH, and at least 1).
+func scene_radius(scene: const CompiledScene*) -> f64:
+    if scene.point_count() == 0 or scene.nodes.count == 0: return 1.0
+    let root = scene.nodes.items[0]
+    let d = Vector3((f64)(root.hi.x - root.lo.x), (f64)(root.hi.y - root.lo.y), (f64)(root.hi.z - root.lo.z))
+    return math.max(1.0, 0.5 * d.length())
+
+## Constants rows (shaders/common.glsl K_*) that follow the scene; rows 12..15
+## follow the view (`view_rows`).
+func fill_constants(rows: f32[], settings: RenderSettings, light_count: usize, radius: f64):
+    for at in 0..<rows.length: rows[at] = 0.0
+    let film = film_matrix()
+    let integrals = cmf_integrals()
+    let background = fit_spectrum(settings.background)
+    let values: f64[32] = [(f64)light_count, (f64)settings.max_bounces, settings.clamp_indirect, 0.0,
+                           background.c0, background.c1, background.c2, background.scale,
+                           settings.background.x, settings.background.y, settings.background.z, 0.0,
+                           film.m[0], film.m[1], film.m[2], 0.0,
+                           film.m[3], film.m[4], film.m[5], 0.0,
+                           film.m[6], film.m[7], film.m[8], 0.0,
+                           integrals.x, integrals.y, integrals.z, 0.0,
+                           (f64)settings.diffuse_bounces, (f64)settings.glossy_bounces, (f64)settings.transmission_bounces, 0.0]
+    for at in 0..<(usize)32: rows[at] = (f32)values[at]
+    rows[44] = (f32)settings.noise_threshold
+    rows[45] = (f32)settings.adaptive_minimum
+    # Environment texels' spectra: ACEScg to the basis spectra's weights.
+    let basis = basis_weights()
+    for r in 0..<(usize)3:
+        for k in 0..<(usize)3: rows[72 + r * 4 + k] = (f32)basis.m[r * 3 + k]
+
+## Constants rows 12..15 (floats 48..63) for a view through `frame`:
+## guiding (on, the cell width per unit of distance from the camera, 8 pixels'
+## footprint; the guide's share of samples where trained; the samples that
+## train a cell; the smallest cell), then the camera (light paths a sample,
+## the image plane's pixel area at unit distance, the lens, the camera's axis).
+func view_rows(out: f32[], settings: RenderSettings, frame: const RayFrame*, light_paths: usize, radius: f64):
+    let pixel_area = frame.du.length() * frame.dv.length()
+    let values: f64[16] = [1.0 if settings.guiding else 0.0, 8.0 * frame.du.length(), 0.5, 16.0, radius * 1e-4, 0.0, 0.0, 0.0,
+                           (f64)light_paths, 1.0 / pixel_area if pixel_area > 0.0 else 0.0, frame.lens_radius, frame.focus_distance,
+                           frame.forward.x, frame.forward.y, frame.forward.z, 0.0]
+    for at in 0..<(usize)16: out[at] = (f32)values[at]

@@ -462,3 +462,37 @@ Next:
 - A denoiser.
 - Instancing as a BLAS per prototype.
 - Per-scene light-path budgets (efficiency-aware MIS, Grittmann et al. 2022).
+
+## Interactive renders
+
+A viewport renders through a view it places, and changes it on every orbit.
+A Renderer therefore keeps three kinds of device state apart (loading.lucb),
+and replaces each only when what it follows changes:
+
+| State | Follows | Replaced by |
+| --- | --- | --- |
+| Geometry: `GpuScene`, the triangles' and splats' buffers, BVHs, BLAS and TLAS | meshes and clouds | a new renderer |
+| Loaded: lights and their tree, materials, textures, programs, constants, specialized kernels | lights, materials, settings | `Renderer.reload` |
+| View: path state, film, images | camera and size | `Renderer.restart` |
+
+- **`restart(frame)`:** a new camera or size. The guide and view constants are
+  uploaded; the next pass clears the film; passes still in flight finish
+  uncounted, and their image shows until the next pass's. A smaller view fills
+  the images' top-left corner (`shown_size`); only a larger one makes the view's
+  buffers again.
+- **`reload(scene, settings)`:** the same geometry with other lights or
+  materials. `compile_scene(set, geometry = false)` makes such a scene without
+  splats or BVHs; reload puts its triangles in the BVH's leaf order
+  (`CompiledScene.order`) and uploads the per-triangle shading again.
+- **`same_geometry(a, b)`** tells when that holds: the meshes and clouds have
+  the same shape and placement, and are made of the same geocore array blocks
+  (blocks are never changed in place).
+- **`RenderSession`** compiles on a thread of its own (the bonsai capture takes
+  about 2.6 s), queues a newer scene behind a running compile, and picks the
+  result up in `draw`. `look` places a view, and `start_view` renders through
+  it. Neither the albedo tables nor the BLAS build blocks the caller: later
+  passes are ordered after them on the queue.
+
+`tests/gpu/interactive.lucb` checks restarts through other views and sizes,
+restarts with passes in flight, and a reload with a brighter light, each
+against a renderer made afresh.

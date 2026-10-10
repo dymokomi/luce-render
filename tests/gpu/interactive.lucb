@@ -1,0 +1,138 @@
+## Interactive renders, as a viewport makes them: a view placed by the caller
+## (look_frame), restarted through other views and sizes, and a scene
+## reloaded with other lights while its geometry stays on the device. Each is
+## checked against a renderer made afresh for the same view and scene: the
+## sample sequence starts over, so the images agree but for the order of the
+## light paths' atomic splats.
+import memory
+from luce_std import math
+from luce_gpu import gpu
+from luce_render import render
+from luce_geocore.geocore import Vector3, MeshPrimitives, GeometrySet
+import interop
+
+pub func checks(device: gpu.Device) -> !:
+    let ball = try MeshPrimitives.sphere(0.6, 24)
+    defer ball.release()
+    let sphere = try (try GeometrySet.of_mesh(ball)).value().transformed(Vector3(0.0, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer sphere.release()
+    let floor = try MeshPrimitives.grid(10.0, 4)
+    defer floor.release()
+    let ground = try GeometrySet.of_mesh(floor)
+    defer ground.release()
+    let both = try sphere.value().merged(ground)
+    defer both.release()
+    let lit = try with_key(both, 6.0)
+    defer lit.release()
+    let brighter = try with_key(both, 12.0)
+    defer brighter.release()
+    # The geometry is the same arrays however the lights change; other
+    # geometry, or the same placed elsewhere, is not.
+    assert(try render.same_geometry(lit.value(), brighter.value()))
+    assert(not (try render.same_geometry(lit.value(), ground.value())))
+    let moved = try lit.value().transformed(Vector3(0.0, 0.1, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer moved.release()
+    assert(not (try render.same_geometry(lit.value(), moved.value())))
+
+    let a = try view(Vector3(0.0, 1.5, 4.0), 48, 32)
+    let b = try view(Vector3(3.0, 2.5, 1.0), 48, 32)
+    let half = try view(Vector3(0.0, 1.5, 4.0), 24, 16)
+    var settings = render.RenderSettings.of(48, 32, 24)
+    settings.max_bounces = 4
+    settings.material.base_color = Vector3(0.6, 0.6, 0.6)
+    let size: usize = 48 * 32 * 4
+    let fresh = try new f32[size] --- in memory.heap
+    defer free(fresh) in memory.heap
+    let again = try new f32[size] --- in memory.heap
+    defer free(again) in memory.heap
+
+    # Through A afresh; then a renderer through B restarted through A.
+    try rendered(device, lit.value(), settings, a, fresh)
+    var scene = try render.compile_scene(lit.value())
+    defer scene.close()
+    var renderer = try render.Renderer.create_viewed(device, &scene, settings, b)
+    defer renderer.destroy()
+    try renderer.finish()
+    assert(renderer.samples_done() == 24)
+    try renderer.restart(a)
+    assert(renderer.samples_done() == 0)
+    try renderer.finish()
+    try renderer.read(again)
+    try agree("restarted through another view", fresh, again)
+
+    # A smaller view fills the images' corner; growing back makes them again.
+    try renderer.restart(half)
+    try renderer.finish()
+    let shown = renderer.shown_size()
+    assert(shown[0] == 24 and shown[1] == 16)
+    try renderer.restart(a)
+    try renderer.finish()
+    try renderer.read(again)
+    try agree("back from a smaller view", fresh, again)
+
+    # Restarted mid-render: passes in flight count for nothing.
+    try renderer.restart(b)
+    _ = try renderer.advance()
+    _ = try renderer.advance()
+    try renderer.restart(a)
+    try renderer.finish()
+    try renderer.read(again)
+    try agree("restarted with passes in flight", fresh, again)
+
+    # A light twice as bright, reloaded over the same geometry, against a
+    # renderer made for it; and about twice the light.
+    var reloaded = try render.compile_scene(brighter.value(), false)
+    defer reloaded.close()
+    assert(reloaded.splats.count() == 0 and reloaded.nodes.count == 0 and reloaded.triangle_count() == scene.triangle_count())
+    try renderer.reload(&reloaded, settings)
+    try renderer.finish()
+    try renderer.read(again)
+    try rendered(device, brighter.value(), settings, a, fresh)
+    try agree("reloaded with a brighter light", fresh, again)
+    let before = try new f32[size] --- in memory.heap
+    defer free(before) in memory.heap
+    try rendered(device, lit.value(), settings, a, before)
+    let ratio = mean(again) / mean(before)
+    if math.abs(ratio - 2.0) > 0.02:
+        print(f"a light twice as bright gives {ratio} times the light")
+        assert(false)
+    print("PASS interactive: restarts through other views and sizes, with passes in flight, and reloads with other lights agree with fresh renders")
+
+func with_key(set: interop.Reference[GeometrySet], intensity: f64) -> interop.Reference[GeometrySet]!:
+    return try set.value().with_light("/key", Vector3(0.0, 3.0, 0.0), Vector3(-0.5 * math.pi, 0.0, 0.0), 0, Vector3(1.0, 1.0, 1.0), intensity, 0.0, 0.0, false, 2.0, 2.0, 0.5, 0.0, false)
+
+## A 40° view from `eye` at the sphere.
+func view(eye: Vector3, width: u32, height: u32) -> render.RayFrame!:
+    return try render.look_frame(eye, Vector3().subtract(eye), Vector3(0.0, 1.0, 0.0), math.tan(20.0 * math.pi / 180.0), width, height)
+
+func rendered(device: gpu.Device, set: const GeometrySet*, settings: render.RenderSettings, frame: render.RayFrame, out: f32[]) -> !:
+    var scene = try render.compile_scene(set)
+    defer scene.close()
+    var renderer = try render.Renderer.create_viewed(device, &scene, settings, frame)
+    defer renderer.destroy()
+    try renderer.finish()
+    try renderer.read(out)
+
+func mean(pixels: const f32[]) -> f64:
+    var sum: f64 = 0.0
+    for at in 0..<pixels.length:
+        if at % 4 != 3: sum += (f64)pixels[at]
+    return sum / (f64)(pixels.length // 4 * 3)
+
+## The images agree: the mean difference within 0.1% of the mean, and no
+## pixel off by more than 2% of the brightest (light paths' splats land in
+## another order).
+func agree(what: str, expected: const f32[], got: const f32[]) -> !:
+    var difference: f64 = 0.0
+    var worst: f64 = 0.0
+    var peak: f64 = 0.0
+    for at in 0..<expected.length:
+        if at % 4 == 3: continue
+        let d = math.abs((f64)expected[at] - (f64)got[at])
+        difference += d
+        worst = math.max(worst, d)
+        peak = math.max(peak, (f64)expected[at])
+    difference /= (f64)(expected.length // 4 * 3)
+    if difference > 1e-3 * mean(expected) or worst > 0.02 * peak:
+        print(f"{what}: mean difference {difference} (image mean {mean(expected)}), worst {worst} of {peak}")
+        assert(false)

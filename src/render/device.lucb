@@ -83,6 +83,14 @@ pub struct GpuScene:
         uploaded.accelerated = true
         return uploaded
 
+    ## Upload `scene`'s triangle shading attributes (normals and materials) in
+    ## place of these: the same geometry with its materials assigned anew
+    ## (Renderer.reload).
+    pub func replace_shading(device: gpu.Device, scene: const CompiledScene*) -> !:
+        let shading = try buffer_of(device, u8[]((u8*)scene.shading.items.data, scene.shading.count * 4))
+        self.shading.destroy()
+        self.shading = shading
+
     ## The splat buffers' addresses for the kernels' constants (splats.glsl):
     ## records, harmonics and the software BVH.
     pub func splat_addresses() -> u64[3]!:
