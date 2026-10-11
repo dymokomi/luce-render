@@ -161,12 +161,22 @@ pub struct RenderSession:
         self.viewing = true
         self.settings.width = (u32)width
         self.settings.height = (u32)height
+        # A reload on its way (a light or a material changed) starts through
+        # this view: the scene it replaces is not restarted for nothing.
+        if self.reload_pending(): return
         if let running = self.renderer:
             var renderer = running
             try renderer.restart(self.framing)
             self.renderer = renderer
         self.started = clock.now()
         self.took = 0.0
+
+    ## Whether the scene compiling or waiting only reloads the renderer's.
+    func reload_pending() -> bool:
+        if self.renderer == none: return false
+        if self.waiting != none: return self.waiting_reloads
+        let job = self.compiling else return false
+        return not job.geometry
 
     ## The default material of the next start (faces with none assigned):
     ## OpenPBR parameters by name, one per line, four numbers each, as a
@@ -270,12 +280,19 @@ pub struct RenderSession:
         job.thread.join() catch _: _ = 0
         self.compiling = none
         if self.queued != none:
-            # Superseded: the newer set compiles instead.
-            job.scene.close()
-            release_job(job)
+            # A newer set waits. A finished reload (a light dragged, a set a
+            # frame) still shows, so a scene changing every frame is seen
+            # changing; a finished upload is superseded by the newer set.
             let next = self.queued else return
             self.queued = none
             defer next.release()
+            if not job.failed and not job.geometry:
+                self.waiting = job.scene
+                self.waiting_reloads = true
+                self.waiting_set = job.set.clone()
+            else:
+                job.scene.close()
+            release_job(job)
             try self.spawn(next)
             return
         if job.failed:

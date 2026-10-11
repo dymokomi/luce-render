@@ -7,7 +7,8 @@
 #       and records passes. A pass traces one sample for one band of pixels (at most
 #       `pool` paths): camera, then per bounce intersect_closest → shade_surface →
 #       shade_miss → intersect_shadow, then finish (paths
-#       into the film) and film_convert (the film's average into the image). With
+#       into the film) and, after a sample's last band, film_convert (the film's average
+#       into the image and a display image). With
 #       light tracing, the first band's pass also starts the sample's light paths
 #       (light_emit, into the pool's slots after the band's), which run in the same
 #       rounds: shade_surface shades their hits after the camera paths', and
@@ -18,6 +19,13 @@
 #       `advance` is meant to be called once per UI frame: it starts the next pass
 #       only when the last one has finished, so the UI never waits and the GPU stays
 #       busy. Device work happens on the main thread.
+#
+#       What a viewport shows is always one whole image of one view: a sample's last
+#       pass writes the display image into one of three, never the one shown nor one a
+#       pass in flight writes, and it is shown once that pass has finished. A restart
+#       or a reload begins a new generation; passes of an older one finish unseen.
+#       A UI draws after the passes it submitted, so a display image a pass in flight
+#       still writes is never the one it draws.
 #
 #       Buffers, as shaders/common.glsl binds them: 0 nodes, 1 positions, 2 indices,
 #       3 lights, 4 state (vec4 fields), 5 state (uint fields), 6 queues, 7 film,
@@ -225,7 +233,10 @@ pub struct Renderer:
     var queues: gpu.Buffer
     var film: gpu.Buffer
     var output: gpu.Texture
-    var shown: gpu.Texture
+    ## The display images (rgba16f): `front` is the one shown, of `shown_width` ×
+    ## `shown_height` pixels from its top-left corner.
+    var shown: gpu.Texture[3]
+    var front: usize
     var capacity: usize
     var image_width: u32
     var image_height: u32
@@ -247,6 +258,16 @@ pub struct Renderer:
     var newer_completes: u32
     var older_size: u32[2]
     var newer_size: u32[2]
+    ## The display image each pass in flight writes (-1: none, not its sample's
+    ## last band), and the generation it was recorded in: a restart or a reload
+    ## begins the next, and only the current generation's images are shown.
+    var older_slot: i64
+    var newer_slot: i64
+    var older_generation: u64
+    var newer_generation: u64
+    var generation: u64
+    ## The display image the pass being recorded writes (-1 none).
+    var writing: i64
     var sample: u32
     var band: usize
     var completed: u32
@@ -294,8 +315,9 @@ pub struct Renderer:
             order.close()
             loaded.destroy()
             error(failure.code, failure.message)
-        var renderer = Renderer(device, chosen, uploaded, loaded, order, tables, guide, guide_address, gpu.Buffer(), gpu.Buffer(), gpu.Buffer(), gpu.Buffer(), gpu.Texture(), gpu.Texture(),
-                                0, 0, 0, false, frame, 0, 0, false, none, none, 0, 0, [0, 0], [0, 0], 0, 0, 0, 0, 0,
+        var renderer = Renderer(device, chosen, uploaded, loaded, order, tables, guide, guide_address, gpu.Buffer(), gpu.Buffer(), gpu.Buffer(), gpu.Buffer(), gpu.Texture(),
+                                [gpu.Texture(), gpu.Texture(), gpu.Texture()], 0,
+                                0, 0, 0, false, frame, 0, 0, false, none, none, 0, 0, [0, 0], [0, 0], -1, -1, 0, 0, 0, -1, 0, 0, 0, 0, 0,
                                 Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0, 0, 0)
         try renderer.allocate_view(frame.width, frame.height) catch failure:
             renderer.destroy()
@@ -319,7 +341,9 @@ pub struct Renderer:
         self.queues = try gpu.Buffer.allocate(self.device, (queue_base + queue_count * slots) * 4)
         self.film = try gpu.Buffer.allocate(self.device, 4 * pixels * 16)
         self.output = try gpu.Texture.create(self.device, width, height, gpu.Format.rgba32_float, storage = true)
-        self.shown = try gpu.Texture.create(self.device, width, height, gpu.Format.rgba32_float, storage = true)
+        for slot in 0..<(usize)3:
+            self.shown[slot] = try gpu.Texture.create(self.device, width, height, gpu.Format.rgba16_float, storage = true)
+        self.front = 0
         self.capacity = pixels
         self.image_width = width
         self.image_height = height
@@ -335,7 +359,7 @@ pub struct Renderer:
         self.queues.destroy()
         self.film.destroy()
         self.output.destroy()
-        self.shown.destroy()
+        for slot in 0..<(usize)3: self.shown[slot].destroy()
 
     ## The light paths a sample of the current view, and the constants' view rows.
     func show_view() -> !:
@@ -346,13 +370,16 @@ pub struct Renderer:
 
     ## Start over through `frame` (a moved camera, a resized view): the film is
     ## cleared before the next pass, and passes still in flight count for
-    ## nothing, though the image they leave shows until the next pass's. The
+    ## nothing and are never shown; the image shown stays until the new view's
+    ## first whole sample replaces it (a pass that has already finished is
+    ## shown first, since it was current while it ran). The
     ## scene stays on the device; the view's buffers are made again only when
     ## the view outgrows them. `frame` keeps the projection (perspective or
     ## orthographic) the renderer was made with.
     pub func restart(frame: RayFrame) -> !:
         if frame.width == 0 or frame.height == 0 or frame.width > 16384 or frame.height > 16384: error(invalid, "an image is 1 to 16384 pixels on a side")
         if frame.orthographic != self.frame.orthographic: error(invalid, "a restart keeps the view's projection")
+        try self.retire_finished()
         if (usize)frame.width * (usize)frame.height > self.capacity or frame.width > self.image_width or frame.height > self.image_height:
             try self.settle()
             try self.allocate_view(frame.width, frame.height)
@@ -374,6 +401,7 @@ pub struct Renderer:
             if scene.triangle_count() != self.order.count: error(invalid, "a reload keeps the scene's geometry")
             try reorder(scene, self.order.view())
         if settings.samples == 0 or settings.max_bounces == 0 or settings.max_bounces > 1024: error(invalid, "a render needs samples and 1 to 1024 bounces")
+        try self.retire_finished()
         var chosen = settings
         chosen.width = self.settings.width
         chosen.height = self.settings.height
@@ -396,9 +424,10 @@ pub struct Renderer:
         try self.show_view()
         self.forget_passes()
 
-    ## Passes in flight finish uncounted; the next pass clears the film and
-    ## starts sample 0.
+    ## Passes in flight finish uncounted and unseen (a new generation); the
+    ## next pass clears the film and starts sample 0.
     func forget_passes():
+        self.generation += 1
         self.older_completes = 0
         self.newer_completes = 0
         self.sample = 0
@@ -422,7 +451,15 @@ pub struct Renderer:
         if samples == 0: error(invalid, "a render needs samples")
         self.settings.samples = samples
 
-    ## Retire the older pass if it has finished: its samples and image size count.
+    ## Retire every pass in flight that has finished, oldest first.
+    func retire_finished() -> !:
+        while self.older != none:
+            let running = self.older else return
+            if not (try running.done()): return
+            try self.retire()
+
+    ## Retire the older pass if it has finished: its samples count, and its
+    ## display image is shown if it wrote one in the current generation.
     func retire() -> !:
         let running = self.older else return
         if not (try running.done()): return
@@ -434,13 +471,19 @@ pub struct Renderer:
             for at in 1..<self.marks.count:
                 self.kernel_ns[(usize)self.marks.items[at]] += (f64)(stamps[at] - stamps[at - 1])
         finished.close()
-        self.completed = self.older_completes
-        self.shown_width = self.older_size[0]
-        self.shown_height = self.older_size[1]
+        if self.older_generation == self.generation:
+            self.completed = self.older_completes
+            if self.older_slot >= 0:
+                self.front = (usize)self.older_slot
+                self.shown_width = self.older_size[0]
+                self.shown_height = self.older_size[1]
         self.older = self.newer
         self.older_completes = self.newer_completes
         self.older_size = self.newer_size
+        self.older_slot = self.newer_slot
+        self.older_generation = self.newer_generation
         self.newer = none
+        self.newer_slot = -1
 
     ## Start the next pass if the last has finished. True while there is work,
     ## running or to come; false once every sample is in the image.
@@ -455,6 +498,7 @@ pub struct Renderer:
             if not self.display_stale: return in_flight > 0
             # Only the display changed: convert the film again.
             self.display_stale = false
+            self.writing = (i64)self.free_slot()
             var convert = try gpu.Compute.begin(self.device)
             errdefer convert.close()
             var block: u8[104]
@@ -466,6 +510,10 @@ pub struct Renderer:
             self.queue_pass(convert, self.sample)
             return true
         self.display_stale = false
+        # Only a sample's last band converts the film: a whole image, into a
+        # display image no one shows or writes.
+        let bands = (self.pixels() + self.pool - 1) // self.pool
+        self.writing = (i64)self.free_slot() if self.band + 1 == bands else -1
         var pass = try gpu.Compute.begin(self.device)
         errdefer pass.close()
         self.marks.clear()
@@ -476,7 +524,6 @@ pub struct Renderer:
         try self.record(&pass)
         if self.settings.profile: try self.mark(&pass, kind_rest)
         try pass.submit()
-        let bands = (self.pixels() + self.pool - 1) // self.pool
         self.band += 1
         if self.band == bands:
             self.band = 0
@@ -484,17 +531,33 @@ pub struct Renderer:
         self.queue_pass(pass, self.sample)
         return true
 
-    ## Hold a submitted pass: the samples every pixel has once it finishes.
+    ## Hold a submitted pass: the samples every pixel has once it finishes, the
+    ## display image it writes and its generation.
     func queue_pass(pass: gpu.Compute, completes: u32):
         let size: u32[2] = [self.frame.width, self.frame.height]
         if self.older == none:
             self.older = pass
             self.older_completes = completes
             self.older_size = size
+            self.older_slot = self.writing
+            self.older_generation = self.generation
         else:
             self.newer = pass
             self.newer_completes = completes
             self.newer_size = size
+            self.newer_slot = self.writing
+            self.newer_generation = self.generation
+        self.writing = -1
+
+    ## A display image neither shown nor written by a pass in flight (of three,
+    ## with at most two passes in flight, one is always free).
+    func free_slot() -> usize:
+        for slot in 0..<(usize)3:
+            if slot == self.front: continue
+            if self.older != none and self.older_slot == (i64)slot: continue
+            if self.newer != none and self.newer_slot == (i64)slot: continue
+            return slot
+        return self.front
 
     ## Run every remaining pass to the end (offline renders and tests).
     pub func finish() -> !:
@@ -513,12 +576,14 @@ pub struct Renderer:
     pub func image() -> gpu.Texture:
         return self.output
 
-    ## The render ready to show: exposed, in linear Rec.709, through the view.
+    ## The render ready to show: exposed, in linear Rec.709, through the view
+    ## (rgba16f). Always one whole image of one view; passes in flight never
+    ## write it.
     pub func display() -> gpu.Texture:
-        return self.shown
+        return self.shown[self.front]
 
-    ## The size of the image the last finished pass left in `display`, from
-    ## its top-left corner ((0, 0) before the first).
+    ## The size of the image in `display`, from its top-left corner ((0, 0)
+    ## before the first whole sample).
     pub func shown_size() -> u32[2]:
         return [self.shown_width, self.shown_height]
 
@@ -598,7 +663,8 @@ pub struct Renderer:
             let y = (self.frame.height + 7) // 8
             try self.dispatch(pass, &self.loaded.kernels.adaptive, block, start, count, 0, 0, x, y)
             try self.dispatch(pass, &self.loaded.kernels.adaptive, block, start, count, 0, 1, x, y)
-        try self.dispatch(pass, &self.loaded.kernels.film_convert, block, start, count, 0, self.light_samples, (self.frame.width + 7) // 8, (self.frame.height + 7) // 8)
+        if self.writing >= 0:
+            try self.dispatch(pass, &self.loaded.kernels.film_convert, block, start, count, 0, self.light_samples, (self.frame.width + 7) // 8, (self.frame.height + 7) // 8)
 
     ## The push constants after the camera frame: band, sample and step.
     func uniforms(block: u8[], start: usize, count: usize, current: u32, phase: u32):
@@ -610,7 +676,7 @@ pub struct Renderer:
         var all: gpu.Binding[16] = [gpu.Binding(buffer = self.scene.nodes), gpu.Binding(buffer = self.scene.positions), gpu.Binding(buffer = self.scene.indices),
                                     gpu.Binding(buffer = self.loaded.lights), gpu.Binding(buffer = self.state_v), gpu.Binding(buffer = self.state_u),
                                     gpu.Binding(buffer = self.queues), gpu.Binding(buffer = self.film), gpu.Binding(texture = self.output),
-                                    gpu.Binding(buffer = self.loaded.constants), gpu.Binding(texture = self.shown),
+                                    gpu.Binding(buffer = self.loaded.constants), gpu.Binding(texture = self.shown[(usize)self.writing if self.writing >= 0 else self.front]),
                                     gpu.Binding(buffer = self.scene.shading), gpu.Binding(buffer = self.loaded.materials),
                                     gpu.Binding(filter = gpu.Filter.linear), gpu.Binding(), gpu.Binding(buffer = self.loaded.emitters)]
         if self.scene.accelerated: all[14] = gpu.Binding(accel = self.scene.tlas)

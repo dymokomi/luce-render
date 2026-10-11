@@ -1,0 +1,128 @@
+## What a viewport shows of an interactive render, frame by frame: the session
+## advances the renderer a pass, then draws `display()`'s top-left
+## `shown_size()`, and the GPU runs that draw after every pass submitted before
+## it. Restarted mid-pass, through another view and another size, in several
+## bands a sample, the image shown must always be one whole image of one
+## configuration (the view before, or the view after), never a mix of the two
+## nor a sample still missing bands.
+import memory
+from luce_std import math
+from luce_gpu import gpu
+from luce_render import render
+from luce_geocore.geocore import Vector3, MeshPrimitives, GeometrySet
+import interop
+
+pub func checks(device: gpu.Device) -> !:
+    let ball = try MeshPrimitives.sphere(0.6, 24)
+    defer ball.release()
+    let floor = try MeshPrimitives.grid(10.0, 4)
+    defer floor.release()
+    let sphere = try GeometrySet.of_mesh(ball)
+    defer sphere.release()
+    let ground = try GeometrySet.of_mesh(floor)
+    defer ground.release()
+    let both = try sphere.value().merged(ground)
+    defer both.release()
+    let lit = try both.value().with_light("/key", Vector3(0.0, 3.0, 0.0), Vector3(-0.5 * math.pi, 0.0, 0.0), 0, Vector3(1.0, 1.0, 1.0), 6.0, 0.0, 0.0, false, 2.0, 2.0, 0.5, 0.0, false)
+    defer lit.release()
+    var scene = try render.compile_scene(lit.value())
+    defer scene.close()
+    # One sample a pixel in bands of 400 paths (four bands at 48 x 32), no
+    # light paths: every whole image of a view is the same, pixel for pixel.
+    var settings = render.RenderSettings.of(48, 32, 1)
+    settings.max_bounces = 3
+    settings.pool = 400
+    settings.light_tracing = 0.0
+    let a = try view(Vector3(0.0, 1.5, 4.0), 48, 32)
+    let b = try view(Vector3(3.0, 2.5, 1.0), 48, 32)
+    let small = try view(Vector3(-2.0, 1.0, 3.0), 24, 16)
+    var references: Reference[3]
+    references[0] = try reference(device, &scene, settings, a)
+    references[1] = try reference(device, &scene, settings, b)
+    references[2] = try reference(device, &scene, settings, small)
+    defer:
+        for at in 0..<(usize)3: references[at].close()
+
+    var renderer = try render.Renderer.create_viewed(device, &scene, settings, a)
+    defer renderer.destroy()
+    try renderer.finish()
+    try shows_whole(&renderer, references[..<3], "A finished")
+    # Frame by frame: restart to B after a pass, to the small view after
+    # another, then frames until it finishes; every frame shows a whole image.
+    var frame = 0
+    for step in [1, 2, 0, 0, 0, 0, 0, 0, 0, 0]:
+        if step == 1: try renderer.restart(b)
+        if step == 2: try renderer.restart(small)
+        _ = try renderer.advance()
+        try shows_whole(&renderer, references[..<3], "frame", frame)
+        frame += 1
+    try renderer.finish()
+    try shows_whole(&renderer, references[2..<3], "the small view finished")
+    print("PASS display: restarted mid-pass through other views and sizes, every frame shows one whole image of one view")
+
+## A view's whole one-sample image, as `display()` holds it.
+struct Reference:
+    var width: u32
+    var height: u32
+    var pixels: f32[]
+
+    func close():
+        if self.pixels.length > 0: free(self.pixels) in memory.heap
+
+func reference(device: gpu.Device, scene: const render.CompiledScene*, settings: render.RenderSettings, frame: render.RayFrame) -> Reference!:
+    var renderer = try render.Renderer.create_viewed(device, scene, settings, frame)
+    defer renderer.destroy()
+    try renderer.finish()
+    return Reference(frame.width, frame.height, try shown_pixels(&renderer))
+
+## The pixels a draw now would show: `display()`'s `shown_size()` corner, read
+## after every pass submitted so far, as RGBA floats.
+func shown_pixels(renderer: render.Renderer*) -> f32[]!:
+    let size = renderer.shown_size()
+    let texture = renderer.display()
+    let count = (usize)size[0] * (usize)size[1] * 4
+    let wide = (try texture.pixel_format()) == gpu.Format.rgba32_float
+    let bytes = try new u8[count * (4 if wide else 2)] --- in memory.heap
+    defer free(bytes) in memory.heap
+    try texture.read(bytes, gpu.Region(0, 0, size[0], size[1]))
+    let out = try new f32[count] --- in memory.heap
+    for at in 0..<count:
+        out[at] = memory.read[f32]((const void*)&bytes[at * 4]) if wide else half(memory.read[u16]((const void*)&bytes[at * 2]))
+    return out
+
+## IEEE half to float.
+func half(bits: u16) -> f32:
+    let exponent = ((u32)bits >> 10) & 31
+    let fraction = (f32)((u32)bits & 1023)
+    var magnitude: f32 = 0.0
+    if exponent == 0: magnitude = fraction * (f32)math.pow(2.0, -24.0)
+    else: magnitude = (1.0 + fraction / 1024.0) * (f32)math.pow(2.0, (f64)exponent - 15.0)
+    return -magnitude if ((u32)bits & 32768) != 0 else magnitude
+
+## The shown image is one of `references` whole: its size, and every pixel
+## within half-float rounding.
+func shows_whole(renderer: render.Renderer*, references: const Reference[], what: str, frame: i64 = -1) -> !:
+    let size = renderer.shown_size()
+    let shown = try shown_pixels(renderer)
+    defer free(shown) in memory.heap
+    for candidate in references:
+        if candidate.width != size[0] or candidate.height != size[1]: continue
+        var matches = true
+        for at in 0..<shown.length:
+            if math.abs((f64)shown[at] - (f64)candidate.pixels[at]) > 0.002 + 0.002 * math.abs((f64)candidate.pixels[at]):
+                matches = false
+                break
+        if matches: return
+    var differing: usize = 0
+    var first: usize = shown.length
+    if size[0] == references[0].width and size[1] == references[0].height:
+        for at in 0..<shown.length:
+            if math.abs((f64)shown[at] - (f64)references[0].pixels[at]) > 0.002 + 0.002 * math.abs((f64)references[0].pixels[at]):
+                differing += 1
+                if first == shown.length: first = at // 4
+    print(f"{what} {frame}: the {size[0]} x {size[1]} image shown is no view's whole image ({differing} channels differ from the first view's, from pixel {first})")
+    assert(false)
+
+## A 40° view from `eye` at the sphere.
+func view(eye: Vector3, width: u32, height: u32) -> render.RayFrame!:
+    return try render.look_frame(eye, Vector3().subtract(eye), Vector3(0.0, 1.0, 0.0), math.tan(20.0 * math.pi / 180.0), width, height)

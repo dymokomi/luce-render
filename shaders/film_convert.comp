@@ -10,7 +10,7 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 #include "common.glsl"
 layout(set = 0, binding = 8, rgba32f) writeonly uniform image2D image;
-layout(set = 0, binding = 10, rgba32f) writeonly uniform image2D display;
+layout(set = 0, binding = 10, rgba16f) writeonly uniform image2D display;
 
 // ACEScg to linear Rec.709, Bradford-adapted from the ACES white to D65.
 const mat3 acescg_to_rec709 = mat3(1.70505, -0.13026, -0.02400,
