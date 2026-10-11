@@ -534,7 +534,9 @@ and replaces each only when what it follows changes:
   (blocks are never changed in place).
 - **`RenderSession`** compiles on a thread of its own (the bonsai capture takes
   about 2.6 s), queues a newer scene behind a running compile, and picks the
-  result up in `draw`. A finished reload still shows when a newer scene is
+  result up in `draw` (or `advance`, which draws nothing: `show` then draws
+  the image, `shown_width` × `shown_height`, which a viewport compares with
+  its own size before showing it). A finished reload still shows when a newer scene is
   queued (a light dragged changes the set every frame), and while a reload is
   on its way `look` only places the view the reload starts through. `look` places a view, and `start_view` renders through
   it. Neither the albedo tables nor the BLAS build blocks the caller: later

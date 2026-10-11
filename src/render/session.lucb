@@ -352,6 +352,14 @@ pub struct RenderSession:
     ## Advance the render a pass and draw it fitted into (x, y, width, height) of
     ## `target`; whether passes are still coming.
     pub func draw(target: interop.View[gpu.RenderTarget], x: f64, y: f64, width: f64, height: f64) -> bool!:
+        let busy = try self.advance(target)
+        try self.show(target, x, y, width, height)
+        return busy
+
+    ## Advance the render a pass, drawing nothing (a viewport that shows
+    ## something else until the image suits it); whether passes are still
+    ## coming.
+    pub func advance(target: interop.View[gpu.RenderTarget]) -> bool!:
         let native = try target.get()
         try self.collect()
         if not (try self.take_waiting(native)): return false
@@ -363,8 +371,15 @@ pub struct RenderSession:
             return false
         self.renderer = renderer
         if not busy and self.took == 0.0 and self.compiling == none: self.took = self.started.elapsed().seconds()
+        return busy or self.compiling != none
+
+    ## Draw the image shown, if any, fitted into (x, y, width, height) of
+    ## `target`.
+    pub func show(target: interop.View[gpu.RenderTarget], x: f64, y: f64, width: f64, height: f64) -> !:
+        let renderer = self.renderer else return
         let shown = renderer.shown_size()
-        if shown[0] == 0 or shown[1] == 0: return busy or self.compiling != none
+        if shown[0] == 0 or shown[1] == 0: return
+        let native = try target.get()
         let image_width = (f64)shown[0]
         let image_height = (f64)shown[1]
         let scale = math.min(width / image_width, height / image_height)
@@ -372,7 +387,6 @@ pub struct RenderSession:
         let shown_height = image_height * scale
         let area = gpu.Rect(x + 0.5 * (width - shown_width), y + 0.5 * (height - shown_height), shown_width, shown_height)
         try gpu.draw_image(native, renderer.display(), area, gpu.Region(0, 0, shown[0], shown[1]), 1.0, gpu.Filter.linear)
-        return busy or self.compiling != none
 
     func note(message: str) -> !:
         self.problem_text.clear()
@@ -391,6 +405,17 @@ pub struct RenderSession:
     pub func has_image() -> bool:
         let renderer = self.renderer else return false
         return renderer.shown_size()[0] > 0
+
+    ## The size of the image `show` draws, in pixels (0 without one): the
+    ## size of the view it was rendered through, which may be an earlier
+    ## view's (the image stays until the current view's first whole sample).
+    pub func shown_width() -> i64:
+        let renderer = self.renderer else return 0
+        return (i64)renderer.shown_size()[0]
+
+    pub func shown_height() -> i64:
+        let renderer = self.renderer else return 0
+        return (i64)renderer.shown_size()[1]
 
     pub func samples_done() -> i64:
         let renderer = self.renderer else return 0
