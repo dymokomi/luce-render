@@ -153,11 +153,13 @@ pub struct RenderSession:
 
     ## Place the view (a viewport's camera): at `position`, looking along
     ## `forward`, `up` toward the image's top, `tan_half_height` the tangent of
-    ## half the vertical field of view, `width` × `height` pixels. A render in
-    ## progress starts over through it without loading anything again.
-    pub func look(position: Vector3, forward: Vector3, up: Vector3, tan_half_height: f64, width: i64, height: i64) -> !:
+    ## half the vertical field of view, `width` × `height` pixels; an
+    ## `orthographic` view is `2 · tan_half_height` scene units tall instead,
+    ## its rays parallel. A render in progress starts over through it without
+    ## loading anything again.
+    pub func look(position: Vector3, forward: Vector3, up: Vector3, tan_half_height: f64, width: i64, height: i64, orthographic: bool = false) -> !:
         if width < 1 or height < 1 or width > 16384 or height > 16384: error(invalid, "an image is 1 to 16384 pixels on a side")
-        self.framing = try look_frame(position, forward, up, tan_half_height, (u32)width, (u32)height)
+        self.framing = try look_frame(position, forward, up, tan_half_height, (u32)width, (u32)height, orthographic)
         self.viewing = true
         self.settings.width = (u32)width
         self.settings.height = (u32)height

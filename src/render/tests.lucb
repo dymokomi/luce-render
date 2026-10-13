@@ -80,6 +80,16 @@ test "a camera's ray frame fits its film horizontally and looks down -Z":
     let (_, top) = frame.ray(100.0, 0.0)
     assert(math.abs(top.y - 0.5) < 1e-9)
 
+test "an orthographic view looks along its forward from every point of its film":
+    let frame = look_frame(Vector3(0.0, 10.0, 0.0), Vector3(0.0, -1.0, 0.0), Vector3(0.0, 0.0, -1.0), 2.0, 200, 100, orthographic = true) catch failure: trap(failure.message)
+    assert(frame.orthographic)
+    # 4 units tall, 8 wide: the top-left corner 4 left and 2 up (-Z) of the eye.
+    let (corner, along) = frame.ray(0.0, 0.0)
+    assert(math.abs(corner.x + 4.0) < 1e-9 and math.abs(corner.z + 2.0) < 1e-9 and corner.y == 10.0)
+    assert(along.y == -1.0 and along.x == 0.0)
+    let (middle, _) = frame.ray(100.0, 50.0)
+    assert(math.abs(middle.x) < 1e-9 and math.abs(middle.z) < 1e-9)
+
 test "a color's spectrum fit returns it through the film, and white is a constant":
     let to_acescg = film_matrix()
     let white = fit_spectrum(Vector3(1.0, 1.0, 1.0))

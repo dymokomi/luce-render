@@ -78,16 +78,18 @@ pub func ray_frame(object: SceneObject, width: u32, height: u32) -> RayFrame!:
 ## The pinhole frame of a view the caller places (a viewport's camera): at
 ## `position`, looking along `forward` with `up` toward the image's top, its
 ## image `2 · tan_half_height` tall at unit distance (tan of half the vertical
-## field of view) and as wide as `width` × `height` makes it.
-pub func look_frame(position: Vector3, forward: Vector3, up: Vector3, tan_half_height: f64, width: u32, height: u32) -> RayFrame!:
+## field of view) and as wide as `width` × `height` makes it. An
+## `orthographic` view's image is `2 · tan_half_height` scene units tall
+## around `position`, its rays parallel along `forward`.
+pub func look_frame(position: Vector3, forward: Vector3, up: Vector3, tan_half_height: f64, width: u32, height: u32, orthographic: bool = false) -> RayFrame!:
     if width == 0 or height == 0: error(invalid, "an image needs pixels")
-    if not (tan_half_height > 0.0 and tan_half_height < 1e6): error(invalid, "a view needs a field of view between 0 and 180 degrees")
+    if not (tan_half_height > 0.0 and tan_half_height < 1e6): error(invalid, "a view needs a field of view between 0 and 180 degrees, or a height")
     let ahead = try forward.normalized()
     let right = try ahead.cross(up).normalized()
     let above = right.cross(ahead)
     let half_height = tan_half_height
     let half_width = half_height * (f64)width / (f64)height
-    let corner = right.multiply_scalar(-half_width).add(above.multiply_scalar(half_height)).add(ahead)
+    let corner = right.multiply_scalar(-half_width).add(above.multiply_scalar(half_height)).add(Vector3() if orthographic else ahead)
     let du = right.multiply_scalar(2.0 * half_width / (f64)width)
     let dv = above.multiply_scalar(-2.0 * half_height / (f64)height)
-    return RayFrame(position, corner, du, dv, ahead, false, width, height, 0.0, 1.0)
+    return RayFrame(position, corner, du, dv, ahead, orthographic, width, height, 0.0, 1.0)
