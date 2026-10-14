@@ -509,7 +509,7 @@ and replaces each only when what it follows changes:
 
 | State | Follows | Replaced by |
 | --- | --- | --- |
-| Geometry: `GpuScene`, the triangles' and splats' buffers, BVHs, BLAS and TLAS | meshes and clouds | a new renderer |
+| Geometry: `GpuScene`, the triangles' and splats' buffers, BVHs, BLAS and TLAS | meshes and clouds | `Renderer.replace_scene` |
 | Loaded: lights and their tree, materials, textures, programs, constants, specialized kernels | lights, materials, settings | `Renderer.reload` |
 | View: path state, film, images | camera and size | `Renderer.restart` |
 
@@ -517,7 +517,7 @@ and replaces each only when what it follows changes:
   uploaded; the next pass clears the film; passes still in flight finish
   uncounted and unseen (a new generation). A smaller view fills the images'
   top-left corner (`shown_size`); only a larger one makes the view's buffers
-  again.
+  again, with a quarter's room each way (a window resized makes them seldom).
 - **What shows is always one whole image of one view.** A UI draws after the
   passes it submitted, so an image a pass in flight writes would show before the
   pass counts: part of a new view over an old one, a sample missing bands, a
@@ -525,10 +525,22 @@ and replaces each only when what it follows changes:
   the film, into one of three rgba16f display images (never the one shown, nor
   one a pass in flight writes), and that image is shown once its pass finishes
   in the current generation. Until then the last whole image stays.
-- **`reload(scene, settings)`:** the same geometry with other lights or
+- **`reload(scene, settings, frame)`:** the same geometry with other lights or
   materials. `compile_scene(set, geometry = false)` makes such a scene without
   splats or BVHs; reload puts its triangles in the BVH's leaf order
-  (`CompiledScene.order`) and uploads the per-triangle shading again.
+  (`CompiledScene.order`) and uploads the per-triangle shading again. A
+  renderer that keeps its triangles (`keep_geometry`, as a session's does)
+  passes its materials to the compile (`known`): when the set's are the same
+  paths in the same order the compile leaves the meshes out
+  (`meshes_kept`) and the reload lends it the kept triangles, uploading none.
+  Kernels built for the same features are taken over; image files come from
+  the renderer's `ImageStore`, read again only when one changed on disk.
+- **`replace_scene(scene, settings, frame)`:** new geometry in the same
+  renderer: the view's buffers and images stay, so the last image shows until
+  the new scene's first whole sample. A device that traces rays in hardware
+  needs no software BVH, and a session's compiles build none there.
+- Materials no triangle uses (`CompiledScene.used`) load no textures or
+  programs and turn on no kernel feature.
 - **`same_geometry(a, b)`** tells when that holds: the meshes and clouds have
   the same shape and placement, and are made of the same geocore array blocks
   (blocks are never changed in place).
@@ -539,7 +551,10 @@ and replaces each only when what it follows changes:
   its own size before showing it). A finished reload still shows when a newer scene is
   queued (a light dragged changes the set every frame), and while a reload is
   on its way `look` only places the view the reload starts through. `look` places a view, and `start_view` renders through
-  it. Neither the albedo tables nor the BLAS build blocks the caller: later
+  it. A newer scene stops a whole-geometry compile it supersedes at its next
+  component, and `stop` leaves a compile to end on its thread. A compile's end
+  wakes the session's waker (`wake_with`); `wants_frames` says whether drawing
+  moves anything on, so a view draws nothing while a scene compiles. Neither the albedo tables nor the BLAS build blocks the caller: later
   passes are ordered after them on the queue.
 
 `tests/gpu/interactive.lucb` checks restarts through other views and sizes,

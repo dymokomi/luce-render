@@ -162,7 +162,7 @@ struct StoredDome:
 ## The programs of `materials`' node graphs and the textures they read
 ## (from `store`), on `device`; the table always has at least one texture
 ## (kernels that sample need one bound).
-pub func load_textures(device: gpu.Device, materials: const Materials*, store: ImageStore*) -> MaterialTextures!:
+pub func load_textures(device: gpu.Device, materials: const Materials*, store: ImageStore*, used: const bool[]) -> MaterialTextures!:
     var assets = MaterialTextures(Growing[f32](), Growing[u32](), Growing[gpu.Texture](), Growing[u64](), gpu.TextureTable(), device, store, gpu.Texture())
     errdefer:
         assets.white.destroy()
@@ -175,7 +175,10 @@ pub func load_textures(device: gpu.Device, materials: const Materials*, store: I
     for index in 0..<materials.count():
         let graph = materials.find_text(index, "shader_graph")
         var entry: i64 = -1
-        if graph.length > 0: entry = try compile_graph(graph, ImageSlots(image_slot, (void*)&assets), &assets.programs)
+        # A material no triangle uses compiles nothing and reads no image
+        # (`used` by material index: the library's are 1 on).
+        let wanted = used.length == 0 or (index + 1 < used.length and used[index + 1])
+        if graph.length > 0 and wanted: entry = try compile_graph(graph, ImageSlots(image_slot, (void*)&assets), &assets.programs)
         try assets.entries.push((f32)entry)
     if assets.textures.count == 0:
         assets.white = try gpu.Texture.create(device, 1, 1, gpu.Format.rgba8_linear)

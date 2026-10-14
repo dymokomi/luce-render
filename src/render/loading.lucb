@@ -102,7 +102,7 @@ struct Loaded:
         # The materials' textures (slots a material, the default's first),
         # and the buffers kernels reach by address: the albedo tables and the
         # triangles' texture coordinates.
-        var textures = try load_textures(device, &scene.materials, images)
+        var textures = try load_textures(device, &scene.materials, images, scene.used.view())
         errdefer textures.destroy()
         var programs = try buffer_of(device, u8[]((u8*)textures.programs.items.data, textures.programs.count * 4))
         errdefer programs.destroy()
@@ -122,7 +122,7 @@ struct Loaded:
         for index in 0..<library.count:
             let material = library.items[index]
             try pack_material(material, textures.entries.items[index], &records)
-            cutouts = cutouts or material.geometry_opacity < 1.0
+            cutouts = cutouts or (in_use(scene.used.view(), index) and material.geometry_opacity < 1.0)
         rows[3] = 1.0 if cutouts else 0.0
         # Domes and distant lights with a size start light paths too, on a disk
         # around what casts caustics (shaders/lights.glsl), sharing them with
@@ -153,7 +153,7 @@ struct Loaded:
         # light count, guiding, light paths, programs and splats.
         var has_programs = false
         for entry in textures.entries.view(): has_programs = has_programs or entry >= 0.0
-        var features = scene_features(library.view(), light_count, settings, tracing, has_programs, uploaded.splat_count > 0)
+        var features = scene_features(library.view(), scene.used.view(), light_count, settings, tracing, has_programs, uploaded.splat_count > 0)
         var kernels = Kernels.take_or_create(device, settings.spectral, uploaded.accelerated, features, reuse) catch failure:
             error(failure.code, failure.message)
         errdefer kernels.destroy()
@@ -186,13 +186,14 @@ struct Loaded:
 ## The specialization constants of the integrator kernels (shaders/common.glsl):
 ## which material features the scene uses, cut-outs, guiding, the light count,
 ## light tracing, node graphs, splats.
-func scene_features(library: const OpenPbr[], light_count: usize, settings: RenderSettings, light_tracing: bool, programs: bool, splats: bool) -> gpu.Constant[10]:
+func scene_features(library: const OpenPbr[], used: const bool[], light_count: usize, settings: RenderSettings, light_tracing: bool, programs: bool, splats: bool) -> gpu.Constant[10]:
     var coat = false
     var transmission = false
     var metal = false
     var emission = false
     var cutouts = false
-    for material in library:
+    for (index, material) in library.indexed():
+        if not in_use(used, index): continue
         coat = coat or material.coat_weight > 0.0
         transmission = transmission or material.transmission_weight > 0.0
         metal = metal or material.base_metalness > 0.0
@@ -202,6 +203,12 @@ func scene_features(library: const OpenPbr[], light_count: usize, settings: Rend
             gpu.Constant.boolean(3, emission), gpu.Constant.boolean(4, cutouts), gpu.Constant.boolean(5, settings.guiding),
             gpu.Constant.uint32(6, (u32)light_count), gpu.Constant.boolean(7, light_tracing), gpu.Constant.boolean(8, programs),
             gpu.Constant.boolean(9, splats)]
+
+## Whether material `index` (0 the default) is used by a triangle; every one
+## is when the scene says nothing (no triangles were compiled).
+func in_use(used: const bool[], index: usize) -> bool:
+    if used.length == 0: return true
+    return index < used.length and used[index]
 
 ## Whether a material casts caustics: it refracts, or reflects sharply
 ## enough (metal, glossy specular or a clear coat) to focus light.

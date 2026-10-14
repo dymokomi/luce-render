@@ -977,6 +977,9 @@ func swap_geometry(a: CompiledScene*, b: CompiledScene*):
     let uvs = a.uvs
     a.uvs = b.uvs
     b.uvs = uvs
+    let used = a.used
+    a.used = b.used
+    b.used = used
 
 ## A side of `wanted` pixels with room to grow: a quarter more, in steps of
 ## 64, at most 16384 (and never less than the side held, `held`).

@@ -57,6 +57,10 @@ pub struct CompiledScene:
     ## Without software trees (a device that traces rays in hardware): half
     ## the triangles' bounds' diagonal, which the BVH's root gives otherwise.
     pub var radius: f64
+    ## Which materials the triangles use, by material index (0 the default,
+    ## then the library's): what is not used loads no textures or programs
+    ## and turns on no kernel feature (a cut-out's eight more rounds).
+    pub var used: Growing[bool]
 
     pub func init():
         self.positions = Growing[f32]()
@@ -72,6 +76,7 @@ pub struct CompiledScene:
         self.splats = CompiledSplats()
         self.meshes_kept = false
         self.radius = 0.0
+        self.used = Growing[bool]()
 
     pub func triangle_count() -> usize:
         return self.indices.count // 3
@@ -85,6 +90,7 @@ pub struct CompiledScene:
         self.faces.close()
         self.shading.close()
         self.uvs.close()
+        self.used.close()
         self.nodes.close()
         self.order.close()
         self.objects.close()
@@ -107,6 +113,7 @@ pub func compile_scene(set: const GeometrySet*, geometry: bool = true, stopping:
     errdefer scene.close()
     var face_base: u32 = 0
     try materials_flattened(set, &scene.materials)
+    try scene.used.fill(scene.materials.count() + 1, false)
     if not geometry:
         if let held = known: scene.meshes_kept = same_paths(&scene.materials, held)
     try add_set(&scene, set, Matrix4(), &face_base, 0, geometry, stopping, not scene.meshes_kept)
@@ -255,6 +262,8 @@ func add_mesh(scene: CompiledScene*, mesh: const Mesh*, matrix: Matrix4, face_ba
     defer normals.close()
     let face_materials = try material_indices(&scene.materials, mesh)
     defer free(face_materials) in memory.heap
+    for material in face_materials:
+        if (usize)material < scene.used.count: scene.used.items[(usize)material] = true
     let uv = texture_coordinates(mesh)
     # The uv column read directly, not through a checked call per value.
     var uv_entry: const Attribute*? = none
