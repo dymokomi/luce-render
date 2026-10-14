@@ -30,7 +30,6 @@ struct Loaded:
     var emitters: gpu.Buffer
     ## The materials' textures, and the triangles' texture coordinates.
     var textures: MaterialTextures
-    var uvs: gpu.Buffer
     ## The materials' node-graph programs (shader_graph.lucb).
     var programs: gpu.Buffer
     var light_count: usize
@@ -47,8 +46,10 @@ struct Loaded:
     ## albedo `tables`, for views like `frame` (light paths need a perspective
     ## one). The view rows are left for `show_view`.
     ## Image files come from `images` (read only when new or changed).
+    ## `reuse`: the kernels of the load this one replaces, taken over when
+    ## they were built for the same features.
     pub static func create(device: gpu.Device, scene: const CompiledScene*, settings: RenderSettings, radius: f64, uploaded: const GpuScene*, tables: const gpu.Buffer*, frame: const RayFrame*,
-                           images: ImageStore*) -> Loaded!:
+                           images: ImageStore*, reuse: Kernels*? = none) -> Loaded!:
         var packed = Growing[f32]()
         defer packed.close()
         # The first dome with an image lights by it (environment.lucb).
@@ -103,16 +104,10 @@ struct Loaded:
         # triangles' texture coordinates.
         var textures = try load_textures(device, &scene.materials, images)
         errdefer textures.destroy()
-        var corner_uvs = Growing[f32]()
-        defer corner_uvs.close()
-        try corner_uvs.assign(scene.uvs.view())
-        while corner_uvs.count < 6: try corner_uvs.push(0.0)
-        var uvs = try buffer_of(device, u8[]((u8*)corner_uvs.items.data, corner_uvs.count * 4))
-        errdefer uvs.destroy()
         var programs = try buffer_of(device, u8[]((u8*)textures.programs.items.data, textures.programs.count * 4))
         errdefer programs.destroy()
         memory.write[u64]((void*)&rows[92], try tables.address())
-        memory.write[u64]((void*)&rows[94], try uvs.address())
+        memory.write[u64]((void*)&rows[94], try uploaded.uvs.address())
         memory.write[u64]((void*)&rows[96], try programs.address())
         # The splats, reached by address (shaders/splats.glsl: K_SPLATS, K_SPLAT_TREE).
         let splat_addresses = try uploaded.splat_addresses()
@@ -132,11 +127,20 @@ struct Loaded:
         # Domes and distant lights with a size start light paths too, on a disk
         # around what casts caustics (shaders/lights.glsl), sharing them with
         # the tree's emitters by power.
-        let (focus, focus_radius, casters) = caster_bounds(scene, library.view())
-        var afar = false
+        # What casts caustics is looked for only when such lights would aim
+        # light paths at it.
+        var distant = false
         for index in 0..<light_count:
             let kind = packed.items[index * light_stride * 4 + 3]
-            if kind == 4.0 or (kind == 3.0 and packed.items[index * light_stride * 4 + 11] < 1.0 - 1e-7): afar = casters
+            if kind == 4.0 or (kind == 3.0 and packed.items[index * light_stride * 4 + 11] < 1.0 - 1e-7): distant = true
+        var focus = Vector3()
+        var focus_radius = 1.0
+        var afar = false
+        if distant and settings.light_tracing > 0.0 and not frame.orthographic:
+            let (center, reach, casters) = caster_bounds(scene, library.view())
+            focus = center
+            focus_radius = reach
+            afar = casters
         let afar_power = distant_power * (focus_radius / radius) * (focus_radius / radius) if afar else 0.0
         let afar_share = afar_power / (afar_power + tree.energy) if afar_power + tree.energy > 0.0 else 0.0
         let emit_rows: f64[8] = [afar_share, focus_radius, 0.0, 0.0, focus.x, focus.y, focus.z, 0.0]
@@ -150,10 +154,11 @@ struct Loaded:
         var has_programs = false
         for entry in textures.entries.view(): has_programs = has_programs or entry >= 0.0
         var features = scene_features(library.view(), light_count, settings, tracing, has_programs, uploaded.splat_count > 0)
-        var kernels = try Kernels.create(device, settings.spectral, uploaded.accelerated, features)
+        var kernels = Kernels.take_or_create(device, settings.spectral, uploaded.accelerated, features, reuse) catch failure:
+            error(failure.code, failure.message)
         errdefer kernels.destroy()
         let materials = try buffer_of(device, u8[]((u8*)records.items.data, records.count * 4))
-        return Loaded(kernels, lights, constants, materials, emitters, textures, uvs, programs, light_count, 8 if cutouts else 0, tracing, radius)
+        return Loaded(kernels, lights, constants, materials, emitters, textures, programs, light_count, 8 if cutouts else 0, tracing, radius)
 
     ## Light paths a sample for a view of `pixels` traced in bands of `band`
     ## paths: light tracing's share of the pixels, at most a band's (they take
@@ -176,7 +181,6 @@ struct Loaded:
         self.materials.destroy()
         self.emitters.destroy()
         self.textures.destroy()
-        self.uvs.destroy()
         self.programs.destroy()
 
 ## The specialization constants of the integrator kernels (shaders/common.glsl):
@@ -231,7 +235,8 @@ func caster_bounds(scene: const CompiledScene*, library: const OpenPbr[]) -> (Ve
 ## Half the diagonal of the triangles' bounds, by the BVH's root (1 for a
 ## scene without triangles or BVH, and at least 1).
 func scene_radius(scene: const CompiledScene*) -> f64:
-    if scene.point_count() == 0 or scene.nodes.count == 0: return 1.0
+    if scene.point_count() == 0: return 1.0
+    if scene.nodes.count == 0: return math.max(1.0, scene.radius)
     let root = scene.nodes.items[0]
     let d = Vector3((f64)(root.hi.x - root.lo.x), (f64)(root.hi.y - root.lo.y), (f64)(root.hi.z - root.lo.z))
     return math.max(1.0, 0.5 * d.length())

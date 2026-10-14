@@ -140,6 +140,44 @@ struct Kernels:
     var adaptive: Kernel
     var guide_fit: Kernel
     var light_emit: Kernel
+    ## What they were built for: the spectral or RGB build, hardware rays,
+    ## and the scene's features; and whether a later load took them over
+    ## (then this owner frees nothing).
+    var spectral: bool = false
+    var rays: bool = false
+    var features: gpu.Constant[10]
+    var taken: bool = false
+
+    ## A successful load's borrowed kernels become its own, `older` (the
+    ## load it replaces) giving them up.
+    func adopt(older: Kernels*):
+        if not self.taken: return
+        older.taken = true
+        self.taken = false
+
+    ## Whether these serve a load of the same build and features (a light or
+    ## a material's values changed): the load takes them instead of making
+    ## and checking ten kernels again.
+    func serves(spectral: bool, rays: bool, features: const gpu.Constant[10]*) -> bool:
+        if self.taken or spectral != self.spectral or rays != self.rays: return false
+        for at in 0..<(usize)10:
+            let a = self.features[at]
+            let b = (*features)[at]
+            if a.id != b.id or a.kind != b.kind or a.bits != b.bits: return false
+        return true
+
+    ## `reuse`'s kernels when they serve this build, else new ones.
+    static func take_or_create(device: gpu.Device, spectral: bool, rays: bool, features: const gpu.Constant[10], reuse: Kernels*?) -> Kernels!:
+        if let older = reuse:
+            if older.serves(spectral, rays, &features): return older.take()
+        return try Kernels.create(device, spectral, rays, features)
+
+    ## The same kernels, borrowed (`taken`: freeing them frees nothing) until
+    ## the load holding them succeeds and `adopt` makes them its own.
+    func take() -> Kernels:
+        var borrowed = self
+        borrowed.taken = true
+        return borrowed
 
     ## The build's kernels; intersection by hardware ray queries when `rays`.
     static func create(device: gpu.Device, spectral: bool, rays: bool, constants: const gpu.Constant[]) -> Kernels!:
@@ -163,7 +201,7 @@ struct Kernels:
             var fit = try Kernel.create(device, constants, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
             errdefer fit.kernel.destroy()
             let emit = try Kernel.create(device, constants, light_emit_comp_words, light_emit_comp_msl, light_emit_comp_group, light_emit_comp_bindings)
-            return Kernels(camera, closest, surface, miss, shadow, finish, convert, adaptive, fit, emit)
+            return Kernels(camera, closest, surface, miss, shadow, finish, convert, adaptive, fit, emit, spectral, rays, keyed(constants))
         var camera = try Kernel.create(device, constants, camera_rgb_comp_words, camera_rgb_comp_msl, camera_rgb_comp_group, camera_rgb_comp_bindings)
         errdefer camera.kernel.destroy()
         var closest = try intersect_kernel(device, false, rays, constants)
@@ -183,9 +221,10 @@ struct Kernels:
         var fit = try Kernel.create(device, constants, guide_fit_comp_words, guide_fit_comp_msl, guide_fit_comp_group, guide_fit_comp_bindings)
         errdefer fit.kernel.destroy()
         let emit = try Kernel.create(device, constants, light_emit_rgb_comp_words, light_emit_rgb_comp_msl, light_emit_rgb_comp_group, light_emit_rgb_comp_bindings)
-        return Kernels(camera, closest, surface, miss, shadow, finish, convert, adaptive, fit, emit)
+        return Kernels(camera, closest, surface, miss, shadow, finish, convert, adaptive, fit, emit, spectral, rays, keyed(constants))
 
     func destroy():
+        if self.taken: return
         self.camera.kernel.destroy()
         self.intersect_closest.kernel.destroy()
         self.shade_surface.kernel.destroy()
@@ -196,6 +235,13 @@ struct Kernels:
         self.adaptive.kernel.destroy()
         self.guide_fit.kernel.destroy()
         self.light_emit.kernel.destroy()
+
+## The ten features as a kernel set keeps them.
+func keyed(constants: const gpu.Constant[]) -> gpu.Constant[10]:
+    var key: gpu.Constant[10] = [gpu.Constant.uint32(0, 0), gpu.Constant.uint32(0, 0), gpu.Constant.uint32(0, 0), gpu.Constant.uint32(0, 0), gpu.Constant.uint32(0, 0),
+                                 gpu.Constant.uint32(0, 0), gpu.Constant.uint32(0, 0), gpu.Constant.uint32(0, 0), gpu.Constant.uint32(0, 0), gpu.Constant.uint32(0, 0)]
+    for at in 0..<(constants.length if constants.length < 10 else 10): key[at] = constants[at]
+    return key
 
 ## Intersection kernels serve both builds: they read no spectra.
 ## Closest hits, spectral or RGB (splats add their emission in the build's terms).
@@ -285,6 +331,12 @@ pub struct Renderer:
     var lights_in_pass: u32
     ## The image files the loaded scene reads, kept across reloads.
     var images: ImageStore = ImageStore()
+    ## The scene's triangles in the BVH's order and its materials, as the
+    ## last load had them (`keep_geometry`): a reload whose materials are
+    ## the same reads its emitters and casters from them instead of
+    ## converting every mesh again.
+    var kept: CompiledScene = CompiledScene()
+    var keeps: bool = false
 
     ## A renderer of `scene` through its camera (see RenderSettings.camera). The
     ## scene's buffers are uploaded; `scene` may be closed afterwards.
@@ -297,6 +349,25 @@ pub struct Renderer:
     ## A renderer of `scene` through `frame`, a view of the caller's (a
     ## viewport's camera, `look_frame`), in place of a scene camera; its size is
     ## the image's. `restart` moves it.
+    ## Keep `scene`'s triangles and materials (its arrays swapped for the
+    ## renderer's last ones, which the caller closes with it).
+    pub func keep_geometry(scene: CompiledScene*):
+        swap_geometry(&self.kept, scene)
+        let materials = self.kept.materials
+        self.kept.materials = scene.materials
+        scene.materials = materials
+        self.keeps = true
+
+    ## The materials the kept triangles' indices name, when it keeps them.
+    pub func kept_materials() -> const Materials*?:
+        if not self.keeps: return none
+        return &self.kept.materials
+
+    ## Whether `frame` keeps this renderer's projection (perspective or
+    ## orthographic): a scene replaced or a restart through it may.
+    pub func projection_matches(frame: RayFrame) -> bool:
+        return frame.orthographic == self.frame.orthographic
+
     ## Image files read so far (tests: a reload reads none it already has).
     pub func image_reads() -> i64:
         return self.images.reads
@@ -309,6 +380,8 @@ pub struct Renderer:
         chosen.height = frame.height
         var uploaded = try GpuScene.upload(device, scene, not settings.software_bvh)
         errdefer uploaded.destroy()
+        if not uploaded.accelerated and scene.nodes.count == 0 and scene.triangle_count() > 0:
+            error(invalid, "a scene compiled without its BVH needs hardware ray tracing")
         var tables = try shared_tables(device)
         # The guiding grid only when guiding: a placeholder holds its address.
         var guide = try gpu.Buffer.allocate(device, guide_bytes if chosen.guiding else 16)
@@ -399,8 +472,10 @@ pub struct Renderer:
         if frame.orthographic != self.frame.orthographic: error(invalid, "a restart keeps the view's projection")
         try self.retire_finished()
         if (usize)frame.width * (usize)frame.height > self.capacity or frame.width > self.image_width or frame.height > self.image_height:
+            # Room for a quarter more each way: a view growing a few pixels
+            # at a time (a window resized) makes its buffers again seldom.
             try self.settle()
-            try self.allocate_view(frame.width, frame.height)
+            try self.allocate_view(roomy(frame.width, self.image_width), roomy(frame.height, self.image_height))
         self.frame = frame
         self.settings.width = frame.width
         self.settings.height = frame.height
@@ -415,7 +490,14 @@ pub struct Renderer:
     ## would, the view's constants sent once).
     pub func reload(scene: CompiledScene*, settings: RenderSettings, frame: RayFrame? = none) -> !:
         if let wanted = frame: try self.place(wanted)
-        if scene.nodes.count == 0 and scene.triangle_count() > 0:
+        # Triangles left out (the materials are the same): the kept ones are
+        # lent for the load and taken back after it.
+        let lent = scene.meshes_kept and self.keeps
+        if scene.meshes_kept and not self.keeps: error(invalid, "a reload without triangles needs the renderer's kept")
+        if lent: swap_geometry(&self.kept, scene)
+        defer:
+            if lent: swap_geometry(&self.kept, scene)
+        if not lent and scene.nodes.count == 0 and scene.triangle_count() > 0 and self.order.count > 0:
             if scene.triangle_count() != self.order.count: error(invalid, "a reload keeps the scene's geometry")
             try reorder(scene, self.order.view())
         if settings.samples == 0 or settings.max_bounces == 0 or settings.max_bounces > 1024: error(invalid, "a render needs samples and 1 to 1024 bounces")
@@ -426,31 +508,80 @@ pub struct Renderer:
         chosen.pool = self.settings.pool
         chosen.software_bvh = self.settings.software_bvh
         # The radius is the geometry's, which `scene` may have no BVH to tell.
+        # New shading and texture coordinates first: the load reaches them
+        # by address.
+        if not lent: try self.scene.replace_shading(self.device, scene)
         self.images.begin()
-        var loaded = try Loaded.create(self.device, scene, chosen, self.loaded.radius, &self.scene, &self.tables, &self.frame, &self.images)
+        var loaded = try Loaded.create(self.device, scene, chosen, self.loaded.radius, &self.scene, &self.tables, &self.frame, &self.images, &self.loaded.kernels)
         errdefer loaded.destroy()
-        try self.scene.replace_shading(self.device, scene)
         # Light paths need slots: a view made without them grows its state.
         let pixels = self.pixels()
         let band = self.pool if self.pool < pixels else pixels
         let grow = band + loaded.light_paths(chosen, pixels, band) > self.slots
-        # Guiding turned on: its grid, in place of the placeholder (passes
-        # made while it was off never read it).
-        if chosen.guiding and self.guide.bytes() < guide_bytes:
-            var guide = try gpu.Buffer.allocate(self.device, guide_bytes)
-            errdefer guide.destroy()
-            self.guide_address = try guide.address()
-            self.guide.destroy()
-            self.guide = guide
+        try self.grow_guide(chosen)
+        loaded.kernels.adopt(&self.loaded.kernels)
         self.loaded.destroy()
         self.loaded = loaded
         self.images.settle()
+        if not lent and self.keeps: self.keep_geometry(scene)
+        elif lent:
+            let materials = self.kept.materials
+            self.kept.materials = scene.materials
+            scene.materials = materials
         self.settings = chosen
         if grow:
             try self.settle()
             try self.allocate_view(self.image_width, self.image_height)
         try self.show_view()
         self.forget_passes()
+
+    ## Take new geometry (`scene`, compiled whole) in place of this one's,
+    ## keeping the view's buffers and images: the last image stays shown
+    ## until the new scene's first whole sample replaces it, and nothing of
+    ## the view is made again. The passes on the old geometry are waited for
+    ## before its buffers go. `settings` keep the pool and BVH choice.
+    pub func replace_scene(scene: CompiledScene*, settings: RenderSettings, frame: RayFrame) -> !:
+        if settings.samples == 0 or settings.max_bounces == 0 or settings.max_bounces > 1024: error(invalid, "a render needs samples and 1 to 1024 bounces")
+        if settings.pool != self.settings.pool or settings.software_bvh != self.settings.software_bvh: error(invalid, "a scene replaced keeps the pool and BVH choice")
+        try self.place(frame)
+        try self.retire_finished()
+        var chosen = settings
+        chosen.width = self.settings.width
+        chosen.height = self.settings.height
+        var uploaded = try GpuScene.upload(self.device, scene, not chosen.software_bvh)
+        errdefer uploaded.destroy()
+        if not uploaded.accelerated and scene.nodes.count == 0 and scene.triangle_count() > 0:
+            error(invalid, "a scene compiled without its BVH needs hardware ray tracing")
+        self.images.begin()
+        var loaded = try Loaded.create(self.device, scene, chosen, scene_radius(scene), &uploaded, &self.tables, &self.frame, &self.images, &self.loaded.kernels)
+        errdefer loaded.destroy()
+        try self.order.assign(scene.order.view())
+        try self.grow_guide(chosen)
+        try self.settle()
+        loaded.kernels.adopt(&self.loaded.kernels)
+        self.loaded.destroy()
+        self.scene.destroy()
+        self.loaded = loaded
+        self.scene = uploaded
+        self.images.settle()
+        if self.keeps: self.keep_geometry(scene)
+        self.settings = chosen
+        let pixels = self.pixels()
+        let band = self.pool if self.pool < pixels else pixels
+        if band + self.loaded.light_paths(chosen, pixels, band) > self.slots:
+            try self.allocate_view(self.image_width, self.image_height)
+        try self.show_view()
+        self.forget_passes()
+
+    ## Guiding turned on: its grid, in place of the placeholder (passes
+    ## made while it was off never read it).
+    func grow_guide(chosen: RenderSettings) -> !:
+        if not chosen.guiding or self.guide.bytes() >= guide_bytes: return
+        var guide = try gpu.Buffer.allocate(self.device, guide_bytes)
+        errdefer guide.destroy()
+        self.guide_address = try guide.address()
+        self.guide.destroy()
+        self.guide = guide
 
     ## Passes in flight finish uncounted and unseen (a new generation); the
     ## next pass clears the film and starts sample 0.
@@ -764,6 +895,7 @@ pub struct Renderer:
         self.newer = none
         self.loaded.destroy()
         self.images.close()
+        self.kept.close()
         self.scene.destroy()
         self.guide.destroy()
         self.release_view()
@@ -827,3 +959,28 @@ func find_camera(scene: const CompiledScene*, index: i64) -> usize!:
     for at in 0..<scene.objects.count():
         if scene.objects.object(at).kind == SceneKind.camera: return at
     error(invalid, "the scene has no camera")
+
+## Swap the triangle arrays of `a` and `b`.
+func swap_geometry(a: CompiledScene*, b: CompiledScene*):
+    let positions = a.positions
+    a.positions = b.positions
+    b.positions = positions
+    let indices = a.indices
+    a.indices = b.indices
+    b.indices = indices
+    let faces = a.faces
+    a.faces = b.faces
+    b.faces = faces
+    let shading = a.shading
+    a.shading = b.shading
+    b.shading = shading
+    let uvs = a.uvs
+    a.uvs = b.uvs
+    b.uvs = uvs
+
+## A side of `wanted` pixels with room to grow: a quarter more, in steps of
+## 64, at most 16384 (and never less than the side held, `held`).
+func roomy(wanted: u32, held: u32) -> u32:
+    var side = (wanted + wanted // 4 + 63) // 64 * 64
+    if side < held: side = held
+    return side if side <= 16384 else 16384

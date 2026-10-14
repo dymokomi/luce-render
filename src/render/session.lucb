@@ -41,14 +41,26 @@ struct Compiling:
     ## Asked when a newer scene makes this one's upload pointless, or the
     ## render stops: the compile ends at its next component.
     var stopping: Stopping
+    ## A reload's copy of the renderer's materials (`knows`): the same ones
+    ## leave the triangles out (compile_scene's `known`).
+    var known: Materials
+    var knows: bool
+    ## Whether to build the software BVHs (not for a device that traces in
+    ## hardware).
+    var trees: bool
+    ## Woken from the compile's thread once it has finished (the session's
+    ## waker, held by `waker_hold` until the thread is joined).
+    var waker: wake.Waker*?
+    var waker_hold: interop.Reference[wake.Waker]?
 
 func compile_entry(context: void*?):
     let job = (Compiling*)(context else return)
-    job.scene = compile_scene(job.storage, job.geometry, &job.stopping) catch failure:
+    job.scene = compile_scene(job.storage, job.geometry, &job.stopping, &job.known if job.knows else none, job.trees) catch failure:
         job.failed = true
         append_text(&job.message, failure.message) catch _: _ = 0
         recover CompiledScene()
     job.finished.store(1, .release)
+    if let waker = job.waker: waker.wake()
 
 pub struct RenderSession:
     var device: gpu.Device
@@ -95,6 +107,9 @@ pub struct RenderSession:
     var compiles: i64
     var uploads: i64
     var reloads: i64
+    ## Woken when a compile finishes (wake_with): a viewport waits for a
+    ## scene without drawing frames for it.
+    var waker: interop.Reference[wake.Waker]?
 
     pub func init():
         self.device = gpu.Device()
@@ -128,6 +143,7 @@ pub struct RenderSession:
         self.compiles = 0
         self.uploads = 0
         self.reloads = 0
+        self.waker = none
 
     pub static func make() -> interop.Reference[RenderSession]!:
         return try interop.Reference[RenderSession].adopt(try new RenderSession() in memory.heap, render_session_type, memory.heap)
@@ -279,6 +295,21 @@ pub struct RenderSession:
             dispose_storage(storage)
             error(failure.code, failure.message)
         job.finished.store(0, .relaxed)
+        job.known = Materials()
+        job.knows = false
+        job.waker = none
+        job.waker_hold = none
+        job.trees = not self.traces_in_hardware()
+        if let told = self.waker:
+            job.waker = try told.get()
+            job.waker_hold = told.clone()
+        if reloads:
+            if let running = self.renderer:
+                if let held = running.kept_materials():
+                    job.known.add_all(held) catch failure:
+                        release_job(job)
+                        error(failure.code, failure.message)
+                    job.knows = true
         job.thread = thread.spawn(compile_entry, (void*)job, name = "render compile") catch failure:
             release_job(job)
             error(failure.code, failure.message)
@@ -346,6 +377,23 @@ pub struct RenderSession:
                 self.renderer = renderer
                 self.reloads += 1
                 return true
+        # New geometry into the renderer there is: its view's buffers and
+        # image stay (a different projection or pool makes a new one).
+        if let running = self.renderer:
+            var renderer = running
+            let made = renderer.render_settings()
+            if made.pool == self.settings.pool and made.software_bvh == self.settings.software_bvh and renderer.projection_matches(frame):
+                renderer.replace_scene(&held, self.settings, frame) catch failure:
+                    try self.note(failure.message)
+                    self.stop()
+                    return false
+                renderer.set_display(self.exposure_stops, self.view) catch failure:
+                    error(failure.code, failure.message)
+                self.renderer = renderer
+                if let older = self.geometry_set: older.release()
+                self.geometry_set = set.clone()
+                self.uploads += 1
+                return true
         self.destroy_renderer()
         var made = Renderer.create_viewed(self.device, &held, self.settings, frame) catch failure:
             try self.note(failure.message)
@@ -353,6 +401,8 @@ pub struct RenderSession:
         made.set_display(self.exposure_stops, self.view) catch failure:
             made.destroy()
             error(failure.code, failure.message)
+        # Its triangles and materials stay with it, for reloads.
+        made.keep_geometry(&held)
         self.renderer = made
         self.geometry_set = set.clone()
         self.uploads += 1
@@ -400,6 +450,30 @@ pub struct RenderSession:
     func note(message: str) -> !:
         self.problem_text.clear()
         try append_text(&self.problem_text, message)
+
+    ## Whether renderers here trace in hardware (known once a draw named the
+    ## device): their compiles need no software BVH.
+    func traces_in_hardware() -> bool:
+        if not self.device.is_open() or self.settings.software_bvh: return false
+        let limits = self.device.limits() catch failure: return false
+        return limits.ray_query
+
+    ## Wake `waker` (luce-ui's notifier's) from now on when a compile
+    ## finishes, so a view need not draw frames while one runs
+    ## (`wants_frames`).
+    pub func wake_with(waker: interop.Reference[wake.Waker]):
+        if let older = self.waker: older.release()
+        self.waker = waker.clone()
+
+    ## Whether drawing a frame moves anything on: a compiled scene waits to be
+    ## taken, or samples are still to come. A compile alone does not: its
+    ## end wakes the waker.
+    pub func wants_frames() -> bool:
+        if self.waiting != none: return true
+        if let job = self.compiling:
+            if self.waker == none or job.finished.load(.acquire) != 0: return true
+        let renderer = self.renderer else return false
+        return renderer.samples_done() < self.settings.samples
 
     ## Whether a render is in progress, compiling or waiting for its first draw.
     pub func running() -> bool:
@@ -526,6 +600,8 @@ pub struct RenderSession:
             job.scene.close()
             release_job(job)
         self.retiring.close()
+        if let held = self.waker: held.release()
+        self.waker = none
         if self.device.is_open(): self.device.destroy()
         self.problem_text.close()
         self.camera_path.close()
@@ -534,6 +610,8 @@ pub let render_session_type: interop.Type[RenderSession] = interop.Type[RenderSe
 
 ## Free a collected (or never started) compile: its set, storage and message.
 func release_job(job: Compiling*):
+    if let held = job.waker_hold: held.release()
+    job.known.close()
     job.set.release()
     dispose_storage(job.storage)
     job.message.close()

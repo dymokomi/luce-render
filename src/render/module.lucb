@@ -40,6 +40,7 @@ from luce_std import math
 from luce_std import math32
 from luce_std import parallel
 from luce_std import files
+from luce_std import wake
 import strings
 from luce_exr import exr
 from luce_png import png

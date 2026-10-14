@@ -112,7 +112,10 @@ pub func build_light_tree(scene: const CompiledScene*, lights: const f32[], ligh
         let energy = math.max(0.0, luminance(rgb)) * area * math.pi
         try emitters.push(Emitter(position.subtract(extent), position.add(extent), normal, theta_o, 0.5 * math.pi, energy, (u32)index))
     let p = scene.positions.view()
-    for triangle in 0..<scene.triangle_count():
+    # No material emits (the usual scene): no triangle is an emitter.
+    var emissive = false
+    for m in materials: emissive = emissive or m.emission_luminance > 0.0
+    for triangle in 0..<(scene.triangle_count() if emissive else 0):
         let material = scene.shading.items[triangle * 4 + 3]
         if (usize)material >= materials.length: continue
         let m = materials[(usize)material]

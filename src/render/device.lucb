@@ -19,6 +19,9 @@ pub struct GpuScene:
     pub var indices: gpu.Buffer
     pub var faces: gpu.Buffer
     pub var shading: gpu.Buffer
+    ## Six f32s a triangle: its corners' texture coordinates (reached by
+    ## address: shaders/openpbr.glsl).
+    pub var uvs: gpu.Buffer
     ## Hardware ray tracing's view of the scene, where the device has it: a
     ## BLAS of the triangles (instance mask 1) and one of the splats' boxes
     ## (mask 2), each where the scene has some, in one TLAS.
@@ -46,6 +49,8 @@ pub struct GpuScene:
         errdefer faces.destroy()
         var shading = try buffer_of(device, u8[]((u8*)scene.shading.items.data, scene.shading.count * 4))
         errdefer shading.destroy()
+        var uvs = try uv_buffer(device, scene)
+        errdefer uvs.destroy()
         let splats = &scene.splats
         var splat_records = try buffer_of(device, u8[]((u8*)splats.records.items.data, splats.records.count * 4))
         errdefer splat_records.destroy()
@@ -55,7 +60,7 @@ pub struct GpuScene:
         errdefer splat_boxes.destroy()
         var splat_nodes = try buffer_of(device, u8[]((u8*)splats.nodes.items.data, splats.nodes.count * memory.size_of(BvhNode)))
         errdefer splat_nodes.destroy()
-        var uploaded = GpuScene(nodes, positions, indices, faces, shading, false, gpu.Blas(), gpu.Blas(), gpu.Tlas(), splats.count(),
+        var uploaded = GpuScene(nodes, positions, indices, faces, shading, uvs, false, gpu.Blas(), gpu.Blas(), gpu.Tlas(), splats.count(),
                                 splat_records, splat_harmonics, splat_boxes, splat_nodes)
         if not accelerate or (scene.triangle_count() == 0 and splats.count() == 0) or not (try device.limits()).ray_query:
             return uploaded
@@ -87,9 +92,13 @@ pub struct GpuScene:
     ## place of these: the same geometry with its materials assigned anew
     ## (Renderer.reload).
     pub func replace_shading(device: gpu.Device, scene: const CompiledScene*) -> !:
-        let shading = try buffer_of(device, u8[]((u8*)scene.shading.items.data, scene.shading.count * 4))
+        var shading = try buffer_of(device, u8[]((u8*)scene.shading.items.data, scene.shading.count * 4))
+        errdefer shading.destroy()
+        let uvs = try uv_buffer(device, scene)
         self.shading.destroy()
         self.shading = shading
+        self.uvs.destroy()
+        self.uvs = uvs
 
     ## The splat buffers' addresses for the kernels' constants (splats.glsl):
     ## records, harmonics and the software BVH.
@@ -98,6 +107,7 @@ pub struct GpuScene:
 
     pub func destroy():
         self.nodes.destroy()
+        self.uvs.destroy()
         self.positions.destroy()
         self.indices.destroy()
         self.faces.destroy()
@@ -148,3 +158,10 @@ pub func probe(device: gpu.Device, scene: const GpuScene*, frame: const RayFrame
         let face = memory.read[u32]((const void*)&bytes[at * 8])
         let distance = memory.read[f32]((const void*)&bytes[at * 8 + 4])
         out[at] = Probe(none if face == 4294967295 else face, distance)
+
+## The triangles' texture coordinates on `device` (one triangle's worth of
+## zeros at least: kernels read a buffer).
+func uv_buffer(device: gpu.Device, scene: const CompiledScene*) -> gpu.Buffer!:
+    if scene.uvs.count >= 6: return try buffer_of(device, u8[]((u8*)scene.uvs.items.data, scene.uvs.count * 4))
+    var zeros: f32[6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    return try buffer_of(device, u8[]((u8*)&zeros[0], 24))

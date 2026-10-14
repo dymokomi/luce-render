@@ -96,6 +96,26 @@ pub func checks(device: gpu.Device) -> !:
     if math.abs(ratio - 2.0) > 0.02:
         print(f"a light twice as bright gives {ratio} times the light")
         assert(false)
+    # The renderer keeping its triangles: a reload compile with its
+    # materials leaves the meshes out, and renders the same.
+    renderer.keep_geometry(&scene)
+    var kept_known = renderer.kept_materials() else trap("kept materials")
+    var light_only = try render.compile_scene(brighter.value(), false, none, kept_known)
+    defer light_only.close()
+    assert(light_only.meshes_kept and light_only.triangle_count() == 0)
+    try renderer.reload(&light_only, settings)
+    try renderer.finish()
+    try renderer.read(again)
+    try agree("reloaded keeping its triangles", fresh, again)
+    # Other geometry into the same renderer (its view kept): as a renderer
+    # made for it renders.
+    var other = try render.compile_scene(moved.value())
+    defer other.close()
+    try renderer.replace_scene(&other, settings, a)
+    try renderer.finish()
+    try renderer.read(again)
+    try rendered(device, moved.value(), settings, a, fresh)
+    try agree("another scene in the same renderer", fresh, again)
     print("PASS interactive: restarts through other views and sizes, with passes in flight, and reloads with other lights agree with fresh renders")
 
 func with_key(set: interop.Reference[GeometrySet], intensity: f64) -> interop.Reference[GeometrySet]!:
