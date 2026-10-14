@@ -251,11 +251,14 @@ func add_mesh(scene: CompiledScene*, mesh: const Mesh*, matrix: Matrix4, face_ba
         scene.positions.items[scene.positions.count + 2] = (f32)placed.z
         scene.positions.count += 3
     let count = triangles.length // 3
-    var normals = try shading_normals(mesh)
+    var normals = try shading_normals(mesh, matrix)
     defer normals.close()
     let face_materials = try material_indices(&scene.materials, mesh)
     defer free(face_materials) in memory.heap
     let uv = texture_coordinates(mesh)
+    # The uv column read directly, not through a checked call per value.
+    var uv_entry: const Attribute*? = none
+    if uv.0 >= 0: uv_entry = try mesh.attribute_entry(uv.0)
     try scene.uvs.reserve(scene.uvs.count + count * 6)
     try scene.indices.reserve(scene.indices.count + count * 3)
     try scene.faces.reserve(scene.faces.count + count)
@@ -265,22 +268,13 @@ func add_mesh(scene: CompiledScene*, mesh: const Mesh*, matrix: Matrix4, face_ba
             let corner = (usize)triangles[at * 3 + k]
             scene.indices.items[scene.indices.count + k] = base + (u32)corners[corner]
             let element = normals.element(corner, (usize)corners[corner], (usize)corner_faces[corner])
-            # A singular placement leaves no normal to transform: any will do, as
-            # it flattens the triangle to nothing.
-            let normal = matrix.transform_normal(normals.values.items[element].vector()) catch failure:
-                _ = failure
-                recover Vector3(0.0, 1.0, 0.0)
-            scene.shading.items[scene.shading.count + k] = octahedral(normal)
+            scene.shading.items[scene.shading.count + k] = normals.encoded.items[element]
             var u: f64 = 0.0
             var v: f64 = 0.0
-            if uv.0 >= 0:
-                let uv_at = (i64)uv_element(uv.1, corner, (usize)corners[corner], (usize)corner_faces[corner], uv.2)
-                u = mesh.attribute_value(uv.0, uv_at, 0) catch failure:
-                    _ = failure
-                    recover 0.0
-                v = mesh.attribute_value(uv.0, uv_at, 1) catch failure:
-                    _ = failure
-                    recover 0.0
+            if let entry = uv_entry:
+                let uv_at = uv_element(uv.1, corner, (usize)corners[corner], (usize)corner_faces[corner], uv.2)
+                u = entry.number(uv_at, 0)
+                v = entry.number(uv_at, 1)
             scene.uvs.items[scene.uvs.count + k * 2] = (f32)u
             scene.uvs.items[scene.uvs.count + k * 2 + 1] = (f32)v
         scene.shading.items[scene.shading.count + 3] = face_materials[(usize)corner_faces[(usize)triangles[at * 3]]]
@@ -339,9 +333,11 @@ func uv_element(domain: i64, corner: usize, point: usize, face: usize, single: b
     if domain == 0: return point
     return face
 
-## A mesh's shading normals and the domain they are indexed by.
+## A mesh's shading normals placed by its matrix and encoded (octahedral),
+## one per element of their domain: each element once, however many
+## corners share it.
 struct ShadingNormals:
-    var values: Growing[Float3]
+    var encoded: Growing[u32]
     ## 0 point, 1 corner, 2 face, 3 detail.
     var domain: i64
 
@@ -352,22 +348,43 @@ struct ShadingNormals:
         return 0
 
     func close():
-        self.values.close()
+        self.encoded.close()
 
-func shading_normals(mesh: const Mesh*) -> ShadingNormals!:
-    var values = Growing[Float3]()
-    errdefer values.close()
+## The authored N (corner, point, face, detail) else the smooth normals, read
+## where they are (no copy), placed by `matrix` (its inverse transpose, made
+## once) and encoded.
+func shading_normals(mesh: const Mesh*, matrix: Matrix4) -> ShadingNormals!:
+    # The cofactors carry the inverse transpose up to the determinant's
+    # size; its sign keeps a mirroring placement's normals outward. A
+    # singular placement flattens its triangles to nothing: any normal does.
+    let determinant = matrix.determinant()
+    let sign = 1.0 if determinant >= 0.0 else -1.0
+    let singular = determinant == 0.0 or not math.is_finite(determinant)
+    let c0 = matrix.y.cross(matrix.z).multiply_scalar(sign)
+    let c1 = matrix.z.cross(matrix.x).multiply_scalar(sign)
+    let c2 = matrix.x.cross(matrix.y).multiply_scalar(sign)
+    var encoded = Growing[u32]()
+    errdefer encoded.close()
     let domains: i64[4] = [1, 0, 2, 3]
     for domain in domains:
         let index = mesh.find_attribute("N", domain)
         if index < 0 or (try mesh.attribute_width(index)) < 3 or (try mesh.attribute_integer(index)): continue
         let tuples = try mesh.attribute_tuples(index)
+        var values = Growing[Float3]()
+        defer values.close()
         try values.fill(tuples, Float3(0.0, 1.0, 0.0))
         try mesh.pack_attribute3(index, f32[]((f32*)values.items.data, tuples * 3))
-        return ShadingNormals(values, 3 if (try mesh.attribute_storage(index)) == 1 else domain)
-    let smooth = try mesh.smooth_normal_span()
-    try values.assign(smooth)
-    return ShadingNormals(values, 1 if (try mesh.smooth_normals_corner_domain()) else 0)
+        try encode_all(values.view(), c0, c1, c2, singular, &encoded)
+        return ShadingNormals(encoded, 3 if (try mesh.attribute_storage(index)) == 1 else domain)
+    try encode_all(try mesh.smooth_normal_span(), c0, c1, c2, singular, &encoded)
+    return ShadingNormals(encoded, 1 if (try mesh.smooth_normals_corner_domain()) else 0)
+
+func encode_all(normals: const Float3[], c0: Vector3, c1: Vector3, c2: Vector3, singular: bool, out: Growing[u32]*) -> !:
+    try out.fill(normals.length, 0)
+    for at in 0..<normals.length:
+        let n = normals[at].vector()
+        let placed = Vector3(0.0, 1.0, 0.0) if singular else c0.multiply_scalar(n.x).add(c1.multiply_scalar(n.y)).add(c2.multiply_scalar(n.z))
+        out.items[at] = octahedral(placed)
 
 ## A unit vector as two snorm16 octahedral coordinates (x in the low half), as
 ## GLSL's unpackSnorm2x16 reads them.

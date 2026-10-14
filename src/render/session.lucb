@@ -289,7 +289,9 @@ pub struct RenderSession:
         if let running = self.renderer:
             if let held = self.geometry_set:
                 let made = running.render_settings()
-                reloads = made.pool == self.settings.pool and made.software_bvh == self.settings.software_bvh and (try same_geometry(try set.get(), try held.get()))
+                # The renderer's own set needs no comparing.
+                let same = (try set.get()) == (try held.get()) or (try same_geometry(try set.get(), try held.get()))
+                reloads = made.pool == self.settings.pool and made.software_bvh == self.settings.software_bvh and same
         let storage = try (try set.get()).storage()
         let job = new Compiling(set = set.clone(), storage = storage, geometry = not reloads, scene = CompiledScene(), failed = false, message = Growing[u8]()) in memory.heap catch failure:
             dispose_storage(storage)
