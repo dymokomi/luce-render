@@ -38,10 +38,13 @@ struct Compiling:
     var message: Growing[u8]
     var finished: @u32
     var thread: thread.Handle
+    ## Asked when a newer scene makes this one's upload pointless, or the
+    ## render stops: the compile ends at its next component.
+    var stopping: Stopping
 
 func compile_entry(context: void*?):
     let job = (Compiling*)(context else return)
-    job.scene = compile_scene(job.storage, job.geometry) catch failure:
+    job.scene = compile_scene(job.storage, job.geometry, &job.stopping) catch failure:
         job.failed = true
         append_text(&job.message, failure.message) catch _: _ = 0
         recover CompiledScene()
@@ -52,6 +55,8 @@ pub struct RenderSession:
     ## The compile in progress, and a scene started meanwhile (which replaces
     ## it once it finishes); then the compiled scene waiting for the next draw.
     var compiling: Compiling*?
+    ## Compiles stopped and left to end on their threads, freed once they have.
+    var retiring: Growing[Compiling*]
     var queued: interop.Reference[GeometrySet]?
     var waiting: CompiledScene?
     ## Whether `waiting` is only what a reload needs (the geometry is the renderer's).
@@ -94,6 +99,7 @@ pub struct RenderSession:
     pub func init():
         self.device = gpu.Device()
         self.compiling = none
+        self.retiring = Growing[Compiling*]()
         self.queued = none
         self.waiting = none
         self.waiting_reloads = false
@@ -250,9 +256,13 @@ pub struct RenderSession:
             self.waiting = none
         if let older = self.waiting_set: older.release()
         self.waiting_set = none
-        if self.compiling != none:
+        if let job = self.compiling:
             if let older = self.queued: older.release()
             self.queued = set.clone()
+            # A whole upload would be replaced as soon as it showed: stop it.
+            # A reload (lights, materials) finishes and shows, so a scene
+            # changing every frame is seen changing.
+            if job.geometry: job.stopping.ask()
             return
         try self.spawn(set)
 
@@ -277,6 +287,7 @@ pub struct RenderSession:
 
     ## A finished compile becomes the waiting scene; a queued set starts next.
     func collect() -> !:
+        self.reap()
         let job = self.compiling else return
         if job.finished.load(.acquire) == 0: return
         job.thread.join() catch _: _ = 0
@@ -328,11 +339,7 @@ pub struct RenderSession:
         if self.waiting_reloads:
             if let running = self.renderer:
                 var renderer = running
-                renderer.reload(&held, self.settings) catch failure:
-                    try self.note(failure.message)
-                    self.stop()
-                    return false
-                renderer.restart(frame) catch failure:
+                renderer.reload(&held, self.settings, frame) catch failure:
                     try self.note(failure.message)
                     self.stop()
                     return false
@@ -467,13 +474,18 @@ pub struct RenderSession:
             try renderer.set_display(exposure, view)
             self.renderer = renderer
 
-    ## End the render; its image goes too. A compile in progress is waited for.
+    ## End the render; its image goes too. A compile in progress is asked to
+    ## stop and left to end on its thread (never waited for here).
     pub func stop():
         if let job = self.compiling:
-            job.thread.join() catch _: _ = 0
-            job.scene.close()
-            release_job(job)
+            job.stopping.ask()
             self.compiling = none
+            self.retiring.push(job) catch failure:
+                # No room to keep it: wait for it, as a last resort.
+                _ = failure
+                job.thread.join() catch _: _ = 0
+                job.scene.close()
+                release_job(job)
         if let next = self.queued: next.release()
         self.queued = none
         if let scene = self.waiting:
@@ -492,8 +504,28 @@ pub struct RenderSession:
         if let set = self.geometry_set: set.release()
         self.geometry_set = none
 
+    ## Free the stopped compiles that have ended.
+    func reap():
+        var kept: usize = 0
+        for at in 0..<self.retiring.count:
+            let job = self.retiring.items[at]
+            if job.finished.load(.acquire) == 0:
+                self.retiring.items[kept] = job
+                kept += 1
+                continue
+            job.thread.join() catch _: _ = 0
+            job.scene.close()
+            release_job(job)
+        self.retiring.count = kept
+
     pub func close():
         self.stop()
+        # Closing: the stopped compiles end soon; wait for them.
+        for job in self.retiring.view():
+            job.thread.join() catch _: _ = 0
+            job.scene.close()
+            release_job(job)
+        self.retiring.close()
         if self.device.is_open(): self.device.destroy()
         self.problem_text.close()
         self.camera_path.close()

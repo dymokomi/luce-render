@@ -579,6 +579,17 @@ func dome_sun(device: gpu.Device, spectral: bool) -> !:
     let expected = 0.5 / math.pi * irradiance
     print(f"dome sun (spectral {spectral}): {measured.x} {measured.y} {measured.z}, expected {expected}")
     assert(math.abs(measured.y / expected - 1.0) < 0.02)
+    # Reloads (a light or a material changed) keep the dome's image: read once.
+    var scene = try render.compile_scene(set.value())
+    defer scene.close()
+    var renderer = try render.Renderer.create(device, &scene, settings)
+    defer renderer.destroy()
+    for round in 0..<3:
+        _ = round
+        var again = try render.compile_scene(set.value(), false)
+        defer again.close()
+        try renderer.reload(&again, settings)
+    assert(renderer.image_reads() == 1)
 
 ## The rect light over a floor whose grey comes from a texture through a node
 ## graph (an image node driving base_color): an sRGB PNG of 188s (0.502

@@ -114,15 +114,18 @@ pub struct SpectrumFit:
         let x = (lambda - lambda_min) / (lambda_max - lambda_min)
         return self.scale * sigmoid((self.c0 * x + self.c1) * x + self.c2)
 
-## The XYZ (relative to E, normalized per channel) of the fit's sigmoid alone.
-func fit_xyz(k: Vector3, integrals: Vector3) -> Vector3:
+## The fit's wavelengths, 5 nm apart over 360–830 nm.
+let fit_samples: usize = 95
+
+## The XYZ (relative to E, normalized per channel) of the fit's sigmoid alone,
+## from the observer at the fit's wavelengths (`observer`, XYZ triples).
+func fit_xyz(k: Vector3, integrals: Vector3, observer: const f64[]) -> Vector3:
     var sum = Vector3()
-    var lambda = lambda_min
-    while lambda <= lambda_max:
+    for at in 0..<fit_samples:
+        let lambda = lambda_min + 5.0 * (f64)at
         let x = (lambda - lambda_min) / (lambda_max - lambda_min)
         let s = sigmoid((k.x * x + k.y) * x + k.z)
-        sum = sum.add(cmf(lambda).multiply_scalar(s * 5.0))
-        lambda += 5.0
+        sum = sum.add(Vector3(observer[at * 3], observer[at * 3 + 1], observer[at * 3 + 2]).multiply_scalar(s * 5.0))
     return Vector3(sum.x / integrals.x, sum.y / integrals.y, sum.z / integrals.z)
 
 func solve3(j: Matrix3, r: Vector3) -> Vector3:
@@ -138,16 +141,23 @@ pub func fit_spectrum(rgb: Vector3) -> SpectrumFit:
     # Fit the color at half its largest component; S(0) = ½ is the start.
     let target = acescg_to_xyz_e().apply(rgb.multiply_scalar(0.5 / largest))
     let integrals = cmf_integrals()
+    # The observer once, not at every step of the fit.
+    var observer: f64[285]
+    for at in 0..<fit_samples:
+        let value = cmf(lambda_min + 5.0 * (f64)at)
+        observer[at * 3] = value.x
+        observer[at * 3 + 1] = value.y
+        observer[at * 3 + 2] = value.z
     var k = Vector3()
     for iteration in 0..<(usize)40:
         _ = iteration
-        let r = fit_xyz(k, integrals).subtract(target)
+        let r = fit_xyz(k, integrals, observer[..<fit_samples * 3]).subtract(target)
         if r.length() < 1e-7: break
         # Numerical Jacobian, one column per coefficient.
         let h: f64 = 1e-4
-        let jx = fit_xyz(Vector3(k.x + h, k.y, k.z), integrals).subtract(target).subtract(r).multiply_scalar(1.0 / h)
-        let jy = fit_xyz(Vector3(k.x, k.y + h, k.z), integrals).subtract(target).subtract(r).multiply_scalar(1.0 / h)
-        let jz = fit_xyz(Vector3(k.x, k.y, k.z + h), integrals).subtract(target).subtract(r).multiply_scalar(1.0 / h)
+        let jx = fit_xyz(Vector3(k.x + h, k.y, k.z), integrals, observer[..<fit_samples * 3]).subtract(target).subtract(r).multiply_scalar(1.0 / h)
+        let jy = fit_xyz(Vector3(k.x, k.y + h, k.z), integrals, observer[..<fit_samples * 3]).subtract(target).subtract(r).multiply_scalar(1.0 / h)
+        let jz = fit_xyz(Vector3(k.x, k.y, k.z + h), integrals, observer[..<fit_samples * 3]).subtract(target).subtract(r).multiply_scalar(1.0 / h)
         let j = Matrix3([jx.x, jy.x, jz.x, jx.y, jy.y, jz.y, jx.z, jy.z, jz.z])
         let step = solve3(j, r)
         if not step.is_finite(): break

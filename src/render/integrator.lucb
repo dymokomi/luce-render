@@ -283,6 +283,8 @@ pub struct Renderer:
     var light_samples: u32
     ## Light paths in the pass being recorded (common.glsl params.light_count).
     var lights_in_pass: u32
+    ## The image files the loaded scene reads, kept across reloads.
+    var images: ImageStore = ImageStore()
 
     ## A renderer of `scene` through its camera (see RenderSettings.camera). The
     ## scene's buffers are uploaded; `scene` may be closed afterwards.
@@ -295,6 +297,10 @@ pub struct Renderer:
     ## A renderer of `scene` through `frame`, a view of the caller's (a
     ## viewport's camera, `look_frame`), in place of a scene camera; its size is
     ## the image's. `restart` moves it.
+    ## Image files read so far (tests: a reload reads none it already has).
+    pub func image_reads() -> i64:
+        return self.images.reads
+
     pub static func create_viewed(device: gpu.Device, scene: const CompiledScene*, settings: RenderSettings, frame: RayFrame) -> Renderer!:
         if frame.width == 0 or frame.height == 0 or frame.width > 16384 or frame.height > 16384: error(invalid, "an image is 1 to 16384 pixels on a side")
         if settings.samples == 0 or settings.max_bounces == 0 or settings.max_bounces > 1024: error(invalid, "a render needs samples and 1 to 1024 bounces")
@@ -303,13 +309,17 @@ pub struct Renderer:
         chosen.height = frame.height
         var uploaded = try GpuScene.upload(device, scene, not settings.software_bvh)
         errdefer uploaded.destroy()
-        var tables = try make_tables(device)
-        errdefer tables.destroy()
-        var guide = try gpu.Buffer.allocate(device, guide_bytes)
+        var tables = try shared_tables(device)
+        # The guiding grid only when guiding: a placeholder holds its address.
+        var guide = try gpu.Buffer.allocate(device, guide_bytes if chosen.guiding else 16)
         errdefer guide.destroy()
         let guide_address = try guide.address()
-        var loaded = try Loaded.create(device, scene, chosen, scene_radius(scene), &uploaded, &tables, &frame)
+        var images = ImageStore()
+        errdefer images.close()
+        images.begin()
+        var loaded = try Loaded.create(device, scene, chosen, scene_radius(scene), &uploaded, &tables, &frame, &images)
         errdefer loaded.destroy()
+        images.settle()
         var order = Growing[u32]()
         order.assign(scene.order.view()) catch failure:
             order.close()
@@ -319,6 +329,7 @@ pub struct Renderer:
                                 [gpu.Texture(), gpu.Texture(), gpu.Texture()], 0,
                                 0, 0, 0, false, frame, 0, 0, false, none, none, 0, 0, [0, 0], [0, 0], -1, -1, 0, 0, 0, -1, 0, 0, 0, 0, 0,
                                 Growing[u8](), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0, 0, 0)
+        renderer.images = images
         try renderer.allocate_view(frame.width, frame.height) catch failure:
             renderer.destroy()
             error(failure.code, failure.message)
@@ -377,6 +388,13 @@ pub struct Renderer:
     ## the view outgrows them. `frame` keeps the projection (perspective or
     ## orthographic) the renderer was made with.
     pub func restart(frame: RayFrame) -> !:
+        try self.place(frame)
+        try self.show_view()
+        self.forget_passes()
+
+    ## Take `frame` as the view, its buffers made again only when it
+    ## outgrows them.
+    func place(frame: RayFrame) -> !:
         if frame.width == 0 or frame.height == 0 or frame.width > 16384 or frame.height > 16384: error(invalid, "an image is 1 to 16384 pixels on a side")
         if frame.orthographic != self.frame.orthographic: error(invalid, "a restart keeps the view's projection")
         try self.retire_finished()
@@ -386,8 +404,6 @@ pub struct Renderer:
         self.frame = frame
         self.settings.width = frame.width
         self.settings.height = frame.height
-        try self.show_view()
-        self.forget_passes()
 
     ## Load `scene`'s lights, materials and constants again, keeping the
     ## geometry on the device: `scene` must have the same triangles and splats
@@ -395,8 +411,10 @@ pub struct Renderer:
     ## `compile_scene` with `geometry` false makes such a scene without
     ## repeating the splats and BVHs, and its triangles are put in the BVH's
     ## order here). `settings` replace the renderer's but for the size and the
-    ## pool; the film starts over.
-    pub func reload(scene: CompiledScene*, settings: RenderSettings) -> !:
+    ## pool; the film starts over, through `frame` when given (as `restart`
+    ## would, the view's constants sent once).
+    pub func reload(scene: CompiledScene*, settings: RenderSettings, frame: RayFrame? = none) -> !:
+        if let wanted = frame: try self.place(wanted)
         if scene.nodes.count == 0 and scene.triangle_count() > 0:
             if scene.triangle_count() != self.order.count: error(invalid, "a reload keeps the scene's geometry")
             try reorder(scene, self.order.view())
@@ -408,15 +426,25 @@ pub struct Renderer:
         chosen.pool = self.settings.pool
         chosen.software_bvh = self.settings.software_bvh
         # The radius is the geometry's, which `scene` may have no BVH to tell.
-        var loaded = try Loaded.create(self.device, scene, chosen, self.loaded.radius, &self.scene, &self.tables, &self.frame)
+        self.images.begin()
+        var loaded = try Loaded.create(self.device, scene, chosen, self.loaded.radius, &self.scene, &self.tables, &self.frame, &self.images)
         errdefer loaded.destroy()
         try self.scene.replace_shading(self.device, scene)
         # Light paths need slots: a view made without them grows its state.
         let pixels = self.pixels()
         let band = self.pool if self.pool < pixels else pixels
         let grow = band + loaded.light_paths(chosen, pixels, band) > self.slots
+        # Guiding turned on: its grid, in place of the placeholder (passes
+        # made while it was off never read it).
+        if chosen.guiding and self.guide.bytes() < guide_bytes:
+            var guide = try gpu.Buffer.allocate(self.device, guide_bytes)
+            errdefer guide.destroy()
+            self.guide_address = try guide.address()
+            self.guide.destroy()
+            self.guide = guide
         self.loaded.destroy()
         self.loaded = loaded
+        self.images.settle()
         self.settings = chosen
         if grow:
             try self.settle()
@@ -519,7 +547,9 @@ pub struct Renderer:
         self.marks.clear()
         if self.settings.profile: try self.mark(&pass, kind_rest)
         if self.clear_film:
-            try pass.fill(self.film, 0, 4 * self.capacity * 16, 0)
+            # The planes the current view addresses (common.glsl's film_at:
+            # plane · width · height + pixel), not the room a larger view left.
+            try pass.fill(self.film, 0, 4 * self.pixels() * 16, 0)
             self.clear_film = false
         try self.record(&pass)
         if self.settings.profile: try self.mark(&pass, kind_rest)
@@ -733,8 +763,8 @@ pub struct Renderer:
         self.older = none
         self.newer = none
         self.loaded.destroy()
+        self.images.close()
         self.scene.destroy()
-        self.tables.destroy()
         self.guide.destroy()
         self.release_view()
         self.order.close()
@@ -743,6 +773,35 @@ pub struct Renderer:
 ## The albedo tables energy compensation reads (shaders/microfacet.glsl),
 ## computed on the device by the same GGX code the shading kernels run.
 let table_floats: usize = 32 * 32 + 32 + 32 * 32 * 16
+
+## The tables of the device renderers last drew on: they hold no scene, so
+## one copy serves every renderer there (a new scene's renderer reads it
+## again), until another device or `release_tables`.
+struct HeldTables:
+    var device: gpu.Device
+    var buffer: gpu.Buffer
+
+var held_tables: HeldTables? = none
+
+func shared_tables(device: gpu.Device) -> gpu.Buffer!:
+    if let held = held_tables:
+        var wanted = device
+        if held.device.same(&wanted): return held.buffer
+        release_tables()
+    var buffer = try make_tables(device)
+    errdefer buffer.destroy()
+    held_tables = HeldTables(device = try device.share(), buffer = buffer)
+    return buffer
+
+## Free the shared albedo tables (made again on the next renderer): for a
+## clean shutdown, or before closing the device.
+pub func release_tables():
+    let held = held_tables else return
+    held_tables = none
+    var buffer = held.buffer
+    buffer.destroy()
+    var device = held.device
+    device.destroy()
 
 func make_tables(device: gpu.Device) -> gpu.Buffer!:
     var tables = try gpu.Buffer.allocate(device, table_floats * 4)

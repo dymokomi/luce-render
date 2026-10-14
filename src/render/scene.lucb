@@ -86,18 +86,36 @@ pub struct CompiledScene:
 ## theirs, and its cameras and lights. Without `geometry`, only what a renderer
 ## reloads (Renderer.reload, for a set whose geometry it already has): the
 ## triangles and their materials, no BVH, no splats.
-pub func compile_scene(set: const GeometrySet*, geometry: bool = true) -> CompiledScene!:
+## A compile asked to stop when `stopping` asks: it fails `stopped` at the
+## next component or phase.
+pub func compile_scene(set: const GeometrySet*, geometry: bool = true, stopping: const Stopping*? = none) -> CompiledScene!:
     var scene = CompiledScene()
     errdefer scene.close()
     var face_base: u32 = 0
     try materials_flattened(set, &scene.materials)
-    try add_set(&scene, set, Matrix4(), &face_base, 0, geometry)
+    try add_set(&scene, set, Matrix4(), &face_base, 0, geometry, stopping)
     if scene.point_count() > 4294967295: error(limit, "a scene holds at most 2^32 points")
     try scene_flattened(set, Matrix4(), &scene.objects)
     if geometry:
+        try check_stop(stopping)
         try build_bvh(&scene)
+        try check_stop(stopping)
         try build_splat_bvh(&scene.splats)
     return scene
+
+## A request to stop a compile in progress, from another thread.
+pub struct Stopping:
+    var asked: @u32
+
+    pub func ask():
+        self.asked.store(1, .release)
+
+    pub func is_asked() -> bool:
+        return self.asked.load(.acquire) != 0
+
+func check_stop(stopping: const Stopping*?) -> !:
+    let held = stopping else return
+    if held.is_asked(): error(stopped, "the compile was stopped")
 
 ## Whether `set` and `other` hold the same geometry, so they compile to the
 ## same triangles and splats: their meshes and point clouds in the same order
@@ -163,9 +181,10 @@ func mix(key: u64*, word: u64):
         *key = (*key ^ (value & 255)) *% 1099511628211
         value = value >> 8
 
-func add_set(scene: CompiledScene*, set: const GeometrySet*, matrix: Matrix4, face_base: u32*, depth: usize, splats: bool) -> !:
+func add_set(scene: CompiledScene*, set: const GeometrySet*, matrix: Matrix4, face_base: u32*, depth: usize, splats: bool, stopping: const Stopping*?) -> !:
     if depth > 64: error(invalid, "instances nest more than 64 deep")
     for index in 0..<set.component_count():
+        try check_stop(stopping)
         let entry = set.component(index)
         if entry.kind == mesh_component():
             try add_mesh(scene, (const Mesh*)entry.data, matrix, face_base)
@@ -176,7 +195,7 @@ func add_set(scene: CompiledScene*, set: const GeometrySet*, matrix: Matrix4, fa
             for at in 0..<instances.count():
                 let item = instances.item(at)
                 if not item.visible: continue
-                try add_set(scene, item.set, matrix.multiply(item.matrix()), face_base, depth + 1, splats)
+                try add_set(scene, item.set, matrix.multiply(item.matrix()), face_base, depth + 1, splats, stopping)
         elif entry.kind.unrealizable != "":
             scene.skipped += 1
 
@@ -249,12 +268,13 @@ func material_indices(materials: const Materials*, mesh: const Mesh*) -> u32[]!:
     for at in 0..<names:
         let found = materials.index_of(try mesh.attribute_string(attribute, (i64)at))
         looked[at] = (u32)(found + 1)
+    # Each face's string index (text attributes store them), read directly.
+    let entry = try mesh.attribute_entry(attribute)
+    let single = (try mesh.attribute_storage(attribute)) == 1
+    let indices = entry.data.view()
     for face in 0..<faces:
-        let path = try mesh.attribute_text(attribute, (i64)face)
-        for at in 0..<names:
-            if (try mesh.attribute_string(attribute, (i64)at)) == path:
-                out[face] = looked[at]
-                break
+        let index = memory.read[i32]((const void*)&indices[(0 if single else face) * 4])
+        if index >= 0 and (usize)index < names: out[face] = looked[(usize)index]
     return out
 
 ## A mesh's `uv` attribute: its index (-1: none), its domain (0 point, 1

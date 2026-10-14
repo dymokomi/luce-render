@@ -17,35 +17,159 @@ pub struct MaterialTextures:
     ## Each material's program entry (-1 none), the default material's first.
     pub var entries: Growing[f32]
     pub var programs: Growing[u32]
+    ## The textures the table binds (the store's; the white one its own).
     pub var textures: Growing[gpu.Texture]
+    ## Which stored image each texture is (ImageStore's ids).
+    var sources: Growing[u64]
     pub var table: gpu.TextureTable
     var device: gpu.Device
-    ## The file and use of each texture, to read each once.
-    var keys: Growing[u8]
+    var store: ImageStore*
+    var white: gpu.Texture
 
     pub func destroy():
         self.table.destroy()
-        for texture in self.textures.view():
-            var held = texture
-            held.destroy()
+        self.white.destroy()
         self.textures.close()
+        self.sources.close()
         self.entries.close()
         self.programs.close()
-        self.keys.close()
 
-## The programs of `materials`' node graphs and the textures they read, on
-## `device`; the table always has at least one texture (kernels that sample
-## need one bound).
-pub func load_textures(device: gpu.Device, materials: const Materials*) -> MaterialTextures!:
-    var assets = MaterialTextures(Growing[f32](), Growing[u32](), Growing[gpu.Texture](), gpu.TextureTable(), device, Growing[u8]())
+## The image files a renderer's scene reads (materials' textures and the
+## dome's environment), kept while the scene uses them: a reload (a light or
+## a material changed) reads and sends none of them again unless the file
+## changed (its size or modification time). What a load no longer uses goes
+## when that load is done (`settle`).
+pub struct ImageStore:
+    var images: Growing[StoredImage]
+    ## The dome's environment, when `domed`.
+    var dome: StoredDome
+    var domed: bool
+    ## The last id given to a stored image, and the files read so far.
+    var serial: u64
+    pub var reads: i64
+
+    pub func init():
+        self.images = Growing[StoredImage]()
+        self.dome = StoredDome(Growing[u8](), Stamp(0, 0, 0), Environment(), false)
+        self.domed = false
+        self.serial = 0
+        self.reads = 0
+
+    ## Before a load: nothing is used yet.
+    pub func begin():
+        for at in 0..<self.images.count: self.images.items[at].used = false
+        self.dome.used = false
+
+    ## After a load: free what it did not use.
+    pub func settle():
+        var kept: usize = 0
+        for at in 0..<self.images.count:
+            var image = self.images.items[at]
+            if not image.used:
+                image.close()
+                continue
+            self.images.items[kept] = image
+            kept += 1
+        self.images.count = kept
+        if self.domed and not self.dome.used: self.drop_dome()
+
+    ## The texture of `file` read for its use (`color`: sRGB), kept or read
+    ## now, and its id in the store.
+    func texture(device: gpu.Device, file: str, color: bool) -> (gpu.Texture, u64)!:
+        let stamp = try stamp_of(file)
+        for at in 0..<self.images.count:
+            let image = &self.images.items[at]
+            if image.color != color or (str)image.path.view() != file: continue
+            if image.stamp == stamp:
+                image.used = true
+                return (image.texture, image.id)
+            # Changed on disk: read again.
+            var stale = *image
+            stale.close()
+            self.images.items[at] = self.images.items[self.images.count - 1]
+            self.images.count -= 1
+            break
+        self.serial += 1
+        self.reads += 1
+        var image = StoredImage(Growing[u8](), color, stamp, try read_texture(device, file, color), true, self.serial)
+        errdefer image.close()
+        try append_text(&image.path, file)
+        try self.images.push(image)
+        return (image.texture, image.id)
+
+    ## The environment of dome image `file`: kept, or read now.
+    pub func environment(file: str) -> const Environment*!:
+        let stamp = try stamp_of(file)
+        if self.domed and (str)self.dome.path.view() == file and self.dome.stamp == stamp:
+            self.dome.used = true
+            return &self.dome.environment
+        self.drop_dome()
+        self.reads += 1
+        let environment = try load_environment(file)
+        self.dome = StoredDome(Growing[u8](), stamp, environment, true)
+        self.domed = true
+        try append_text(&self.dome.path, file)
+        return &self.dome.environment
+
+    func drop_dome():
+        if self.domed: self.dome.close()
+        self.dome = StoredDome(Growing[u8](), Stamp(0, 0, 0), Environment(), false)
+        self.domed = false
+
+    pub func close():
+        for at in 0..<self.images.count: self.images.items[at].close()
+        self.images.close()
+        self.drop_dome()
+
+## What tells a file's contents apart without reading them: its size and
+## modification time.
+struct Stamp:
+    var size: i64
+    var seconds: i64
+    var nanoseconds: u32
+
+func stamp_of(file: str) -> Stamp!:
+    var name: str
+    with memory.heap:
+        name = try strings.copy(file)
+    defer:
+        with memory.heap: strings.release(name)
+    let found = try files.metadata((c.str)name)
+    return Stamp(found.size, found.modified.seconds, found.modified.nanoseconds)
+
+struct StoredImage:
+    var path: Growing[u8]
+    var color: bool
+    var stamp: Stamp
+    var texture: gpu.Texture
+    var used: bool
+    var id: u64
+
+    func close():
+        self.path.close()
+        self.texture.destroy()
+
+struct StoredDome:
+    var path: Growing[u8]
+    var stamp: Stamp
+    var environment: Environment
+    var used: bool
+
+    func close():
+        self.path.close()
+        self.environment.close()
+
+## The programs of `materials`' node graphs and the textures they read
+## (from `store`), on `device`; the table always has at least one texture
+## (kernels that sample need one bound).
+pub func load_textures(device: gpu.Device, materials: const Materials*, store: ImageStore*) -> MaterialTextures!:
+    var assets = MaterialTextures(Growing[f32](), Growing[u32](), Growing[gpu.Texture](), Growing[u64](), gpu.TextureTable(), device, store, gpu.Texture())
     errdefer:
-        for texture in assets.textures.view():
-            var held = texture
-            held.destroy()
+        assets.white.destroy()
         assets.textures.close()
+        assets.sources.close()
         assets.entries.close()
         assets.programs.close()
-        assets.keys.close()
     try assets.entries.push(-1.0)
     try assets.programs.push(0)
     for index in 0..<materials.count():
@@ -54,37 +178,23 @@ pub func load_textures(device: gpu.Device, materials: const Materials*) -> Mater
         if graph.length > 0: entry = try compile_graph(graph, ImageSlots(image_slot, (void*)&assets), &assets.programs)
         try assets.entries.push((f32)entry)
     if assets.textures.count == 0:
-        var white = try gpu.Texture.create(device, 1, 1, gpu.Format.rgba8_linear)
-        errdefer white.destroy()
+        assets.white = try gpu.Texture.create(device, 1, 1, gpu.Format.rgba8_linear)
         let texel: u8[4] = [255, 255, 255, 255]
-        try white.upload(u8[]((u8*)&texel[0], 4))
-        try assets.textures.push(white)
+        try assets.white.upload(u8[]((u8*)&texel[0], 4))
+        try assets.textures.push(assets.white)
     assets.table = try gpu.TextureTable.create(device, (u32)assets.textures.count)
     for at in 0..<assets.textures.count: try assets.table.set((u32)at, assets.textures.items[at])
     return assets
 
+## The table slot of `file` read for its use, the texture from the store.
 func image_slot(context: void*, file: str, color: bool) -> f64!:
     let assets = (MaterialTextures*)context
-    return (f64)(try texture_slot(assets.device, &assets.keys, &assets.textures, file, color))
-
-## The slot of `file` read for its use (`color`: sRGB), read now if it is new.
-func texture_slot(device: gpu.Device, keys: Growing[u8]*, textures: Growing[gpu.Texture]*, file: str, color: bool) -> usize!:
-    # Keys are "c" or "d", the file, a newline: one per texture, in order.
-    var at: usize = 0
-    var slot: usize = 0
-    while at < keys.count:
-        var end = at
-        while end < keys.count and keys.items[end] != 10: end += 1
-        let key = (str)keys.items[at..<end]
-        if key.length == file.length + 1 and key.bytes[0] == ('c' if color else 'd') and (str)key.bytes[1..] == file: return slot
-        slot += 1
-        at = end + 1
-    let texture = try read_texture(device, file, color)
-    try textures.push(texture)
-    try keys.push('c' if color else 'd')
-    try append_text(keys, file)
-    try keys.push(10)
-    return textures.count - 1
+    let (texture, id) = try assets.store.texture(assets.device, file, color)
+    for at in 0..<assets.sources.count:
+        if assets.sources.items[at] == id: return (f64)at
+    try assets.textures.push(texture)
+    try assets.sources.push(id)
+    return (f64)(assets.textures.count - 1)
 
 ## Image file `file` as a texture: 8-bit RGBA from PNG or JPEG (sRGB for a
 ## color), half-float RGBA from OpenEXR.

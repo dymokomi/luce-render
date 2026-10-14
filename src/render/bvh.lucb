@@ -107,9 +107,11 @@ func build_tree(boxes: const Box[], order: u32[], nodes: Growing[BvhNode]*) -> !
         for at in job.first..<job.first + job.count:
             bounds = bounds.grow(boxes[(usize)order[at]])
             middle = middle.grow_point(centers[(usize)order[at]])
-        let split = best_split(boxes, centers, order[job.first..<job.first + job.count], middle)
         let leaf_cost = (f32)job.count
         var left_count: usize = 0
+        # A node of `leaf_size` or fewer is a leaf: no split is searched.
+        var split = Split(-1, 0, 3.0e38)
+        if job.count > leaf_size: split = best_split(boxes, centers, order[job.first..<job.first + job.count], bounds, middle)
         if job.count > leaf_size and (split.cost < leaf_cost or job.count > leaf_limit):
             if split.axis >= 0 and split.cost < 3.0e38:
                 left_count = partition(centers, order[job.first..<job.first + job.count], middle, (usize)split.axis, split.bin)
@@ -139,12 +141,11 @@ func bin_of(center: Float3, middle: Box, axis: usize) -> usize:
     if at < 0: return 0
     return (usize)at if at < (i64)bins else bins - 1
 
-## The cheapest bin boundary on any axis: SAH cost relative to the node's area,
-## in primitive intersections (one traversal step costs one).
-func best_split(boxes: const Box[], centers: const Float3[], order: const u32[], middle: Box) -> Split:
+## The cheapest bin boundary on any axis: SAH cost relative to the node's area
+## (`parent` its bounds), in primitive intersections (one traversal step
+## costs one).
+func best_split(boxes: const Box[], centers: const Float3[], order: const u32[], parent: Box, middle: Box) -> Split:
     var best = Split(-1, 0, 3.0e38)
-    var parent = Box.empty()
-    for index in order: parent = parent.grow(boxes[(usize)index])
     let area = parent.area()
     if area <= 0.0: return best
     for axis in 0..<(usize)3:

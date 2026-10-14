@@ -54,6 +54,9 @@ from luce_geocore.splats import placed_point_store, orient_name, scale_name, opa
 from luce_geocore.core.growing import Growing
 from luce_gpu import gpu
 
-## Errors: an unusable input (no camera, no pixels), and a scene past a limit.
+## Errors: an unusable input (no camera, no pixels), a scene past a limit, and
+## a compile stopped.
 pub let invalid: ErrorCode = ErrorCode.package(400)
 pub let limit: ErrorCode = ErrorCode.package(401)
+## A compile asked to stop (a newer scene replaces it).
+pub let stopped: ErrorCode = ErrorCode.package(402)

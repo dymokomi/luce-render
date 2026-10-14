@@ -209,23 +209,31 @@ func key_of(emitters: const Emitter[], index: u32, axis: usize) -> f64:
 
 ## Reorder `order` so the emitter at `k` is the one sorting there by center
 ## along `axis`, those before it no larger and those after no smaller
-## (quickselect, Lomuto's partition).
+## (quickselect with a three-way partition: keys equal to the pivot settle
+## in one pass, so coincident or coplanar emitters cost no more than any).
 func select(emitters: const Emitter[], order: u32[], k: usize, axis: usize):
     var low: usize = 0
     var high = order.length
     while high - low > 1:
-        let middle = (low + high) // 2
-        let pivot = key_of(emitters, order[middle], axis)
-        swap(order, middle, high - 1)
-        var store = low
-        for i in low..<high - 1:
-            if key_of(emitters, order[i], axis) < pivot:
-                swap(order, i, store)
-                store += 1
-        swap(order, store, high - 1)
-        if store == k: return
-        if k < store: high = store
-        else: low = store + 1
+        let pivot = key_of(emitters, order[(low + high) // 2], axis)
+        # [low, less) below the pivot, [less, at) equal, [more, high) above.
+        var less = low
+        var at = low
+        var more = high
+        while at < more:
+            let key = key_of(emitters, order[at], axis)
+            if key < pivot:
+                swap(order, at, less)
+                less += 1
+                at += 1
+            elif key > pivot:
+                more -= 1
+                swap(order, at, more)
+            else:
+                at += 1
+        if k < less: high = less
+        elif k >= more: low = more
+        else: return
 
 func swap(order: u32[], a: usize, b: usize):
     let held = order[a]

@@ -46,18 +46,17 @@ struct Loaded:
     ## beside its geometry `uploaded` (of size `radius`, scene_radius) and the
     ## albedo `tables`, for views like `frame` (light paths need a perspective
     ## one). The view rows are left for `show_view`.
-    pub static func create(device: gpu.Device, scene: const CompiledScene*, settings: RenderSettings, radius: f64, uploaded: const GpuScene*, tables: const gpu.Buffer*, frame: const RayFrame*) -> Loaded!:
+    ## Image files come from `images` (read only when new or changed).
+    pub static func create(device: gpu.Device, scene: const CompiledScene*, settings: RenderSettings, radius: f64, uploaded: const GpuScene*, tables: const gpu.Buffer*, frame: const RayFrame*,
+                           images: ImageStore*) -> Loaded!:
         var packed = Growing[f32]()
         defer packed.close()
         # The first dome with an image lights by it (environment.lucb).
-        var environment = Environment()
-        defer environment.close()
         var environment_view: const Environment*? = none
         for index in 0..<scene.objects.count():
             let item = scene.objects.object(index)
             if item.kind != SceneKind.light or item.light.shape != LightShape.dome or scene.objects.texture(index).length == 0: continue
-            environment = try load_environment(scene.objects.texture(index))
-            environment_view = &environment
+            environment_view = try images.environment(scene.objects.texture(index))
             break
         let (light_count, distant_power, dome) = try pack_lights(&scene.objects, radius, &packed, environment_view)
         # Materials: the default first (material 0), then the scene's library.
@@ -74,6 +73,7 @@ struct Loaded:
         # The dome's texels (a vec4 each), then its cumulative weights.
         var dome_row: f64[8] = [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         if dome >= 0:
+            let environment = environment_view else trap("a dome without its environment")
             while packed.count % 4 != 0: try packed.push(0.0)
             let texel_base = packed.count // 4
             for value in environment.texels.view(): try packed.push(value)
@@ -101,7 +101,7 @@ struct Loaded:
         # The materials' textures (slots a material, the default's first),
         # and the buffers kernels reach by address: the albedo tables and the
         # triangles' texture coordinates.
-        var textures = try load_textures(device, &scene.materials)
+        var textures = try load_textures(device, &scene.materials, images)
         errdefer textures.destroy()
         var corner_uvs = Growing[f32]()
         defer corner_uvs.close()
